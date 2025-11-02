@@ -16,6 +16,8 @@
 
 #include "usb_microphone.h"
 
+#define PDM_BUFFER_BYTES CFG_TUD_AUDIO_EP_SZ_IN
+
 // configuration
 const struct pdm_microphone_config config = {
   .gpio_data = 2,
@@ -23,11 +25,11 @@ const struct pdm_microphone_config config = {
   .pio = pio0,
   .pio_sm = 0,
   .sample_rate = SAMPLE_RATE,
-  .sample_buffer_size = SAMPLE_BUFFER_SIZE,
+  .sample_buffer_size = PDM_BUFFER_BYTES,
 };
 
 // variables
-uint16_t sample_buffer[SAMPLE_BUFFER_SIZE];
+static uint8_t sample_buffer[PDM_BUFFER_BYTES];
 
 // callback functions
 void on_pdm_samples_ready();
@@ -57,8 +59,8 @@ void on_pdm_samples_ready()
   // Callback from library when all the samples in the library
   // internal sample buffer are ready for reading.
   //
-  // Read new samples into local buffer.
-  pdm_microphone_read(sample_buffer, SAMPLE_BUFFER_SIZE);
+  // Read new bytes into local buffer.
+  pdm_microphone_read(sample_buffer, sizeof(sample_buffer));
 }
 
 void on_usb_microphone_tx_ready()

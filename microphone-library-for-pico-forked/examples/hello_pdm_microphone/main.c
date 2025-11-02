@@ -1,98 +1,88 @@
-/*
- * Copyright (c) 2021 Arm Limited and Contributors. All rights reserved.
- *
- * SPDX-License-Identifier: Apache-2.0
- * 
- * This examples captures data from a PDM microphone using a sample
- * rate of 8 kHz and prints the sample values over the USB serial
- * connection.
- */
-
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "hardware/sync.h"
 #include "pico/stdlib.h"
 #include "pico/pdm_microphone.h"
 #include "tusb.h"
 
-#define SAMPLE_BUFFER_SIZE 400
+#define PDM_BLOCK_BITS   4096
+#define PDM_BLOCK_BYTES  (PDM_BLOCK_BITS / 8)
 
-// configuration
-const struct pdm_microphone_config config = {
-    // GPIO pin for the PDM DAT signal
+static uint8_t sample_buffer[PDM_BLOCK_BYTES];
+static uint8_t discard_buffer[PDM_BLOCK_BYTES];
+static volatile bool block_pending = false;
+static volatile int block_length = 0;
+
+static const struct pdm_microphone_config config = {
     .gpio_data = 2,
-
-    // GPIO pin for the PDM CLK signal
     .gpio_clk = 3,
-
-    // PIO instance to use
     .pio = pio0,
-
-    // PIO State Machine instance to use
     .pio_sm = 0,
-
-    // sample rate in Hz
     .sample_rate = 100000,
-
-    // number of samples to buffer
-    .sample_buffer_size = SAMPLE_BUFFER_SIZE,
+    .sample_buffer_size = PDM_BLOCK_BYTES,
 };
 
-// variables
-int16_t sample_buffer[SAMPLE_BUFFER_SIZE];
-volatile int samples_read = 0;
+static void on_pdm_samples_ready(void) {
+    uint8_t* target = block_pending ? discard_buffer : sample_buffer;
+    int read = pdm_microphone_read(target, PDM_BLOCK_BYTES);
 
-void on_pdm_samples_ready()
-{
-    // callback from library when all the samples in the library
-    // internal sample buffer are ready for reading 
-    samples_read = pdm_microphone_read(sample_buffer, SAMPLE_BUFFER_SIZE);
+    if (!block_pending && read > 0) {
+        block_length = read;
+        block_pending = true;
+    }
 }
 
-int main( void )
-{
-    // initialize stdio and wait for USB CDC connect
+int main(void) {
     stdio_init_all();
     setvbuf(stdout, NULL, _IONBF, 0);
+
     while (!tud_cdc_connected()) {
         tight_loop_contents();
     }
 
-    // initialize the PDM microphone
     if (pdm_microphone_init(&config) < 0) {
         printf("PDM microphone initialization failed!\n");
-        while (1) { tight_loop_contents(); }
-    }
-
-    // set callback that is called when all the samples in the library
-    // internal sample buffer are ready for reading
-    pdm_microphone_set_samples_ready_handler(on_pdm_samples_ready);
-    
-     // start capturing data from the PDM microphone
-    if (pdm_microphone_start() < 0) {
-        printf("PDM microphone start failed!\n");
-        while (1) { tight_loop_contents(); }
-    }
-
-    while (1) {
-        // wait for new samples
-        while (samples_read == 0) { tight_loop_contents(); }
-
-        // store and clear the samples read from the callback
-        int sample_count = samples_read;
-        samples_read = 0;
-        
-        size_t written = fwrite(
-            sample_buffer,
-            sizeof(sample_buffer[0]),
-            sample_count,
-            stdout
-        );
-
-        if (written != (size_t)sample_count) {
-            sleep_ms(1);
+        while (true) {
+            tight_loop_contents();
         }
     }
 
-    return 0;
+    pdm_microphone_set_samples_ready_handler(on_pdm_samples_ready);
+
+    if (pdm_microphone_start() < 0) {
+        printf("PDM microphone start failed!\n");
+        while (true) {
+            tight_loop_contents();
+        }
+    }
+
+    while (true) {
+        if (!block_pending) {
+            tight_loop_contents();
+            continue;
+        }
+
+        uint8_t transfer_buffer[PDM_BLOCK_BYTES];
+        int bytes_to_send = 0;
+
+        uint32_t status = save_and_disable_interrupts();
+        if (block_pending) {
+            bytes_to_send = block_length;
+            memcpy(transfer_buffer, sample_buffer, (size_t)bytes_to_send);
+            block_length = 0;
+            block_pending = false;
+        }
+        restore_interrupts(status);
+
+        if (bytes_to_send <= 0) {
+            continue;
+        }
+
+        size_t written = fwrite(transfer_buffer, 1, (size_t)bytes_to_send, stdout);
+        if (written != (size_t)bytes_to_send) {
+            sleep_ms(1);
+        }
+    }
 }

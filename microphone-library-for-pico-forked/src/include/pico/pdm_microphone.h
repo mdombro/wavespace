@@ -28,10 +28,7 @@ int pdm_microphone_start();
 void pdm_microphone_stop();
 
 void pdm_microphone_set_samples_ready_handler(pdm_samples_ready_handler_t handler);
-void pdm_microphone_set_filter_max_volume(uint8_t max_volume);
-void pdm_microphone_set_filter_gain(uint8_t gain);
-void pdm_microphone_set_filter_volume(uint16_t volume);
 
-int pdm_microphone_read(int16_t* buffer, size_t samples);
+int pdm_microphone_read(uint8_t* buffer, size_t max_bytes);
 
 #endif
