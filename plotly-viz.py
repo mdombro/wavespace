@@ -1,113 +1,86 @@
 #!/usr/bin/env python3
-# Data format consumed by this viewer:
-#   - Directory of NPZ files, one per spatial point. Each file must contain:
-#       * `xyz`: float32 coordinate (shape [3] or [1,3]).
-#       * `val`: float32 time-series values (shape [T]).
-#     File names follow --pattern (format placeholder for the point index, default "point_{:05d}.npz").
-#     There are as many files as points. All `val` arrays share the same length T (number of frames).
-#   - Optionally, --series may point to a single NPZ with:
-#       * `xyz`: [N,3] static coordinates or [T,N,3] for moving points.
-#       * `val`: [T,N] scalar values. Values are clipped to [0,1].
-
 """
-wave_points_dash.py — Browser-based animated 3D point-cloud viewer (Plotly Dash).
+PyVista-based animated point-cloud viewer.
 
-- Color & size both map to per-point scalar value in [0,1]
-- Play/Pause + time slider
-- Colormap select, size-min/max sliders
-- Optional downsampling for very large point clouds
-- No VTK/OpenGL/NVIDIA dependencies (uses your browser’s WebGL)
+- Visualizes time-varying 3D point clouds where per-point scalar values map to color and size
+- Playback controls: Play/Pause, time slider scrubbing, FPS-configurable timer
+- Display controls: colormap selector, marker size min/max sliders, configurable downsampling
+- Data sources:
+    * Directory of per-frame NPZ files (xyz[N,3], val[N])
+    * Single NPZ series (xyz[T,N,3] or xyz[N,3], val[T,N])
+    * Synthetic demo (expanding wavefront)
 
-Run:
-  pip install dash plotly numpy
-  python wave_points_dash.py --demo
-  # or your data:
-  # python wave_points_dash.py --path /data --pattern "point_{:05d}.npz" --points 60000
-  # python wave_points_dash.py --series /data/series.npz
+Dependencies:
+    pip install numpy pyvista pyvistaqt PyQt5
 """
 
-import argparse, os
-import numpy as np
+import argparse
+import os
+import sys
 from dataclasses import dataclass
 
-import dash
-from dash import Dash, dcc, html, Input, Output, State, Patch
-import plotly.graph_objects as go
+import numpy as np
 
-# ------------- Data providers -------------
+from PyQt5 import QtCore, QtWidgets
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+
+# ---------------- Data providers ----------------
+
 
 class ProviderBase:
-    def __len__(self): raise NotImplementedError
-    def get(self, t):  # -> (xyz[N,3], val[N])
+    def __len__(self):
         raise NotImplementedError
-    def static_xyz(self) -> bool: return False
-    def max_points(self) -> int: return self._N if hasattr(self, "_N") else None
-
-class PointFilesProvider(ProviderBase):
-    def __init__(self, path, pattern, points=None):
-        self.path = path
-        self.pattern = pattern
-        self._N = int(points) if points is not None else None
-        self._T = None
-        self._xyz = None
-        self._val = None
-        self._load_all()
-
-    def __len__(self): return self._T
-
-    def _filename(self, idx: int) -> str:
-        return os.path.join(self.path, self.pattern.format(idx))
-
-    def _load_all(self):
-        if self._N is None:
-            self._N = infer_points(self.path, self.pattern)
-        if self._N <= 0:
-            raise ValueError("No point files found. Check --path/--pattern.")
-
-        xyz_list = []
-        val_list = []
-
-        for idx in range(self._N):
-            fn = self._filename(idx)
-            if not os.path.exists(fn):
-                raise FileNotFoundError(f"Expected point file missing: {fn}")
-            data = np.load(fn, allow_pickle=False)
-
-            if "xyz" not in data or "val" not in data:
-                raise KeyError(f"Point file {fn} must contain 'xyz' and 'val'")
-
-            xyz = np.asarray(data["xyz"], dtype=np.float32)
-            if xyz.ndim == 2 and xyz.shape[0] == 1:
-                xyz = xyz[0]
-            xyz = xyz.reshape(-1)
-            if xyz.shape[0] != 3:
-                raise ValueError(f"'xyz' in {fn} must have 3 elements, got shape {xyz.shape}")
-
-            val = np.clip(np.asarray(data["val"], dtype=np.float32), 0.0, 1.0)
-            val = val.reshape(-1)
-            if self._T is None:
-                self._T = val.shape[0]
-            elif val.shape[0] != self._T:
-                raise ValueError(f"All 'val' arrays must have same length; {fn} has {val.shape[0]}, expected {self._T}")
-
-            xyz_list.append(xyz)
-            val_list.append(val)
-
-        self._xyz = np.vstack(xyz_list).astype(np.float32)
-        self._val = np.stack(val_list, axis=1).astype(np.float32)  # shape [T, N]
-        if self._T is None:
-            raise ValueError("Could not determine time dimension from point files.")
-        self._N = self._xyz.shape[0]
 
     def get(self, t):
-        tt = int(t)
-        if tt < 0 or tt >= self._T:
-            raise IndexError(f"Frame index {tt} out of bounds for T={self._T}")
-        return self._xyz, self._val[tt]
+        """Return xyz[N,3], val[N] for frame t."""
+        raise NotImplementedError
 
-    def static_xyz(self) -> bool: return True
-    def max_points(self) -> int: return self._xyz.shape[0]
-    
+    def static_xyz(self) -> bool:
+        return False
+
+    def max_points(self) -> int:
+        return getattr(self, "_N", None)
+
+
+class NPZFramesProvider(ProviderBase):
+    def __init__(self, path, pattern, frames):
+        self.path = path
+        self.pattern = pattern
+        self.T = int(frames)
+        if self.T <= 0:
+            raise ValueError("Frame count must be positive.")
+        xyz0, _ = self._load(0)
+        self._N = xyz0.shape[0]
+        self._first_xyz = xyz0.copy()
+        self._static = True
+
+    def __len__(self):
+        return self.T
+
+    def _filename(self, t):
+        return os.path.join(self.path, self.pattern.format(t))
+
+    def _load(self, t):
+        fn = self._filename(t)
+        if not os.path.exists(fn):
+            raise FileNotFoundError(fn)
+        data = np.load(fn, allow_pickle=False)
+        xyz = data["xyz"].astype(np.float32)
+        val = np.clip(data["val"].astype(np.float32), 0.0, 1.0)
+        return xyz, val
+
+    def get(self, t):
+        xyz, val = self._load(int(t))
+        if self._static and not np.array_equal(self._first_xyz, xyz):
+            self._static = False
+        return xyz, val
+
+    def static_xyz(self) -> bool:
+        return bool(self._static)
+
+
 class NPZSeriesProvider(ProviderBase):
     def __init__(self, series_path):
         data = np.load(series_path, allow_pickle=False)
@@ -122,348 +95,392 @@ class NPZSeriesProvider(ProviderBase):
         else:
             raise ValueError("xyz must be (N,3) or (T,N,3)")
 
-    def __len__(self): return self.T
+    def __len__(self):
+        return self.T
+
     def get(self, t):
+        tt = int(t)
         if self._mode == "static":
             xyz = self._xyz.astype(np.float32)
         else:
-            xyz = self._xyz[t].astype(np.float32)
-        return xyz, self._val[t]
-    def static_xyz(self): return self._mode == "static"
+            xyz = self._xyz[tt].astype(np.float32)
+        return xyz, self._val[tt]
 
-def make_demo_provider(T=160, N=10000, radius=1.0):
+    def static_xyz(self):
+        return self._mode == "static"
+
+
+def make_demo_provider(T=160, N=60000, radius=1.0):
     rng = np.random.default_rng(7)
-    # uniform in sphere
     u = rng.random(N)
-    cost = rng.uniform(-1,1,N); phi = rng.uniform(0,2*np.pi,N)
-    r = radius * u**(1/3); s = np.sqrt(1-cost**2)
-    xyz = np.stack([r*s*np.cos(phi), r*s*np.sin(phi), r*cost], axis=-1).astype(np.float32)
-
-    # precompute time-series values per point
-    val_series = np.empty((T, N), dtype=np.float32)
-    rr = np.linalg.norm(xyz, axis=1)
-    sigma = 0.16 * radius
-    denom = 2 * sigma * sigma
-    for t in range(T):
-        tau = t / max(1, T - 1)
-        r0 = 0.8 * radius * tau
-        val = np.exp(-((rr - r0) ** 2) / denom)
-        m = val.max()
-        if m > 0:
-            val = val / m
-        val_series[t] = val.astype(np.float32)
+    cost = rng.uniform(-1, 1, N)
+    phi = rng.uniform(0, 2 * np.pi, N)
+    r = radius * np.power(u, 1.0 / 3.0)
+    s = np.sqrt(1 - cost**2)
+    xyz = np.stack(
+        [r * s * np.cos(phi), r * s * np.sin(phi), r * cost], axis=-1
+    ).astype(np.float32)
 
     class Demo(ProviderBase):
-        def __len__(self): return T
+        def __len__(self):
+            return T
+
         def get(self, t):
-            return xyz, val_series[int(t)]
-        def static_xyz(self): return True
-        def max_points(self): return xyz.shape[0]
+            tt = int(t)
+            tau = tt / max(1, T - 1)
+            c = 0.8 * radius
+            r0 = c * tau
+            rr = np.linalg.norm(xyz, axis=1)
+            sigma = 0.16 * radius
+            val = np.exp(-((rr - r0) ** 2) / (2 * sigma * sigma)).astype(np.float32)
+            m = val.max()
+            if m > 0:
+                val /= m
+            return xyz, val
+
+        def static_xyz(self):
+            return True
+
+        def max_points(self):
+            return xyz.shape[0]
 
     return Demo()
 
-# ------------- Figure helpers -------------
 
-COLORSCALES = ["Viridis","Plasma","Cividis","Magma","Turbo","Inferno","Ice","Aggrnyl"]
+# ---------------- Visualization helpers ----------------
+
+
+COLORSCALES = ["Viridis", "Plasma", "Cividis", "Magma", "Turbo", "Inferno", "Ice", "Aggrnyl"]
+
 
 @dataclass
 class VizParams:
     cmap: str = "Viridis"
     size_min: float = 2.0
     size_max: float = 10.0
-    downsample: int = 0  # 0 = no downsample; otherwise keep N//downsample points
+    downsample: int = 0  # 0 = no downsample
 
-def _figure_for_frame(xyz, val, vp: VizParams):
-    N = xyz.shape[0]
-    if vp.downsample and vp.downsample > 1:
-        step = int(max(1, vp.downsample))
-        xyz = xyz[::step]; val = val[::step]; N = xyz.shape[0]
 
-    sizes = vp.size_min + (vp.size_max - vp.size_min)*val
-    fig = go.Figure()
-    fig.add_trace(go.Scatter3d(
-        x=xyz[:,0], y=xyz[:,1], z=xyz[:,2],
-        mode="markers",
-        marker=dict(
-            size=np.clip(sizes, 1, 100),
-            color=val, colorscale=vp.cmap, cmin=0, cmax=1,
-            opacity=0.95,
+def _downsample(xyz, val, step):
+    step = int(step or 0)
+    if step <= 1:
+        return xyz, val
+    idx = np.arange(0, xyz.shape[0], step, dtype=np.int64)
+    return xyz[idx], val[idx]
+
+
+def _safe_diag_extent(xyz):
+    if xyz.size == 0:
+        return 1.0
+    bounds = np.ptp(xyz, axis=0)
+    diag = float(np.linalg.norm(bounds))
+    return diag if diag > 0 else 1.0
+
+
+def _compute_sizes(val, size_min, size_max, scale_factor):
+    sizes = size_min + (size_max - size_min) * val
+    return scale_factor * sizes
+
+
+# ---------------- PyVista Qt viewer ----------------
+
+
+class PointCloudViewer(QtWidgets.QMainWindow):
+    def __init__(self, provider: ProviderBase, fps=24, default_params=None):
+        super().__init__()
+        self.setWindowTitle("PyVista Point Cloud Viewer")
+        self.provider = provider
+        self.T = len(provider)
+        self.params = default_params or VizParams()
+
+        self.current_frame = 0
+        self.is_playing = False
+        self.downsample_step = max(1, int(self.params.downsample) or 1)
+        self.size_min = float(self.params.size_min)
+        self.size_max = float(self.params.size_max)
+        self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else COLORSCALES[0]
+        self.static_xyz = provider.static_xyz()
+
+        xyz0, val0 = provider.get(0)
+        xyz0, val0 = _downsample(xyz0, val0, self.params.downsample)
+        self._base_extent = _safe_diag_extent(xyz0)
+        self._size_scale = self._base_extent / 150.0
+        self._glyph_geom = pv.Sphere(radius=1.0, theta_resolution=12, phi_resolution=12)
+
+        self._mesh = None
+        self._glyph = None
+        self._actor = None
+
+        self._build_ui(fps)
+        self._initialize_scene(xyz0, val0)
+
+    # ----- UI construction -----
+
+    def _build_ui(self, fps):
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+
+        # Playback controls row
+        top_row = QtWidgets.QHBoxLayout()
+        self.btn_play = QtWidgets.QPushButton("⏵ Play")
+        self.btn_pause = QtWidgets.QPushButton("⏸ Pause")
+        self.slider_frame = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_frame.setRange(0, max(0, self.T - 1))
+        self.slider_frame.setSingleStep(1)
+        self.slider_frame.setPageStep(1)
+
+        top_row.addWidget(self.btn_play)
+        top_row.addWidget(self.btn_pause)
+        top_row.addWidget(self.slider_frame)
+        main_layout.addLayout(top_row)
+
+        # Settings row
+        settings_row = QtWidgets.QHBoxLayout()
+
+        # Colormap
+        cmap_layout = QtWidgets.QVBoxLayout()
+        cmap_layout.addWidget(QtWidgets.QLabel("Colormap"))
+        self.combo_cmap = QtWidgets.QComboBox()
+        self.combo_cmap.addItems(COLORSCALES)
+        self.combo_cmap.setCurrentText(self.cmap)
+        cmap_layout.addWidget(self.combo_cmap)
+        settings_row.addLayout(cmap_layout)
+
+        # Size sliders
+        self.slider_size_min = self._make_slider(1, 20, self.size_min)
+        self.slider_size_max = self._make_slider(4, 40, self.size_max)
+        settings_row.addLayout(self._wrap_slider("Size min (px)", self.slider_size_min))
+        settings_row.addLayout(self._wrap_slider("Size max (px)", self.slider_size_max))
+
+        # Downsample slider + note
+        self.slider_downsample = self._make_slider(0, 20, self.params.downsample)
+        down_layout = self._wrap_slider("Downsample (every Nth point)", self.slider_downsample)
+        down_layout.addWidget(QtWidgets.QLabel("0 = no downsample"))
+        settings_row.addLayout(down_layout)
+
+        main_layout.addLayout(settings_row)
+
+        # PyVista view
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background("black")
+        main_layout.addWidget(self.plotter)
+
+        # Timer for playback
+        self.timer = QtCore.QTimer(self)
+        interval_ms = int(1000 / max(1, fps))
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self._advance_frame)
+
+        # Signal wiring
+        self.btn_play.clicked.connect(self.start_playback)
+        self.btn_pause.clicked.connect(self.stop_playback)
+        self.slider_frame.valueChanged.connect(self._on_frame_slider)
+        self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
+        self.slider_size_min.valueChanged.connect(self._on_size_min_changed)
+        self.slider_size_max.valueChanged.connect(self._on_size_max_changed)
+        self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
+
+    def _make_slider(self, minimum, maximum, value):
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(int(minimum), int(maximum))
+        slider.setSingleStep(1)
+        slider.setPageStep(1)
+        slider.setValue(int(round(value)))
+        return slider
+
+    def _wrap_slider(self, label, slider):
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(QtWidgets.QLabel(label))
+        layout.addWidget(slider)
+        return layout
+
+    # ----- Plot initialization -----
+
+    def _initialize_scene(self, xyz, val):
+        mesh = self._build_polydata(xyz, val)
+        glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
+        self._mesh = mesh
+        self._glyph = glyph
+        self._actor = self.plotter.add_mesh(
+            glyph,
+            scalars="val",
+            cmap=self.cmap,
+            clim=[0.0, 1.0],
+            lighting=False,
+            show_scalar_bar=True,
         )
-    ))
-    fig.update_layout(
-        scene=dict(aspectmode="data", uirevision="scene", dragmode="orbit"),
-        margin=dict(l=0,r=0,t=30,b=0),
-        template="plotly_dark",
-        title="Animated Point Cloud (value → color & size)",
-        uirevision="scene"
-    )
-    return fig
+        self.plotter.show_axes()
+        self.plotter.render()
 
-# ------------- Dash app factory -------------
+    def _build_polydata(self, xyz, val):
+        xyz = np.asarray(xyz, dtype=np.float32)
+        val = np.clip(np.asarray(val, dtype=np.float32), 0.0, 1.0)
+        mesh = pv.PolyData(xyz)
+        mesh.point_data["val"] = val
+        mesh.point_data.set_active_scalars("val")
+        scale = _compute_sizes(val, self.size_min, self.size_max, self._size_scale)
+        mesh.point_data["scale"] = scale
+        return mesh
 
-def create_app(provider: ProviderBase, fps=24, default_params=None):
-    app = Dash(__name__)
-    T = len(provider)
-    vp = default_params or VizParams()
+    # ----- UI callbacks -----
 
-    xyz0, val0 = provider.get(0)
-    initial_fig = _figure_for_frame(xyz0, val0, vp)
+    def start_playback(self):
+        if not self.is_playing and self.T > 1:
+            self.timer.start()
+            self.is_playing = True
 
-    app.layout = html.Div([
-        html.Div([
-            html.Div([
-                html.Button("⏵ Play", id="btn-play", n_clicks=0, style={"marginRight":"6px"}),
-                html.Button("⏸ Pause", id="btn-pause", n_clicks=0, style={"marginRight":"12px"}),
-                dcc.Slider(0, T-1, 1, value=0, id="slider-t", updatemode="drag",
-                           tooltip={"placement":"bottom", "always_visible":False},
-                           dots=False, marks=None),
-            ], style={"flex":"1 1 auto"}),
-        ], style={"display":"flex","gap":"12px","alignItems":"center","margin":"8px 12px"}),
+    def stop_playback(self):
+        if self.is_playing:
+            self.timer.stop()
+            self.is_playing = False
 
-        html.Div([
-            html.Div([
-                html.Label("Colormap"),
-                dcc.Dropdown(options=[{"label":c, "value":c} for c in COLORSCALES],
-                             value=vp.cmap, id="dd-cmap", clearable=False)
-            ], style={"width":"220px"}),
-            html.Div([
-                html.Label("Size min (px)"),
-                dcc.Slider(1, 20, 1, value=vp.size_min, id="sl-szmin",
-                           marks=None, dots=False,
-                           tooltip={"placement":"bottom", "always_visible":False}),
-                html.Div(id="lbl-szmin", className="slider-value")
-            ], style={"flex":"1","marginLeft":"16px"}),
-            html.Div([
-                html.Label("Size max (px)"),
-                dcc.Slider(4, 40, 1, value=vp.size_max, id="sl-szmax",
-                           marks=None, dots=False,
-                           tooltip={"placement":"bottom", "always_visible":False}),
-                html.Div(id="lbl-szmax", className="slider-value")
-            ], style={"flex":"1","marginLeft":"16px"}),
-            html.Div([
-                html.Label("Downsample (every Nth point)"),
-                dcc.Slider(0, 20, 1, value=vp.downsample, id="sl-down",
-                           marks=None, dots=False,
-                           tooltip={"placement":"bottom", "always_visible":False}),
-                html.Div(id="lbl-down", className="slider-value")
-            ], style={"flex":"1","marginLeft":"16px"}),
-        ], style={"display":"flex","gap":"12px","alignItems":"center","margin":"8px 12px"}),
+    def _on_frame_slider(self, value):
+        self.set_frame(int(value))
 
-        dcc.Graph(
-            id="graph",
-            figure=initial_fig,
-            style={"height":"80vh"},
-            config={"scrollZoom": True, "doubleClick": "reset", "displaylogo": False}
-        ),
-        dcc.Interval(id="timer", interval=int(1000/max(1,fps)), n_intervals=0, disabled=True),
-        dcc.Store(id="store-playing", data=False),
-        dcc.Store(id="store-indices", data=None),
-        dcc.Store(id="store-frame", data=None),
-        dcc.Store(id="store-frame-ack", data=None),
-    ])
+    def _on_cmap_changed(self, cmap):
+        self.cmap = cmap
+        self._update_cmap()
 
-    # Initial figure
-    app._provider = provider  # stash
-    app._vp = vp
+    def _on_size_min_changed(self, value):
+        v = float(value)
+        if v > self.size_max:
+            self.size_max = v
+            self.slider_size_max.blockSignals(True)
+            self.slider_size_max.setValue(int(round(v)))
+            self.slider_size_max.blockSignals(False)
+        self.size_min = v
+        self._refresh_current_mesh()
 
-    @app.callback(
-        Output("store-playing","data"),
-        Input("btn-play","n_clicks"),
-        Input("btn-pause","n_clicks"),
-        State("store-playing","data"),
-        prevent_initial_call=True
-    )
-    def play_pause(n_play, n_pause, playing):
-        ctx = dash.callback_context
-        if not ctx.triggered:
-            return playing
-        trig = ctx.triggered[0]["prop_id"].split(".")[0]
-        return (trig == "btn-play")
+    def _on_size_max_changed(self, value):
+        v = float(value)
+        if v < self.size_min:
+            self.size_min = v
+            self.slider_size_min.blockSignals(True)
+            self.slider_size_min.setValue(int(round(v)))
+            self.slider_size_min.blockSignals(False)
+        self.size_max = v
+        self._refresh_current_mesh()
 
-    @app.callback(
-        Output("timer","disabled"),
-        Input("store-playing","data")
-    )
-    def toggle_timer(playing):
-        return not bool(playing)
+    def _on_downsample_changed(self, value):
+        step = int(value)
+        self.downsample_step = max(1, step if step != 0 else 1)
+        self._refresh_current_mesh(rebuild_geometry=True)
 
-    @app.callback(
-        Output("slider-t","value"),
-        Input("timer","n_intervals"),
-        State("store-playing","data"),
-        State("slider-t","value")
-    )
-    def tick(_, playing, t):
-        if not playing:
-            return t
-        return (t + 1) % T
+    # ----- Scene updates -----
 
-    @app.callback(
-        Output("store-indices","data"),
-        Input("sl-down","value"),
-        prevent_initial_call=False
-    )
-    def compute_indices(down):
-        ds = int(down or 0)
-        if ds <= 1:
-            return None
-        N = provider.max_points()
-        if not N:
-            return None
-        return np.arange(0, N, ds, dtype=np.int32).tolist()
+    def set_frame(self, frame_index, rebuild_geometry=False):
+        frame_index = int(frame_index) % max(1, self.T)
+        if frame_index == self.current_frame and not rebuild_geometry:
+            return
+        self.current_frame = frame_index
+        xyz, val = self.provider.get(frame_index)
+        xyz, val = _downsample(xyz, val, self.downsample_step)
 
-    @app.callback(
-        Output("graph","figure"),
-        Output("store-frame","data"),
-        Output("lbl-szmin","children"),
-        Output("lbl-szmax","children"),
-        Output("lbl-down","children"),
-        Input("slider-t","value"),
-        Input("dd-cmap","value"),
-        Input("sl-szmin","value"),
-        Input("sl-szmax","value"),
-        Input("sl-down","value"),
-        Input("store-indices","data"),
-        prevent_initial_call=False
-    )
-    def update_fig(t, cmap, szmin, szmax, down, indices_data):
-        # Pull frame and render
-        xyz, val = provider.get(int(t))
-        ds = int(down or 0)
-        if ds > 1:
-            if indices_data is not None:
-                idx = np.asarray(indices_data, dtype=np.int64)
-            else:
-                idx = np.arange(0, xyz.shape[0], ds, dtype=np.int64)
-            xyz_sel = xyz[idx]
-            val_sel = val[idx]
+        if self.static_xyz and not rebuild_geometry and self._mesh is not None:
+            self._mesh.point_data["val"] = np.clip(val, 0.0, 1.0)
+            scale = _compute_sizes(val, self.size_min, self.size_max, self._size_scale)
+            self._mesh.point_data["scale"] = scale
+            self._update_glyph(self._mesh, reuse_points=True)
         else:
-            xyz_sel = xyz
-            val_sel = val
-        sizes = float(szmin) + (float(szmax) - float(szmin)) * val_sel
-        triggered = {entry["prop_id"].split(".")[0] for entry in dash.callback_context.triggered}
-        update_positions = not triggered  # initial call
-        if "sl-down" in triggered or "store-indices" in triggered:
-            update_positions = True
-        color_list = val_sel.tolist()
-        size_list = np.clip(sizes, 1, 100).tolist()
-        restyle_payload = {
-            "color": color_list,
-            "size": size_list,
-            "colorscale": cmap,
-            "cmin": 0,
-            "cmax": 1,
-        }
-        if update_positions:
-            p = Patch()
-            # Update coordinates only when downsample changes to minimize payload
-            p["data"][0]["x"] = xyz_sel[:, 0].tolist()
-            p["data"][0]["y"] = xyz_sel[:, 1].tolist()
-            p["data"][0]["z"] = xyz_sel[:, 2].tolist()
-            p["data"][0]["marker"]["color"] = color_list
-            p["data"][0]["marker"]["size"] = size_list
-            p["data"][0]["marker"]["colorscale"] = cmap
-            p["data"][0]["marker"]["cmin"] = 0
-            p["data"][0]["marker"]["cmax"] = 1
-            figure_update = p
+            self._mesh = self._build_polydata(xyz, val)
+            self._update_glyph(self._mesh, reuse_points=False)
+
+        if self.slider_frame.value() != frame_index:
+            self.slider_frame.blockSignals(True)
+            self.slider_frame.setValue(frame_index)
+            self.slider_frame.blockSignals(False)
+
+    def _refresh_current_mesh(self, rebuild_geometry=False):
+        self.set_frame(self.current_frame, rebuild_geometry=rebuild_geometry)
+
+    def _advance_frame(self):
+        if self.T <= 1:
+            return
+        next_frame = (self.current_frame + 1) % self.T
+        self.set_frame(next_frame)
+
+    def _update_cmap(self):
+        if not self._actor:
+            return
+        lut = pv.LookupTable(cmap=self.cmap)
+        lut.scalar_range = (0.0, 1.0)
+        vtk_mapper = self._actor.actor.GetMapper()
+        vtk_mapper.SetLookupTable(lut)
+        vtk_mapper.SetScalarRange(0.0, 1.0)
+        self.plotter.render()
+
+    def _update_glyph(self, mesh, reuse_points):
+        camera_pos = self.plotter.camera_position
+        if reuse_points and self._glyph is not None:
+            # Regenerate glyph with updated scalars/scale but same points
+            glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
         else:
-            figure_update = dash.no_update
-        lbl_szmin = f"Current: {float(szmin):.0f} px"
-        lbl_szmax = f"Current: {float(szmax):.0f} px"
-        if ds <= 1:
-            lbl_down = "Current: no downsampling"
-        else:
-            lbl_down = f"Current: keep every {ds}th point"
-        return figure_update, restyle_payload, lbl_szmin, lbl_szmax, lbl_down
+            glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
 
-    app.clientside_callback(
-        """
-        function(frameData){
-            if(!frameData){
-                return null;
-            }
-            const container = document.getElementById('graph');
-            if(!container){
-                return frameData;
-            }
-            const plot = container.querySelector('.js-plotly-plot');
-            if(!plot || !plot.data || !window.Plotly){
-                return frameData;
-            }
-            const restyle = {};
-            if(frameData.color){
-                restyle['marker.color'] = [frameData.color];
-            }
-            if(frameData.size){
-                restyle['marker.size'] = [frameData.size];
-            }
-            if(frameData.colorscale){
-                restyle['marker.colorscale'] = [frameData.colorscale];
-            }
-            if(frameData.cmin !== undefined){
-                restyle['marker.cmin'] = [frameData.cmin];
-            }
-            if(frameData.cmax !== undefined){
-                restyle['marker.cmax'] = [frameData.cmax];
-            }
-            if(Object.keys(restyle).length){
-                window.Plotly.restyle(plot, restyle, [0]);
-            }
-            return frameData;
-        }
-        """,
-        Output("store-frame-ack","data"),
-        Input("store-frame","data"),
-        prevent_initial_call=True
-    )
+        self._glyph = glyph
+        vtk_mapper = self._actor.actor.GetMapper()
+        vtk_mapper.SetInputData(glyph)
+        vtk_mapper.SetScalarRange(0.0, 1.0)
+        vtk_mapper.Modified()
+        self.plotter.camera_position = camera_pos
+        self.plotter.render()
 
-    # seed initial figure
-    app._initial_fig = initial_fig
-    return app
+    def closeEvent(self, event):
+        self.stop_playback()
+        super().closeEvent(event)
 
-# ------------- CLI -------------
 
-def infer_points(path, pattern):
-    idx = 0
-    # Count consecutive point files starting at index 0
-    while os.path.exists(os.path.join(path, pattern.format(idx))):
-        idx += 1
-    return idx
+# ---------------- CLI helpers ----------------
 
-def main():
-    ap = argparse.ArgumentParser(description="Dash animated point-cloud viewer.")
+
+def infer_frames(path, pattern):
+    t = 0
+    while os.path.exists(os.path.join(path, pattern.format(t))):
+        t += 1
+    return t
+
+
+def main(argv=None):
+    argv = argv or sys.argv[1:]
+    ap = argparse.ArgumentParser(description="PyVista animated point-cloud viewer.")
     ap.add_argument("--demo", action="store_true", help="Use synthetic expanding wavefront")
-    ap.add_argument("--path", type=str, default=".", help="Folder with per-point NPZ files")
-    ap.add_argument("--pattern", type=str, default="point_{:05d}.npz", help="Filename pattern with {:d} placeholder for point index")
-    ap.add_argument("--points", type=int, help="Number of point files (if not inferable)")
+    ap.add_argument("--path", type=str, default=".", help="Folder with per-frame NPZs")
+    ap.add_argument("--pattern", type=str, default="frame_{:04d}.npz", help="Filename pattern with {:d}")
+    ap.add_argument("--frames", type=int, help="Frame count (if not inferable)")
     ap.add_argument("--series", type=str, help="Single NPZ with xyz/val time series")
     ap.add_argument("--fps", type=int, default=24, help="Playback FPS")
     ap.add_argument("--size-min", type=float, default=2.0)
     ap.add_argument("--size-max", type=float, default=10.0)
     ap.add_argument("--downsample", type=int, default=0, help="Keep every Nth point (0=no downsample)")
-    ap.add_argument("--host", type=str, default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8050)
-    args = ap.parse_args()
+    ap.add_argument("--host", type=str, default="127.0.0.1", help="Unused (compatibility placeholder)")
+    ap.add_argument("--port", type=int, default=8050, help="Unused (compatibility placeholder)")
+    args = ap.parse_args(argv)
 
     if args.demo:
         provider = make_demo_provider()
     elif args.series:
         provider = NPZSeriesProvider(args.series)
     else:
-        points = args.points or infer_points(args.path, args.pattern)
-        if points == 0:
-            raise SystemExit("No point files found. Check --path/--pattern or use --demo.")
-        provider = PointFilesProvider(args.path, args.pattern, points)
+        frames = args.frames or infer_frames(args.path, args.pattern)
+        if frames == 0:
+            raise SystemExit("No frames found. Check --path/--pattern or use --demo.")
+        provider = NPZFramesProvider(args.path, args.pattern, frames)
 
-    vp = VizParams(
-        cmap="Viridis", size_min=args.size_min, size_max=args.size_max, downsample=max(0,args.downsample)
+    params = VizParams(
+        cmap="Viridis",
+        size_min=args.size_min,
+        size_max=args.size_max,
+        downsample=max(0, args.downsample),
     )
-    app = create_app(provider, fps=args.fps, default_params=vp)
-    # Serve with initial figure to avoid first-render lag
-    # @app.server._got_first_request #before_first_request
-    # def _seed():
-    #     pass
-    app.run(host=args.host, port=args.port, debug=False)
+
+    qt_app = QtWidgets.QApplication(sys.argv)
+    viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
+    viewer.resize(1200, 800)
+    viewer.show()
+    sys.exit(qt_app.exec_())
+
 
 if __name__ == "__main__":
     main()
