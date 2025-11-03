@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Capture raw PDM bitstream blocks from the Pico CDC serial port.
+Capture raw PDM bitstream blocks from the Pico over USB CDC or Wi-Fi UDP.
 
-This helper understands the interactive debug CLI that the firmware now exposes.
-It will automatically:
+When talking to the device over USB this helper understands the interactive
+debug CLI that the firmware now exposes. It will automatically:
     * Query the CLI for the current debug state.
     * Disable the periodic ASCII status ticker (unless --keep-stats is given).
     * Disable the per-block hex dump (unless --keep-dumps is given).
@@ -12,7 +12,8 @@ It will automatically:
     * Optionally request a different PDM clock before capturing (via --clock).
     * Restore the previous CLI state when finished (unless --no-restore).
 
-The capture loop then writes fixed-size blocks to the requested output file.
+In Wi-Fi mode the script simply listens for fixed-size UDP payloads from the
+Pico and writes them directly to the requested output file.
 """
 
 from __future__ import annotations
@@ -25,15 +26,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
+import socket
+
 try:
     import serial  # type: ignore
-except ImportError as exc:  # pragma: no cover - dependency check only
-    raise SystemExit("pyserial is required. Install with `pip install pyserial`.") from exc
+except ImportError:  # pragma: no cover - dependency check only
+    serial = None  # type: ignore
 
 
 DEFAULT_BLOCK_BITS = 4096
 DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8
 DEFAULT_TIMEOUT = 1.0
+DEFAULT_WIFI_PORT = 5000
 CLI_READ_WINDOW = 1.0
 
 COMMAND_HELP = b"?"
@@ -250,7 +254,7 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
     return bytes(buffer)
 
 
-def capture_stream(
+def capture_stream_usb(
     port: str,
     output_path: Path,
     block_bytes: int,
@@ -266,7 +270,8 @@ def capture_stream(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with serial.Serial(port=port, baudrate=115200, timeout=timeout) as device, output_path.open("wb") as sink:
+    serial_timeout = None if timeout <= 0 else timeout
+    with serial.Serial(port=port, baudrate=115200, timeout=serial_timeout) as device, output_path.open("wb") as sink:
         debug(f"[cli] connected to {port}", verbose=verbose)
 
         start_state, toggled = configure_device(
@@ -302,55 +307,139 @@ def capture_stream(
     print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
 
 
+def capture_stream_wifi(
+    bind_host: str,
+    bind_port: int,
+    output_path: Path,
+    block_bytes: int,
+    blocks: Optional[int],
+    timeout: float,
+    *,
+    allow_host: Optional[str],
+    verbose: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock, output_path.open("wb") as sink:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_host, bind_port))
+        sock.settimeout(None if timeout <= 0 else timeout)
+
+        debug(f"[wifi] listening on {bind_host}:{bind_port}", verbose=verbose)
+        block_count = 0
+        source_addr: Optional[Tuple[str, int]] = None
+
+        try:
+            while blocks is None or block_count < blocks:
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except socket.timeout as exc:
+                    raise TimeoutError("Timed out waiting for UDP packets from the Pico") from exc
+
+                if allow_host and addr[0] != allow_host:
+                    debug(f"[wifi] ignoring packet from {addr[0]}:{addr[1]}", verbose=verbose)
+                    continue
+
+                if source_addr is None:
+                    source_addr = addr
+                    debug(f"[wifi] receiving from {addr[0]}:{addr[1]}", verbose=verbose)
+
+                if len(data) != block_bytes:
+                    debug(
+                        f"[wifi] unexpected payload size {len(data)} (expected {block_bytes}), "
+                        "packet skipped",
+                        verbose=verbose,
+                    )
+                    continue
+
+                sink.write(data)
+                block_count += 1
+
+        except KeyboardInterrupt:
+            debug("[wifi] capture interrupted by user", verbose=True)
+        finally:
+            sink.flush()
+
+    print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture raw PDM bitstream blocks from the Pico CDC serial port."
+        description="Capture raw PDM bitstream blocks from the Pico over USB (CDC) or Wi-Fi (UDP)."
     )
-    parser.add_argument("port", help="Serial port presented by the Pico (e.g. /dev/ttyACM0 or COM5)")
+    parser.add_argument(
+        "source",
+        nargs="?",
+        help="USB serial port (for --transport usb). Ignored for Wi-Fi captures.",
+    )
     parser.add_argument("output", help="Destination file path for the captured binary data")
+    parser.add_argument(
+        "--transport",
+        choices=("usb", "wifi"),
+        default="usb",
+        help="Select the transport used by the Pico (default: usb).",
+    )
     parser.add_argument(
         "--block-bytes",
         type=int,
         default=DEFAULT_BLOCK_BYTES,
-        help=f"Number of bytes per block (default: {DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits)",
+        help=f"Number of bytes per block (default: {DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits).",
     )
     parser.add_argument(
         "--blocks",
         type=int,
         default=None,
-        help="Optional limit for the number of blocks to capture (default: capture until interrupted)",
+        help="Optional limit for the number of blocks to capture (default: capture until interrupted).",
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
-        help=f"Serial read timeout in seconds (default: {DEFAULT_TIMEOUT})",
+        help=(
+            "I/O timeout in seconds (default: 1.0). Applies to serial reads for USB"
+            " and to UDP receive calls for Wi-Fi."
+        ),
     )
     parser.add_argument(
         "--clock",
         type=int,
         choices=sorted(COMMAND_CLOCK.keys()),
-        help="Request the firmware to restart with the given PDM clock frequency (Hz) before capturing.",
+        help="(USB only) Request the firmware to restart with the given PDM clock frequency (Hz) before capturing.",
     )
     parser.add_argument(
         "--keep-stats",
         action="store_true",
-        help="Leave the periodic stats ticker enabled (default: disable to avoid ASCII in the stream).",
+        help="(USB only) Leave the periodic stats ticker enabled (default: disable to avoid ASCII in the stream).",
     )
     parser.add_argument(
         "--keep-dumps",
         action="store_true",
-        help="Leave the per-block hex dump enabled if it is currently active.",
+        help="(USB only) Leave the per-block hex dump enabled if it is currently active.",
     )
     parser.add_argument(
         "--no-restore",
         action="store_true",
-        help="Do not restore the previous CLI state after capture (binary streaming will remain in its new state).",
+        help="(USB only) Do not restore the previous CLI state after capture (binary streaming will remain enabled).",
+    )
+    parser.add_argument(
+        "--wifi-bind",
+        default="0.0.0.0",
+        help="Address to bind for Wi-Fi/UDP capture (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--wifi-port",
+        type=int,
+        default=DEFAULT_WIFI_PORT,
+        help=f"UDP port to listen on for Wi-Fi captures (default: {DEFAULT_WIFI_PORT}).",
+    )
+    parser.add_argument(
+        "--wifi-allow",
+        help="Restrict Wi-Fi capture to packets from a specific source IPv4 address.",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print diagnostic information about CLI interactions to stderr.",
+        help="Print diagnostic information about CLI or network interactions to stderr.",
     )
 
     return parser.parse_args(argv)
@@ -363,29 +452,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Block size must be positive", file=sys.stderr)
         return 2
 
-    try:
-        capture_stream(
-            args.port,
-            Path(args.output),
-            args.block_bytes,
-            args.blocks,
-            args.timeout,
-            disable_stats=not args.keep_stats,
-            disable_dump=not args.keep_dumps,
-            enable_stream=True,
-            restore=not args.no_restore,
-            clock=args.clock,
-            verbose=args.verbose,
-        )
-    except TimeoutError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    except serial.SerialException as exc:
-        print(f"Serial error: {exc}", file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    if args.transport == "usb":
+        if not args.source:
+            print("USB transport requires a serial port argument", file=sys.stderr)
+            return 2
+
+        if serial is None:
+            print("pyserial is required for USB captures. Install with `pip install pyserial`.", file=sys.stderr)
+            return 2
+
+        try:
+            capture_stream_usb(
+                args.source,
+                Path(args.output),
+                args.block_bytes,
+                args.blocks,
+                args.timeout,
+                disable_stats=not args.keep_stats,
+                disable_dump=not args.keep_dumps,
+                enable_stream=True,
+                restore=not args.no_restore,
+                clock=args.clock,
+                verbose=args.verbose,
+            )
+        except TimeoutError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except serial.SerialException as exc:
+            print(f"Serial error: {exc}", file=sys.stderr)
+            return 1
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
+            print("Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.", file=sys.stderr)
+
+        try:
+            capture_stream_wifi(
+                args.wifi_bind,
+                args.wifi_port,
+                Path(args.output),
+                args.block_bytes,
+                args.blocks,
+                args.timeout,
+                allow_host=args.wifi_allow,
+                verbose=args.verbose,
+            )
+        except TimeoutError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"Socket error: {exc}", file=sys.stderr)
+            return 1
 
     return 0
 

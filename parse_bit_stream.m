@@ -16,9 +16,9 @@
 ## and optionally decimate to a reasonable PCM rate.
 
 ## --- user settings ---------------------------------------------------------
-fn      = "/home/matt/projects/wavespace/microphone-library-for-pico-forked/raw_pdm.bin";   % your input file
-fs_in   = 1024000;               % PDM bit/sample rate (Hz). Change if not 3 MHz.
-fc      = 50e3;             % desired low-pass cutoff (Hz)
+fn      = "/home/matt/projects/wavespace/microphone-library-for-pico-forked/examples/hello_pdm_microphone/output.bin";   % your input file
+fs_in   = 4800000;               % PDM bit/sample rate (Hz). Change if not 3 MHz.
+fc      = 80e3;             % desired low-pass cutoff (Hz)
 bit_msbfirst= true;         % set false if your file is LSB-first
 map_pm1     = true;         % true: {0,1}->{-1,+1}; false: keep {0,1}
 
