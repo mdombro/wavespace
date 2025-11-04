@@ -15,6 +15,8 @@
 
 #include "tusb.h"
 
+// Example entry point: capture PDM audio and stream over USB CDC and/or UDP.
+
 #ifndef WIFI_SSID
 #define WIFI_SSID "Routers of Rohan"
 #endif
@@ -51,7 +53,7 @@ static uint8_t discard_buffer[PDM_BLOCK_BYTES];
 static volatile bool block_pending = false;
 static volatile int block_length = 0;
 
-// Debug/telemetry state
+// Debug/telemetry counters surfaced through the CLI stats.
 static volatile uint32_t blocks_ready = 0;
 static volatile uint32_t blocks_discarded = 0;
 static volatile uint32_t overruns = 0;
@@ -74,10 +76,23 @@ static bool wifi_stream_enabled = true;
 static struct udp_pcb* wifi_udp_socket = NULL;
 static ip_addr_t wifi_remote_addr;
 
+#define WIFI_QUEUE_CAPACITY 8
+
+typedef struct {
+    uint8_t data[PDM_BLOCK_BYTES];
+    uint16_t length;
+} wifi_packet_t;
+
+static wifi_packet_t wifi_queue[WIFI_QUEUE_CAPACITY];
+static uint8_t wifi_queue_head = 0;
+static uint8_t wifi_queue_tail = 0;
+static uint8_t wifi_queue_count = 0;
+
 static uint32_t wifi_packets_sent = 0;
 static uint32_t wifi_bytes_sent = 0;
 static uint32_t wifi_send_failures = 0;
 static uint32_t wifi_alloc_failures = 0;
+static uint32_t wifi_queue_drops = 0;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
@@ -91,8 +106,11 @@ static struct pdm_microphone_config config = {
 static void clear_stats(void);
 static void on_pdm_samples_ready(void);
 static bool initialise_wifi(void);
-static void wifi_send_block(const uint8_t* data, size_t length);
+static bool wifi_queue_push(const uint8_t* data, size_t length);
+static void wifi_queue_service(void);
+static void wifi_queue_clear(void);
 
+// Clear producer/consumer flags so the next DMA callback restarts cleanly.
 static void reset_capture_state(void) {
     uint32_t status = save_and_disable_interrupts();
     block_pending = false;
@@ -101,8 +119,10 @@ static void reset_capture_state(void) {
 
     clear_stats();
     last_debug_ms = to_ms_since_boot(get_absolute_time());
+    wifi_queue_clear();
 }
 
+// Reconfigure the microphone library at runtime while preserving state trackers.
 static bool restart_microphone(uint32_t new_rate) {
     uint32_t previous_rate = config.sample_rate;
     bool success = false;
@@ -152,6 +172,7 @@ static bool initialise_wifi(void) {
         return wifi_ready;
     }
 
+    // Perform a one-time bring-up of the CYW43 stack and UDP socket.
     wifi_initialised = true;
     bool success = false;
 
@@ -182,6 +203,7 @@ static bool initialise_wifi(void) {
         goto cleanup;
     }
 
+    // Bind to an ephemeral local port; destination is set per-packet.
     err_t bind_err = udp_bind(wifi_udp_socket, IP_ANY_TYPE, 0);
     cyw43_arch_lwip_end();
 
@@ -197,6 +219,7 @@ static bool initialise_wifi(void) {
 cleanup:
     if (!success) {
         if (wifi_udp_socket != NULL) {
+            // Tear down any partially initialised lwIP state before retrying.
             cyw43_arch_lwip_begin();
             udp_remove(wifi_udp_socket);
             cyw43_arch_lwip_end();
@@ -211,6 +234,7 @@ cleanup:
 }
 
 static void on_pdm_samples_ready(void) {
+    // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t* target = block_pending ? discard_buffer : sample_buffer;
     int read = pdm_microphone_read(target, PDM_BLOCK_BYTES);
 
@@ -248,7 +272,7 @@ static void print_stats(void) {
         : (wifi_initialised ? "init-failed" : "not-started");
 
     printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz "
-           "wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu\n",
+           "wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu queue=%u drop=%lu\n",
            (unsigned long)blocks_ready,
            (unsigned long)blocks_streamed,
            (unsigned long)blocks_discarded,
@@ -261,10 +285,13 @@ static void print_stats(void) {
            (unsigned long)wifi_packets_sent,
            (unsigned long)wifi_bytes_sent,
            (unsigned long)wifi_send_failures,
-           (unsigned long)wifi_alloc_failures);
+           (unsigned long)wifi_alloc_failures,
+           wifi_queue_count,
+           (unsigned long)wifi_queue_drops);
 }
 
 static void print_network_status(void) {
+    // Dump Wi-Fi counters without toggling streaming state.
     printf("Wi-Fi streaming %s\n", wifi_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", wifi_initialised ? "YES" : "NO");
     printf("  ready:       %s\n", wifi_ready ? "YES" : "NO");
@@ -273,6 +300,8 @@ static void print_network_status(void) {
     printf("  bytes:       %lu\n", (unsigned long)wifi_bytes_sent);
     printf("  send error:  %lu\n", (unsigned long)wifi_send_failures);
     printf("  alloc fail:  %lu\n", (unsigned long)wifi_alloc_failures);
+    printf("  queue depth: %u / %u\n", wifi_queue_count, WIFI_QUEUE_CAPACITY);
+    printf("  queue drops: %lu\n", (unsigned long)wifi_queue_drops);
 }
 
 static void clear_stats(void) {
@@ -289,8 +318,10 @@ static void clear_stats(void) {
     wifi_bytes_sent = 0;
     wifi_send_failures = 0;
     wifi_alloc_failures = 0;
+    wifi_queue_drops = 0;
 }
 
+// Poll the USB CDC RX path for single-character debug commands.
 static void handle_console_input(void) {
     while (tud_cdc_available()) {
         int ch = tud_cdc_read_char();
@@ -325,6 +356,9 @@ static void handle_console_input(void) {
             case 'w':
                 wifi_stream_enabled = !wifi_stream_enabled;
                 printf("Wi-Fi streaming %s\n", wifi_stream_enabled ? "ENABLED" : "DISABLED");
+                if (!wifi_stream_enabled) {
+                    wifi_queue_clear();
+                }
                 break;
             case 'n':
                 print_network_status();
@@ -408,30 +442,63 @@ static void dump_block_summary(const uint8_t* data, size_t length, uint32_t bloc
     printf(" | ones=%lu zeros=%lu\n", (unsigned long)ones, (unsigned long)zeros);
 }
 
-static void wifi_send_block(const uint8_t* data, size_t length) {
-    if (!wifi_ready || !wifi_stream_enabled || wifi_udp_socket == NULL || length == 0) {
+static bool wifi_queue_push(const uint8_t* data, size_t length) {
+    if (!wifi_stream_enabled || !wifi_ready || wifi_udp_socket == NULL || length == 0) {
+        return false;
+    }
+
+    if (wifi_queue_count >= WIFI_QUEUE_CAPACITY) {
+        wifi_queue_drops++;
+        return false;
+    }
+
+    wifi_packet_t* slot = &wifi_queue[wifi_queue_tail];
+    memcpy(slot->data, data, length);
+    slot->length = (uint16_t)length;
+
+    wifi_queue_tail = (uint8_t)((wifi_queue_tail + 1) % WIFI_QUEUE_CAPACITY);
+    wifi_queue_count++;
+    return true;
+}
+
+static void wifi_queue_service(void) {
+    if (!wifi_ready || !wifi_stream_enabled || wifi_udp_socket == NULL) {
         return;
     }
 
-    cyw43_arch_lwip_begin();
-    struct pbuf* packet = pbuf_alloc(PBUF_TRANSPORT, length, PBUF_RAM);
-    if (packet == NULL) {
+    while (wifi_queue_count > 0) {
+        wifi_packet_t* pkt = &wifi_queue[wifi_queue_head];
+
+        cyw43_arch_lwip_begin();
+        struct pbuf* buffer = pbuf_alloc(PBUF_TRANSPORT, pkt->length, PBUF_RAM);
+        if (buffer == NULL) {
+            cyw43_arch_lwip_end();
+            wifi_alloc_failures++;
+            break;
+        }
+
+        memcpy(buffer->payload, pkt->data, pkt->length);
+        err_t err = udp_sendto(wifi_udp_socket, buffer, &wifi_remote_addr, WIFI_TARGET_PORT);
+        pbuf_free(buffer);
         cyw43_arch_lwip_end();
-        wifi_alloc_failures++;
-        return;
-    }
 
-    memcpy(packet->payload, data, length);
-    err_t err = udp_sendto(wifi_udp_socket, packet, &wifi_remote_addr, WIFI_TARGET_PORT);
-    pbuf_free(packet);
-    cyw43_arch_lwip_end();
+        if (err != ERR_OK) {
+            wifi_send_failures++;
+            break;
+        }
 
-    if (err == ERR_OK) {
         wifi_packets_sent++;
-        wifi_bytes_sent += (uint32_t)length;
-    } else {
-        wifi_send_failures++;
+        wifi_bytes_sent += pkt->length;
+
+        wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
+        wifi_queue_count--;
     }
+}
+
+static void wifi_queue_clear(void) {
+    wifi_queue_head = 0;
+    wifi_queue_tail = 0;
+    wifi_queue_count = 0;
 }
 
 static void usb_write_blocking(const uint8_t* data, size_t length) {
@@ -446,6 +513,7 @@ static void usb_write_blocking(const uint8_t* data, size_t length) {
 
         uint32_t available = tud_cdc_write_available();
         if (available == 0) {
+            // Back-pressure until the host drains its buffers.
             sleep_ms(1);
             continue;
         }
@@ -519,6 +587,7 @@ int main(void) {
     while (true) {
         tud_task();
         handle_console_input();
+        wifi_queue_service();
 
         if (!block_pending) {
             tight_loop_contents();
@@ -548,7 +617,8 @@ int main(void) {
             dump_block_summary(transfer_buffer, (size_t)bytes_to_send, block_id);
         }
 
-        wifi_send_block(transfer_buffer, (size_t)bytes_to_send);
+        wifi_queue_push(transfer_buffer, (size_t)bytes_to_send);
+        wifi_queue_service();
 
         if (stream_binary_data) {
             usb_write_blocking(transfer_buffer, (size_t)bytes_to_send);
