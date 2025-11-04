@@ -19,6 +19,7 @@
 
 #define PDM_RAW_BUFFER_COUNT 2
 
+// Module-level capture context shared by the simple single-microphone API.
 static struct {
     struct pdm_microphone_config config;
     int dma_channel;
@@ -33,6 +34,7 @@ static struct {
 
 static void pdm_dma_handler();
 
+// Configure the PIO state machine and DMA to begin buffering raw PDM data.
 int pdm_microphone_init(const struct pdm_microphone_config* config) {
     memset(&pdm_mic, 0x00, sizeof(pdm_mic));
     memcpy(&pdm_mic.config, config, sizeof(pdm_mic.config));
@@ -61,6 +63,7 @@ int pdm_microphone_init(const struct pdm_microphone_config* config) {
 
     uint pio_sm_offset = pio_add_program(config->pio, &pdm_microphone_data_program);
 
+    // PDM program requires a 4x oversampled clock relative to the desired bit rate.
     float clk_div = clock_get_hz(clk_sys) / (config->sample_rate * 4.0f);
 
     pdm_microphone_data_init(
@@ -81,6 +84,7 @@ int pdm_microphone_init(const struct pdm_microphone_config* config) {
 
     pdm_mic.dma_irq = DMA_IRQ_0;
 
+    // Prime the DMA engine with the first buffer but leave it disabled until start().
     dma_channel_configure(
         pdm_mic.dma_channel,
         &dma_channel_cfg,
@@ -97,6 +101,7 @@ int pdm_microphone_init(const struct pdm_microphone_config* config) {
     return 0;
 }
 
+// Free DMA-owned buffers and release the claimed channel.
 void pdm_microphone_deinit() {
     for (int i = 0; i < PDM_RAW_BUFFER_COUNT; i++) {
         if (pdm_mic.raw_buffer[i]) {
@@ -113,11 +118,13 @@ void pdm_microphone_deinit() {
     }
 }
 
+// Prime the DMA ring and enable the PIO state machine.
 int pdm_microphone_start() {
     pdm_mic.raw_buffer_write_index = 0;
     pdm_mic.raw_buffer_read_index = 0;
     pdm_mic.raw_buffer_ready_count = 0;
 
+    // DMA IRQ 0 is used by default; ensure pending status is cleared.
     if (pdm_mic.dma_irq == DMA_IRQ_0) {
         dma_hw->ints0 = (1u << pdm_mic.dma_channel);
         dma_channel_set_irq0_enabled(pdm_mic.dma_channel, true);
@@ -152,6 +159,7 @@ int pdm_microphone_start() {
     return 0;
 }
 
+// Halt PIO/DMA activity but keep configuration for potential restart.
 void pdm_microphone_stop() {
     pio_sm_set_enabled(
         pdm_mic.config.pio,
@@ -172,6 +180,7 @@ void pdm_microphone_stop() {
     pdm_mic.raw_buffer_ready_count = 0;
 }
 
+// DMA completion ISR: advances the ring buffer and notifies the application.
 static void pdm_dma_handler() {
     // clear IRQ
     if (pdm_mic.dma_irq == DMA_IRQ_0) {
@@ -202,10 +211,12 @@ static void pdm_dma_handler() {
     }
 }
 
+// Allow the user to hook the high-priority ready callback.
 void pdm_microphone_set_samples_ready_handler(pdm_samples_ready_handler_t handler) {
     pdm_mic.samples_ready_handler = handler;
 }
 
+// Copy the next available raw buffer into the caller-provided scratch space.
 int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
     if (!buffer || max_bytes == 0) {
         return 0;
@@ -215,6 +226,7 @@ int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
         return -1;
     }
 
+    // Hold off DMA ISR while copying out the completed buffer.
     uint32_t status = save_and_disable_interrupts();
 
     if (pdm_mic.raw_buffer_ready_count == 0) {
