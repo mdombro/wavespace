@@ -17,6 +17,7 @@
 
 ## --- user settings ---------------------------------------------------------
 fn      = "/home/matt/projects/wavespace/microphone-library-for-pico-forked/examples/hello_pdm_microphone/output.bin";   % your input file
+fn = "/home/matthew/projects/wavespace/microphone-library-for-pico-forked/examples/hello_pdm_microphone/output.bin";
 fs_in   = 4800000;               % PDM bit/sample rate (Hz). Change if not 3 MHz.
 fc      = 80e3;             % desired low-pass cutoff (Hz)
 bit_msbfirst= true;         % set false if your file is LSB-first
@@ -74,8 +75,8 @@ else
   y_filt = y_full;
 end
 
-figure(1)
-plot(y_filt)
+#figure(1)
+#plot(y_filt)
 
 scale = max(1, max(abs(y_filt)));
 audiowrite("pdm_filtered.wav", y_filt/scale, fs_in);
@@ -104,51 +105,51 @@ printf("Out: fs_mid = %.1f kHz (dec_fac = %d), samples = %d\n", fs_mid/1e3, dec_
 scale = max(1, max(abs(y_mid)));
 audiowrite("pdm_filtered_decimated.wav", y_mid/scale, fs_mid);
 
-## --- optional: second stage to audio rate ---------------------------------
-if do_audio_out
-  % Design audio-rate LPF at fs_mid with cutoff audio_fc
-  trans2 = 0.2 * audio_fc;
-  dfn2   = trans2 / (fs_mid/2);
-  N2     = max(64, 2*ceil(3.3/dfn2/2)*2);    % even order
-  wc2    = audio_fc/(fs_mid/2);
-  n2=(0:N2)'; n02=N2/2; m2=n2-n02;
-  h2 = (wc2 * sinc(wc2*m2)) .* (0.54 - 0.46*cos(2*pi*n2/N2));
-  h2 = h2 / sum(h2);
-
-  y2_full = filter(h2, 1, y_mid);
-  D2 = N2/2;
-  if numel(y2_full) > D2
-    y2 = y2_full(D2+1:end);
-  else
-    y2 = y2_full;
-  end
-
-  % Rational resample using rat() for a clean p/q
-  [p,q] = rat(audio_fs / fs_mid, 1e-12);
-  % Upsample by p (zero-stuff), filter, then downsample by q
-  up = zeros(numel(y2)*p, 1); up(1:p:end) = y2;
-  y3_full = filter(h2, 1, up);                    % reuse h2 as anti-image
-  if numel(y3_full) > D2
-    y3 = y3_full(D2+1:end);
-  else
-    y3 = y3_full;
-  end
-  y_audio = y3(1:q:end);
-
-  % Tiny fade to avoid endpoint clicks
-  fade_ms = 2;
-  fade_n  = max(1, round(audio_fs*fade_ms/1000));
-  if numel(y_audio) > 2*fade_n
-    env = ones(size(y_audio));
-    env(1:fade_n) = (0:fade_n-1).'/(fade_n-1);
-    env(end-fade_n+1:end) = env(fade_n:-1:1);
-    y_audio = y_audio .* env;
-  end
-
-  scale = max(1, max(abs(y_audio)));
-  audiowrite("pdm_filtered_48k.wav", y_audio/scale, audio_fs);
-  printf("WAV written: pdm_filtered_48k.wav at %d Hz\n", audio_fs);
-end
+#### --- optional: second stage to audio rate ---------------------------------
+##if do_audio_out
+##  % Design audio-rate LPF at fs_mid with cutoff audio_fc
+##  trans2 = 0.2 * audio_fc;
+##  dfn2   = trans2 / (fs_mid/2);
+##  N2     = max(64, 2*ceil(3.3/dfn2/2)*2);    % even order
+##  wc2    = audio_fc/(fs_mid/2);
+##  n2=(0:N2)'; n02=N2/2; m2=n2-n02;
+##  h2 = (wc2 * sinc(wc2*m2)) .* (0.54 - 0.46*cos(2*pi*n2/N2));
+##  h2 = h2 / sum(h2);
+##
+##  y2_full = filter(h2, 1, y_mid);
+##  D2 = N2/2;
+##  if numel(y2_full) > D2
+##    y2 = y2_full(D2+1:end);
+##  else
+##    y2 = y2_full;
+##  end
+##
+##  % Rational resample using rat() for a clean p/q
+##  [p,q] = rat(audio_fs / fs_mid, 1e-12);
+##  % Upsample by p (zero-stuff), filter, then downsample by q
+##  up = zeros(numel(y2)*p, 1); up(1:p:end) = y2;
+##  y3_full = filter(h2, 1, up);                    % reuse h2 as anti-image
+##  if numel(y3_full) > D2
+##    y3 = y3_full(D2+1:end);
+##  else
+##    y3 = y3_full;
+##  end
+##  y_audio = y3(1:q:end);
+##
+##  % Tiny fade to avoid endpoint clicks
+##  fade_ms = 2;
+##  fade_n  = max(1, round(audio_fs*fade_ms/1000));
+##  if numel(y_audio) > 2*fade_n
+##    env = ones(size(y_audio));
+##    env(1:fade_n) = (0:fade_n-1).'/(fade_n-1);
+##    env(end-fade_n+1:end) = env(fade_n:-1:1);
+##    y_audio = y_audio .* env;
+##  end
+##
+##  scale = max(1, max(abs(y_audio)));
+##  audiowrite("pdm_filtered_48k.wav", y_audio/scale, audio_fs);
+##  printf("WAV written: pdm_filtered_48k.wav at %d Hz\n", audio_fs);
+##end
 
 ## --- quick looks -----------------------------------------------------------
 ms = 5e-3; nshow = min(numel(y_mid), round(fs_mid*ms));
