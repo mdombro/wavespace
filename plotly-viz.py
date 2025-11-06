@@ -19,6 +19,19 @@ import os
 import sys
 from dataclasses import dataclass
 
+# Detect early whether the current environment has a display server. This lets us
+# fail fast with a useful message instead of PyQt attempting to load the xcb
+# platform plugin and aborting the process when no GUI is available.
+DISPLAY_ENV_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_DISPLAY_1", "MIR_SOCKET")
+HEADLESS_ENV = sys.platform.startswith("linux") and not any(
+    os.environ.get(var) for var in DISPLAY_ENV_VARS
+)
+
+# Recognise --offscreen early so we can configure Qt before importing PyQt5.
+OFFSCREEN_REQUESTED = "--offscreen" in sys.argv[1:]
+if OFFSCREEN_REQUESTED:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import numpy as np
 
 from PyQt5 import QtCore, QtWidgets
@@ -110,7 +123,7 @@ class NPZSeriesProvider(ProviderBase):
         return self._mode == "static"
 
 
-def make_demo_provider(T=160, N=60000, radius=1.0):
+def make_demo_provider(T=160, N=1000, radius=1.0):
     rng = np.random.default_rng(7)
     u = rng.random(N)
     cost = rng.uniform(-1, 1, N)
@@ -159,6 +172,11 @@ class VizParams:
     size_min: float = 2.0
     size_max: float = 10.0
     downsample: int = 0  # 0 = no downsample
+
+
+def _normalize_cmap_name(name: str) -> str:
+    """Translate UI colormap labels into the lowercase keys expected by Matplotlib."""
+    return (name or "").strip().lower()
 
 
 def _downsample(xyz, val, step):
@@ -301,16 +319,34 @@ class PointCloudViewer(QtWidgets.QMainWindow):
     def _initialize_scene(self, xyz, val):
         mesh = self._build_polydata(xyz, val)
         glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
+        self._apply_scalars_to_glyph(glyph, mesh)
         self._mesh = mesh
         self._glyph = glyph
         self._actor = self.plotter.add_mesh(
             glyph,
             scalars="val",
-            cmap=self.cmap,
+            cmap=_normalize_cmap_name(self.cmap),
             clim=[0.0, 1.0],
             lighting=False,
             show_scalar_bar=True,
+            opacity=0.5,
         )
+        if hasattr(self._actor, "prop"):
+            prop = self._actor.prop
+            if hasattr(prop, "opacity"):
+                try:
+                    prop.opacity = 0.5
+                except Exception:
+                    pass
+            if hasattr(prop, "SetOpacity"):
+                prop.SetOpacity(0.5)
+        elif hasattr(self._actor, "GetProperty"):
+            self._actor.GetProperty().SetOpacity(0.5)
+        vtk_mapper = self._get_actor_mapper()
+        if vtk_mapper is not None:
+            self._ensure_mapper_scalar_settings(vtk_mapper)
+            if hasattr(vtk_mapper, "SetScalarRange"):
+                vtk_mapper.SetScalarRange(0.0, 1.0)
         self.plotter.show_axes()
         self.plotter.render()
 
@@ -319,7 +355,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         val = np.clip(np.asarray(val, dtype=np.float32), 0.0, 1.0)
         mesh = pv.PolyData(xyz)
         mesh.point_data["val"] = val
-        mesh.point_data.set_active_scalars("val")
+        mesh.point_data.active_scalars_name = "val"
         scale = _compute_sizes(val, self.size_min, self.size_max, self._size_scale)
         mesh.point_data["scale"] = scale
         return mesh
@@ -404,12 +440,56 @@ class PointCloudViewer(QtWidgets.QMainWindow):
     def _update_cmap(self):
         if not self._actor:
             return
-        lut = pv.LookupTable(cmap=self.cmap)
+        lut = pv.LookupTable(cmap=_normalize_cmap_name(self.cmap))
         lut.scalar_range = (0.0, 1.0)
-        vtk_mapper = self._actor.actor.GetMapper()
-        vtk_mapper.SetLookupTable(lut)
-        vtk_mapper.SetScalarRange(0.0, 1.0)
+        vtk_mapper = self._get_actor_mapper()
+        if vtk_mapper is None:
+            raise RuntimeError("Could not access mapper on actor for colormap update.")
+        self._ensure_mapper_scalar_settings(vtk_mapper)
+        if hasattr(vtk_mapper, "SetLookupTable"):
+            vtk_mapper.SetLookupTable(lut)
+        if hasattr(vtk_mapper, "SetScalarRange"):
+            vtk_mapper.SetScalarRange(0.0, 1.0)
+        if hasattr(vtk_mapper, "Modified"):
+            vtk_mapper.Modified()
         self.plotter.render()
+
+    def _get_actor_mapper(self):
+        if not self._actor:
+            return None
+        mapper = getattr(self._actor, "mapper", None)
+        if mapper is None and hasattr(self._actor, "GetMapper"):
+            mapper = self._actor.GetMapper()
+        if mapper is None:
+            return None
+        return getattr(mapper, "_vtk_obj", mapper)
+
+    def _ensure_mapper_scalar_settings(self, vtk_mapper):
+        if hasattr(vtk_mapper, "SetScalarModeToUsePointFieldData"):
+            vtk_mapper.SetScalarModeToUsePointFieldData()
+        if hasattr(vtk_mapper, "SelectColorArray"):
+            vtk_mapper.SelectColorArray("val")
+        if hasattr(vtk_mapper, "ScalarVisibilityOn"):
+            vtk_mapper.ScalarVisibilityOn()
+        if hasattr(vtk_mapper, "SetColorModeToMapScalars"):
+            vtk_mapper.SetColorModeToMapScalars()
+
+    def _apply_scalars_to_glyph(self, glyph, mesh):
+        if glyph is None or mesh is None:
+            return
+        if "val" not in mesh.point_data:
+            return
+        vals = mesh.point_data["val"]
+        vals = np.asarray(vals, dtype=np.float32)
+        total_points = int(getattr(glyph, "n_points", 0) or 0)
+        if total_points and vals.size == 0:
+            vals = np.zeros(total_points, dtype=np.float32)
+        elif total_points and vals.size and total_points != vals.size:
+            reps = int(np.ceil(total_points / float(vals.size)))
+            vals = np.repeat(vals, reps)[:total_points]
+        glyph.point_data["val"] = vals
+        if hasattr(glyph.point_data, "active_scalars_name"):
+            glyph.point_data.active_scalars_name = "val"
 
     def _update_glyph(self, mesh, reuse_points):
         camera_pos = self.plotter.camera_position
@@ -419,11 +499,21 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         else:
             glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
 
+        self._apply_scalars_to_glyph(glyph, mesh)
         self._glyph = glyph
-        vtk_mapper = self._actor.actor.GetMapper()
-        vtk_mapper.SetInputData(glyph)
-        vtk_mapper.SetScalarRange(0.0, 1.0)
-        vtk_mapper.Modified()
+        vtk_mapper = self._get_actor_mapper()
+        if vtk_mapper is None:
+            raise RuntimeError("Could not access mapper on actor for glyph update.")
+        self._ensure_mapper_scalar_settings(vtk_mapper)
+        if hasattr(vtk_mapper, "SetInputData"):
+            vtk_mapper.SetInputData(glyph)
+        else:
+            vtk_mapper.SetInputDataObject(glyph)
+        self._ensure_mapper_scalar_settings(vtk_mapper)
+        if hasattr(vtk_mapper, "SetScalarRange"):
+            vtk_mapper.SetScalarRange(0.0, 1.0)
+        if hasattr(vtk_mapper, "Modified"):
+            vtk_mapper.Modified()
         self.plotter.camera_position = camera_pos
         self.plotter.render()
 
@@ -456,7 +546,21 @@ def main(argv=None):
     ap.add_argument("--downsample", type=int, default=0, help="Keep every Nth point (0=no downsample)")
     ap.add_argument("--host", type=str, default="127.0.0.1", help="Unused (compatibility placeholder)")
     ap.add_argument("--port", type=int, default=8050, help="Unused (compatibility placeholder)")
+    ap.add_argument(
+        "--offscreen",
+        action="store_true",
+        help="Attempt to run with Qt offscreen platform (no interactive window).",
+    )
     args = ap.parse_args(argv)
+
+    if args.offscreen and not OFFSCREEN_REQUESTED:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    if HEADLESS_ENV and not (args.offscreen or os.environ.get("QT_QPA_PLATFORM") == "offscreen"):
+        raise SystemExit(
+            "No display server detected (DISPLAY/WAYLAND variables are empty). "
+            "Run on a machine with a GUI or re-run with --offscreen to try headless mode."
+        )
 
     if args.demo:
         provider = make_demo_provider()
@@ -475,7 +579,20 @@ def main(argv=None):
         downsample=max(0, args.downsample),
     )
 
-    qt_app = QtWidgets.QApplication(sys.argv)
+    if args.offscreen:
+        print(
+            "Running in Qt offscreen mode; no interactive window will be displayed.",
+            file=sys.stderr,
+        )
+
+    try:
+        qt_app = QtWidgets.QApplication(sys.argv)
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to initialise the Qt application. Details: {exc}\n"
+            "If you are running in a headless environment, pass --offscreen "
+            "or set QT_QPA_PLATFORM=offscreen."
+        )
     viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
     viewer.resize(1200, 800)
     viewer.show()
