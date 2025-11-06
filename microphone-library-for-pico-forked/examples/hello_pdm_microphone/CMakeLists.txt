@@ -3,15 +3,24 @@ cmake_minimum_required(VERSION 3.12)
 # rest of your project
 add_executable(hello_pdm_microphone
     main.c
+    usb_descriptors.c
 )
 
 target_link_libraries(hello_pdm_microphone
     pico_pdm_microphone
     pico_stdlib
     pico_cyw43_arch_lwip_threadsafe_background
+    tinyusb_device
+    tinyusb_board
 )
 
 target_include_directories(hello_pdm_microphone PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+
+target_compile_definitions(hello_pdm_microphone PRIVATE
+    CFG_TUSB_CONFIG_FILE=\"tusb_config.h\"
+    PICO_STDIO_USB_ENABLE_TINYUSB_INIT=1
+    PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=0
+)
 
 # enable usb output, disable uart output
 pico_enable_stdio_usb(hello_pdm_microphone 1)

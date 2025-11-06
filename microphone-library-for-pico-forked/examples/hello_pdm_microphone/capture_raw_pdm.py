@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Capture raw PDM bitstream blocks from the Pico over USB CDC or Wi-Fi UDP.
+Capture raw PDM bitstream blocks from the Pico over USB CDC, a vendor-specific USB
+bulk endpoint, or Wi-Fi UDP.
 
 When talking to the device over USB this helper understands the interactive
 debug CLI that the firmware now exposes. It will automatically:
@@ -10,6 +11,7 @@ debug CLI that the firmware now exposes. It will automatically:
     * Disable the per-block hex dump (unless --keep-dumps is given).
     * Enable binary streaming so that subsequent reads are pure PDM data.
     * Optionally request a different PDM clock before capturing (via --clock).
+    * Optionally enable the dedicated vendor USB stream (when requested).
     * Restore the previous CLI state when finished (unless --no-restore).
 
 In Wi-Fi mode the script simply listens for fixed-size UDP payloads from the
@@ -33,17 +35,30 @@ try:
 except ImportError:  # pragma: no cover - dependency check only
     serial = None  # type: ignore
 
+try:
+    import usb.core  # type: ignore
+    import usb.util  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    usb = None  # type: ignore
+else:
+    import usb  # type: ignore
 
-DEFAULT_BLOCK_BITS = 4096
+
+DEFAULT_BLOCK_BITS = 8192
 DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_WIFI_PORT = 5000
 CLI_READ_WINDOW = 1.0
+DEFAULT_USB_VENDOR_VID = 0x2E8A
+DEFAULT_USB_VENDOR_PID = 0x4001
+DEFAULT_USB_VENDOR_INTERFACE = 2
+DEFAULT_USB_VENDOR_ENDPOINT = 0x83
 
 COMMAND_HELP = b"?"
 COMMAND_TOGGLE_STREAM = b"b"
 COMMAND_TOGGLE_STATS = b"s"
 COMMAND_TOGGLE_DUMP = b"d"
+COMMAND_TOGGLE_VENDOR = b"u"
 COMMAND_REINIT = b"r"
 COMMAND_CLOCK = {
     512_000: b"1",
@@ -54,6 +69,7 @@ COMMAND_CLOCK = {
 STREAM_LINE = re.compile(r"toggle binary streaming \(currently (ON|OFF)\)", re.IGNORECASE)
 STATS_LINE = re.compile(r"toggle periodic stats \(currently (ON|OFF)\)", re.IGNORECASE)
 DUMP_LINE = re.compile(r"toggle per-block sample dump \(currently (ON|OFF)\)", re.IGNORECASE)
+VENDOR_LINE = re.compile(r"toggle USB vendor streaming \(currently (ON|OFF)\)", re.IGNORECASE)
 
 
 @dataclass
@@ -61,8 +77,10 @@ class CliState:
     stream: Optional[bool] = None
     stats: Optional[bool] = None
     dump: Optional[bool] = None
+    vendor: Optional[bool] = None
 
     def fully_known(self) -> bool:
+        # Vendor streaming was added later; allow older firmware to omit it.
         return self.stream is not None and self.stats is not None and self.dump is not None
 
 
@@ -132,6 +150,12 @@ def parse_cli_state(lines: Iterable[str]) -> CliState:
             match = DUMP_LINE.search(line)
             if match:
                 state.dump = match.group(1).upper() == "ON"
+                continue
+
+        if state.vendor is None:
+            match = VENDOR_LINE.search(line)
+            if match:
+                state.vendor = match.group(1).upper() == "ON"
 
     return state
 
@@ -176,6 +200,7 @@ def configure_device(
     desired_stream: bool,
     desired_stats: bool,
     desired_dump: bool,
+    desired_vendor: Optional[bool],
     clock: Optional[int],
     verbose: bool,
 ) -> Tuple[CliState, Set[str]]:
@@ -209,6 +234,20 @@ def configure_device(
         send_command(device, COMMAND_TOGGLE_DUMP, verbose=verbose)
         toggled.add("dump")
 
+    if desired_vendor is not None:
+        if start_state.vendor is None:
+            debug("[cli] firmware did not report vendor streaming state; skipping toggle", verbose=verbose)
+        elif start_state.vendor is True and not desired_vendor:
+            debug("[cli] disabling USB vendor streaming", verbose=verbose)
+            send_command(device, COMMAND_TOGGLE_VENDOR, verbose=verbose)
+            toggled.add("vendor")
+        elif start_state.vendor is False and desired_vendor:
+            debug("[cli] enabling USB vendor streaming", verbose=verbose)
+            send_command(device, COMMAND_TOGGLE_VENDOR, verbose=verbose, read_response=False)
+            toggled.add("vendor")
+            time.sleep(0.1)
+            device.reset_input_buffer()
+
     # Enable streaming last so no ASCII is interleaved with binary data.
     if start_state.stream is False and desired_stream:
         debug("[cli] enabling binary streaming", verbose=verbose)
@@ -233,6 +272,14 @@ def restore_device(
         device.reset_input_buffer()
         debug("[cli] disabling binary streaming (restore)", verbose=verbose)
         send_command(device, COMMAND_TOGGLE_STREAM, verbose=verbose)
+
+    if "vendor" in toggled and start_state.vendor is not None:
+        device.reset_input_buffer()
+        if start_state.vendor:
+            debug("[cli] re-enabling USB vendor streaming (restore)", verbose=verbose)
+        else:
+            debug("[cli] disabling USB vendor streaming (restore)", verbose=verbose)
+        send_command(device, COMMAND_TOGGLE_VENDOR, verbose=verbose)
 
     if "stats" in toggled and start_state.stats:
         debug("[cli] re-enabling periodic stats (restore)", verbose=verbose)
@@ -279,6 +326,7 @@ def capture_stream_usb(
             desired_stream=enable_stream,
             desired_stats=not disable_stats,
             desired_dump=not disable_dump,
+            desired_vendor=None,
             clock=clock,
             verbose=verbose,
         )
@@ -363,21 +411,173 @@ def capture_stream_wifi(
     print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
 
 
+def capture_stream_usb_vendor(
+    cli_port: Optional[str],
+    output_path: Path,
+    block_bytes: int,
+    blocks: Optional[int],
+    timeout: float,
+    *,
+    disable_stats: bool,
+    disable_dump: bool,
+    restore: bool,
+    clock: Optional[int],
+    verbose: bool,
+    vendor_vid: int,
+    vendor_pid: int,
+    vendor_interface: int,
+    vendor_endpoint: int,
+) -> None:
+    if usb is None:
+        raise RuntimeError("pyusb is required for USB vendor captures. Install with `pip install pyusb`.")
+
+    if clock is not None and not cli_port:
+        raise RuntimeError("--clock requires a CLI serial port when using the usb-vendor transport.")
+
+    if (disable_stats or disable_dump or restore) and not cli_port:
+        debug("[cli] note: CLI options requested but no serial port provided; skipping device reconfiguration.", verbose=verbose)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cli_device: Optional[serial.Serial] = None
+    start_state = CliState()
+    toggled: Set[str] = set()
+
+    if cli_port:
+        if serial is None:
+            raise RuntimeError("pyserial is required when specifying a CLI serial port.")
+
+        serial_timeout = None if timeout <= 0 else timeout
+        cli_device = serial.Serial(port=cli_port, baudrate=115200, timeout=serial_timeout)
+        debug(f"[cli] connected to {cli_port}", verbose=verbose)
+
+        start_state, toggled = configure_device(
+            cli_device,
+            desired_stream=False,
+            desired_stats=not disable_stats,
+            desired_dump=not disable_dump,
+            desired_vendor=True,
+            clock=clock,
+            verbose=verbose,
+        )
+        cli_device.reset_input_buffer()
+
+    dev = usb.core.find(idVendor=vendor_vid, idProduct=vendor_pid)
+    if dev is None:
+        if cli_device:
+            cli_device.close()
+        raise RuntimeError(
+            f"Unable to locate USB device (VID=0x{vendor_vid:04X}, PID=0x{vendor_pid:04X}). "
+            "Ensure the Pico is connected and the new firmware is running."
+        )
+
+    detach_kernel = False
+    claimed_interface = False
+    try:
+        if dev.is_kernel_driver_active(vendor_interface):
+            try:
+                dev.detach_kernel_driver(vendor_interface)
+                detach_kernel = True
+            except usb.core.USBError as exc:  # type: ignore[attr-defined]
+                raise RuntimeError(f"Failed to detach kernel driver from interface {vendor_interface}: {exc}") from exc
+
+        cfg = dev.get_active_configuration()
+        interface = usb.util.find_descriptor(cfg, bInterfaceNumber=vendor_interface)
+        if interface is None:
+            raise RuntimeError(f"USB interface {vendor_interface} not found on the device")
+
+        endpoint = usb.util.find_descriptor(interface, bEndpointAddress=vendor_endpoint)
+        if endpoint is None:
+            raise RuntimeError(f"USB endpoint 0x{vendor_endpoint:02X} not found on interface {vendor_interface}")
+
+        usb.util.claim_interface(dev, vendor_interface)
+        claimed_interface = True
+
+        usb_timeout = 0 if timeout <= 0 else int(timeout * 1000)
+        block_count = 0
+
+        with output_path.open("wb") as sink:
+            try:
+                while blocks is None or block_count < blocks:
+                    try:
+                        data = endpoint.read(block_bytes, timeout=usb_timeout)
+                    except usb.core.USBError as exc:  # type: ignore[attr-defined]
+                        errno = getattr(exc, "errno", None)
+                        message = str(exc).lower()
+                        if timeout > 0 and (errno in (110, "TIMED_OUT") or "timed out" in message):
+                            raise TimeoutError("Timed out waiting for data from the USB vendor endpoint") from exc
+                        raise
+
+                    sink.write(bytes(data))
+                    block_count += 1
+
+            except KeyboardInterrupt:
+                debug("[usb] capture interrupted by user", verbose=True)
+            finally:
+                sink.flush()
+
+        print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
+
+    finally:
+        if claimed_interface:
+            usb.util.release_interface(dev, vendor_interface)
+        if detach_kernel:
+            try:
+                dev.attach_kernel_driver(vendor_interface)
+            except usb.core.USBError:  # type: ignore[attr-defined]
+                pass
+        usb.util.dispose_resources(dev)
+
+        if cli_device:
+            try:
+                if restore:
+                    restore_device(cli_device, start_state=start_state, toggled=toggled, verbose=verbose)
+            finally:
+                cli_device.close()
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture raw PDM bitstream blocks from the Pico over USB (CDC) or Wi-Fi (UDP)."
+        description="Capture raw PDM bitstream blocks from the Pico over USB (CDC or vendor) or Wi-Fi (UDP)."
     )
     parser.add_argument(
         "source",
         nargs="?",
-        help="USB serial port (for --transport usb). Ignored for Wi-Fi captures.",
+        help=(
+            "Serial port exposed by the Pico's CLI. Required for --transport usb, optional for usb-vendor,"
+            " ignored for Wi-Fi captures."
+        ),
     )
     parser.add_argument("output", help="Destination file path for the captured binary data")
     parser.add_argument(
         "--transport",
-        choices=("usb", "wifi"),
+        choices=("usb", "usb-vendor", "wifi"),
         default="usb",
         help="Select the transport used by the Pico (default: usb).",
+    )
+    parser.add_argument(
+        "--usb-vendor-vid",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_USB_VENDOR_VID,
+        help=f"(usb-vendor) USB vendor ID to match (default: 0x{DEFAULT_USB_VENDOR_VID:04X}).",
+    )
+    parser.add_argument(
+        "--usb-vendor-pid",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_USB_VENDOR_PID,
+        help=f"(usb-vendor) USB product ID to match (default: 0x{DEFAULT_USB_VENDOR_PID:04X}).",
+    )
+    parser.add_argument(
+        "--usb-vendor-interface",
+        type=int,
+        default=DEFAULT_USB_VENDOR_INTERFACE,
+        help=f"(usb-vendor) Interface number that carries the data stream (default: {DEFAULT_USB_VENDOR_INTERFACE}).",
+    )
+    parser.add_argument(
+        "--usb-vendor-endpoint",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_USB_VENDOR_ENDPOINT,
+        help=f"(usb-vendor) IN endpoint address used for the stream (default: 0x{DEFAULT_USB_VENDOR_ENDPOINT:02X}).",
     )
     parser.add_argument(
         "--block-bytes",
@@ -404,22 +604,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--clock",
         type=int,
         choices=sorted(COMMAND_CLOCK.keys()),
-        help="(USB only) Request the firmware to restart with the given PDM clock frequency (Hz) before capturing.",
+        help=(
+            "(USB transports) Request the firmware to restart with the given PDM clock frequency (Hz) before capturing."
+        ),
     )
     parser.add_argument(
         "--keep-stats",
         action="store_true",
-        help="(USB only) Leave the periodic stats ticker enabled (default: disable to avoid ASCII in the stream).",
+        help="(USB transports) Leave the periodic stats ticker enabled (default: disable to avoid ASCII in the stream).",
     )
     parser.add_argument(
         "--keep-dumps",
         action="store_true",
-        help="(USB only) Leave the per-block hex dump enabled if it is currently active.",
+        help="(USB transports) Leave the per-block hex dump enabled if it is currently active.",
     )
     parser.add_argument(
         "--no-restore",
         action="store_true",
-        help="(USB only) Do not restore the previous CLI state after capture (binary streaming will remain enabled).",
+        help="(USB transports) Do not restore the previous CLI state after capture (binary streaming will remain enabled).",
     )
     parser.add_argument(
         "--wifi-bind",
@@ -484,9 +686,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+    elif args.transport == "usb-vendor":
+        if usb is None:
+            print("pyusb is required for usb-vendor captures. Install with `pip install pyusb`.", file=sys.stderr)
+            return 2
+
+        if args.source and serial is None:
+            print(
+                "pyserial is required when supplying a CLI serial port for usb-vendor captures."
+                " Install with `pip install pyserial`.",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
+            capture_stream_usb_vendor(
+                args.source,
+                Path(args.output),
+                args.block_bytes,
+                args.blocks,
+                args.timeout,
+                disable_stats=not args.keep_stats,
+                disable_dump=not args.keep_dumps,
+                restore=not args.no_restore,
+                clock=args.clock,
+                verbose=args.verbose,
+                vendor_vid=args.usb_vendor_vid,
+                vendor_pid=args.usb_vendor_pid,
+                vendor_interface=args.usb_vendor_interface,
+                vendor_endpoint=args.usb_vendor_endpoint,
+            )
+        except TimeoutError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except usb.core.USBError as exc:  # type: ignore[attr-defined]
+            print(f"USB error: {exc}", file=sys.stderr)
+            return 1
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     else:
         if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
-            print("Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.", file=sys.stderr)
+            print(
+                "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.",
+                file=sys.stderr,
+            )
 
         try:
             capture_stream_wifi(
