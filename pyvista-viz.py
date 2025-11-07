@@ -228,6 +228,8 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self._mesh = None
         self._glyph = None
         self._actor = None
+        self.label_frame = None
+        self.label_downsample = None
 
         self._build_ui(fps)
         self._initialize_scene(xyz0, val0)
@@ -248,10 +250,13 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.slider_frame.setRange(0, max(0, self.T - 1))
         self.slider_frame.setSingleStep(1)
         self.slider_frame.setPageStep(1)
+        self.label_frame = QtWidgets.QLabel()
+        self.label_downsample = QtWidgets.QLabel()
 
         top_row.addWidget(self.btn_play)
         top_row.addWidget(self.btn_pause)
         top_row.addWidget(self.slider_frame)
+        top_row.addWidget(self.label_frame)
         main_layout.addLayout(top_row)
 
         # Settings row
@@ -274,8 +279,13 @@ class PointCloudViewer(QtWidgets.QMainWindow):
 
         # Downsample slider + note
         self.slider_downsample = self._make_slider(0, 20, self.params.downsample)
-        down_layout = self._wrap_slider("Downsample (every Nth point)", self.slider_downsample)
-        down_layout.addWidget(QtWidgets.QLabel("0 = no downsample"))
+        down_layout = QtWidgets.QVBoxLayout()
+        label_row = QtWidgets.QHBoxLayout()
+        label_row.addWidget(QtWidgets.QLabel("Downsample (every Nth point)"))
+        label_row.addWidget(self.label_downsample)
+        label_row.addStretch(1)
+        down_layout.addLayout(label_row)
+        down_layout.addWidget(self.slider_downsample)
         settings_row.addLayout(down_layout)
 
         main_layout.addLayout(settings_row)
@@ -299,6 +309,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.slider_size_min.valueChanged.connect(self._on_size_min_changed)
         self.slider_size_max.valueChanged.connect(self._on_size_max_changed)
         self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
+        self._update_status_labels()
 
     def _make_slider(self, minimum, maximum, value):
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -328,7 +339,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             cmap=_normalize_cmap_name(self.cmap),
             clim=[0.0, 1.0],
             lighting=False,
-            show_scalar_bar=True,
+            show_scalar_bar=False,
             opacity=0.5,
         )
         if hasattr(self._actor, "prop"):
@@ -402,6 +413,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
     def _on_downsample_changed(self, value):
         step = int(value)
         self.downsample_step = max(1, step if step != 0 else 1)
+        self._update_status_labels()
         self._refresh_current_mesh(rebuild_geometry=True)
 
     # ----- Scene updates -----
@@ -427,6 +439,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             self.slider_frame.blockSignals(True)
             self.slider_frame.setValue(frame_index)
             self.slider_frame.blockSignals(False)
+        self._update_status_labels()
 
     def _refresh_current_mesh(self, rebuild_geometry=False):
         self.set_frame(self.current_frame, rebuild_geometry=rebuild_geometry)
@@ -473,6 +486,24 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             vtk_mapper.ScalarVisibilityOn()
         if hasattr(vtk_mapper, "SetColorModeToMapScalars"):
             vtk_mapper.SetColorModeToMapScalars()
+
+    def _frame_label_text(self):
+        total = max(0, int(self.T))
+        if total <= 0:
+            return "Frame: 0/0"
+        return f"Frame: {self.current_frame + 1}/{total}"
+
+    def _downsample_label_text(self):
+        step = max(1, int(self.downsample_step))
+        if step <= 1:
+            return "Downsample: off"
+        return f"Downsample: every {step}"
+
+    def _update_status_labels(self):
+        if self.label_frame is not None:
+            self.label_frame.setText(self._frame_label_text())
+        if self.label_downsample is not None:
+            self.label_downsample.setText(self._downsample_label_text())
 
     def _apply_scalars_to_glyph(self, glyph, mesh):
         if glyph is None or mesh is None:
