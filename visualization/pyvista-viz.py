@@ -4,7 +4,7 @@ PyVista-based animated point-cloud viewer.
 
 - Visualizes time-varying 3D point clouds where per-point scalar values map to color and size
 - Playback controls: Play/Pause, time slider scrubbing, FPS-configurable timer
-- Display controls: colormap selector, marker size min/max sliders, configurable downsampling
+- Display controls: colormap selector, marker size scaling slider, configurable downsampling
 - Data sources:
     * Directory of per-frame NPZ files (xyz[N,3], val[N])
     * Single NPZ series (xyz[T,N,3] or xyz[N,3], val[T,N])
@@ -123,6 +123,68 @@ class NPZSeriesProvider(ProviderBase):
         return self._mode == "static"
 
 
+class PointFilesProvider(ProviderBase):
+    """
+    Loads a directory of per-point NPZ files (point_{index}.npz) where each file contains:
+      - xyz: float32 array with shape [3] (or [1,3])
+      - val: float32 array with shape [T]
+    """
+
+    def __init__(self, path, pattern="point_{:05d}.npz", points=None):
+        self.path = path
+        self.pattern = pattern
+        self._N = int(points) if points else None
+        self._xyz = None
+        self._val_series = None
+        self._T = None
+        self._load_all()
+
+    def __len__(self):
+        return self._T
+
+    def _filename(self, idx):
+        return os.path.join(self.path, self.pattern.format(idx))
+
+    def _load_all(self):
+        if self._N is None:
+            self._N = infer_point_files(self.path, self.pattern)
+        if self._N <= 0:
+            raise ValueError("No point files found. Check --path/--pattern or use --demo.")
+
+        xyz_list = []
+        series_list = []
+        for idx in range(self._N):
+            fn = self._filename(idx)
+            if not os.path.exists(fn):
+                raise FileNotFoundError(f"Missing point file: {fn}")
+            data = np.load(fn, allow_pickle=False)
+            if "xyz" not in data or "val" not in data:
+                raise KeyError(f"Point file {fn} must contain 'xyz' and 'val'")
+            xyz = np.asarray(data["xyz"], dtype=np.float32).reshape(-1)
+            if xyz.size != 3:
+                raise ValueError(f"'xyz' in {fn} must have 3 elements, got {xyz.shape}")
+            series = np.clip(np.asarray(data["val"], dtype=np.float32), 0.0, 1.0).reshape(-1)
+            if self._T is None:
+                self._T = series.shape[0]
+            elif series.shape[0] != self._T:
+                raise ValueError(
+                    f"Point file {fn} has {series.shape[0]} frames but expected {self._T}"
+                )
+            xyz_list.append(xyz)
+            series_list.append(series)
+        self._xyz = np.vstack(xyz_list)
+        self._val_series = np.stack(series_list, axis=1)  # shape [T, N]
+
+    def get(self, t):
+        tt = int(t)
+        if tt < 0 or tt >= self._T:
+            raise IndexError(f"Frame {tt} out of range for T={self._T}")
+        return self._xyz, self._val_series[tt]
+
+    def static_xyz(self):
+        return True
+
+
 def make_demo_provider(T=160, N=1000, radius=1.0):
     rng = np.random.default_rng(7)
     u = rng.random(N)
@@ -169,8 +231,7 @@ COLORSCALES = ["Viridis", "Plasma", "Cividis", "Magma", "Turbo", "Inferno", "Ice
 @dataclass
 class VizParams:
     cmap: str = "Viridis"
-    size_min: float = 2.0
-    size_max: float = 10.0
+    size_scale: float = 1.0
     downsample: int = 0  # 0 = no downsample
 
 
@@ -195,9 +256,9 @@ def _safe_diag_extent(xyz):
     return diag if diag > 0 else 1.0
 
 
-def _compute_sizes(val, size_min, size_max, scale_factor):
-    sizes = size_min + (size_max - size_min) * val
-    return scale_factor * sizes
+def _compute_sizes(val, size_scale, scale_factor):
+    base = 2.0 + 8.0 * val  # baseline range roughly matching previous defaults
+    return scale_factor * size_scale * base
 
 
 # ---------------- PyVista Qt viewer ----------------
@@ -214,8 +275,8 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.current_frame = 0
         self.is_playing = False
         self.downsample_step = max(1, int(self.params.downsample) or 1)
-        self.size_min = float(self.params.size_min)
-        self.size_max = float(self.params.size_max)
+        self.size_scale = float(self.params.size_scale) if self.params.size_scale > 0 else 1.0
+        self.size_scale = min(4.0, max(0.1, self.size_scale))
         self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else COLORSCALES[0]
         self.static_xyz = provider.static_xyz()
 
@@ -252,6 +313,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.slider_frame.setPageStep(1)
         self.label_frame = QtWidgets.QLabel()
         self.label_downsample = QtWidgets.QLabel()
+        self.label_size_scale = None
 
         top_row.addWidget(self.btn_play)
         top_row.addWidget(self.btn_pause)
@@ -271,11 +333,14 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         cmap_layout.addWidget(self.combo_cmap)
         settings_row.addLayout(cmap_layout)
 
-        # Size sliders
-        self.slider_size_min = self._make_slider(1, 20, self.size_min)
-        self.slider_size_max = self._make_slider(4, 40, self.size_max)
-        settings_row.addLayout(self._wrap_slider("Size min (px)", self.slider_size_min))
-        settings_row.addLayout(self._wrap_slider("Size max (px)", self.slider_size_max))
+        # Size scaling slider
+        self.slider_size_scale = self._make_slider(10, 400, int(round(self.size_scale * 100)))
+        size_layout = QtWidgets.QVBoxLayout()
+        size_layout.addWidget(QtWidgets.QLabel("Size scale"))
+        size_layout.addWidget(self.slider_size_scale)
+        self.label_size_scale = QtWidgets.QLabel(self._format_size_scale_label(self.size_scale))
+        size_layout.addWidget(self.label_size_scale)
+        settings_row.addLayout(size_layout)
 
         # Downsample slider + note
         self.slider_downsample = self._make_slider(0, 20, self.params.downsample)
@@ -306,9 +371,11 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.btn_pause.clicked.connect(self.stop_playback)
         self.slider_frame.valueChanged.connect(self._on_frame_slider)
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
-        self.slider_size_min.valueChanged.connect(self._on_size_min_changed)
-        self.slider_size_max.valueChanged.connect(self._on_size_max_changed)
+        self.slider_size_scale.valueChanged.connect(self._on_size_scale_changed)
         self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
+
+    def _format_size_scale_label(self, value):
+        return f"{value:.2f}×"
         self._update_status_labels()
 
     def _make_slider(self, minimum, maximum, value):
@@ -367,7 +434,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         mesh = pv.PolyData(xyz)
         mesh.point_data["val"] = val
         mesh.point_data.active_scalars_name = "val"
-        scale = _compute_sizes(val, self.size_min, self.size_max, self._size_scale)
+        scale = _compute_sizes(val, self.size_scale, self._size_scale)
         mesh.point_data["scale"] = scale
         return mesh
 
@@ -390,24 +457,10 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.cmap = cmap
         self._update_cmap()
 
-    def _on_size_min_changed(self, value):
-        v = float(value)
-        if v > self.size_max:
-            self.size_max = v
-            self.slider_size_max.blockSignals(True)
-            self.slider_size_max.setValue(int(round(v)))
-            self.slider_size_max.blockSignals(False)
-        self.size_min = v
-        self._refresh_current_mesh()
-
-    def _on_size_max_changed(self, value):
-        v = float(value)
-        if v < self.size_min:
-            self.size_min = v
-            self.slider_size_min.blockSignals(True)
-            self.slider_size_min.setValue(int(round(v)))
-            self.slider_size_min.blockSignals(False)
-        self.size_max = v
+    def _on_size_scale_changed(self, value):
+        self.size_scale = max(0.1, float(value) / 100.0)
+        if self.label_size_scale:
+            self.label_size_scale.setText(self._format_size_scale_label(self.size_scale))
         self._refresh_current_mesh()
 
     def _on_downsample_changed(self, value):
@@ -428,7 +481,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
 
         if self.static_xyz and not rebuild_geometry and self._mesh is not None:
             self._mesh.point_data["val"] = np.clip(val, 0.0, 1.0)
-            scale = _compute_sizes(val, self.size_min, self.size_max, self._size_scale)
+            scale = _compute_sizes(val, self.size_scale, self._size_scale)
             self._mesh.point_data["scale"] = scale
             self._update_glyph(self._mesh, reuse_points=True)
         else:
@@ -563,17 +616,49 @@ def infer_frames(path, pattern):
     return t
 
 
+def infer_point_files(path, pattern):
+    idx = 0
+    while os.path.exists(os.path.join(path, pattern.format(idx))):
+        idx += 1
+    return idx
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     ap = argparse.ArgumentParser(description="PyVista animated point-cloud viewer.")
     ap.add_argument("--demo", action="store_true", help="Use synthetic expanding wavefront")
-    ap.add_argument("--path", type=str, default=".", help="Folder with per-frame NPZs")
-    ap.add_argument("--pattern", type=str, default="frame_{:04d}.npz", help="Filename pattern with {:d}")
-    ap.add_argument("--frames", type=int, help="Frame count (if not inferable)")
+    ap.add_argument(
+        "--path",
+        type=str,
+        default=".",
+        help="Folder with NPZ files (per-frame or per-point depending on --mode)",
+    )
+    ap.add_argument(
+        "--pattern",
+        type=str,
+        help="Filename pattern with {:d} placeholder. Defaults to frame_{:04d}.npz (frame mode) or point_{:05d}.npz (point mode).",
+    )
+    ap.add_argument("--frames", type=int, help="Frame count for per-frame mode (if not inferable)")
+    ap.add_argument(
+        "--points",
+        type=int,
+        help="Point count for per-point mode (if not inferable).",
+    )
+    ap.add_argument(
+        "--mode",
+        type=str,
+        choices=["frame", "point"],
+        default="frame",
+        help="Interpretation of files under --path/--pattern (per-frame NPZs or per-point NPZs).",
+    )
     ap.add_argument("--series", type=str, help="Single NPZ with xyz/val time series")
     ap.add_argument("--fps", type=int, default=24, help="Playback FPS")
-    ap.add_argument("--size-min", type=float, default=2.0)
-    ap.add_argument("--size-max", type=float, default=10.0)
+    ap.add_argument(
+        "--size-scale",
+        type=float,
+        default=1.0,
+        help="Marker size multiplier (1.0 = default radius; increase for larger points).",
+    )
     ap.add_argument("--downsample", type=int, default=0, help="Keep every Nth point (0=no downsample)")
     ap.add_argument("--host", type=str, default="127.0.0.1", help="Unused (compatibility placeholder)")
     ap.add_argument("--port", type=int, default=8050, help="Unused (compatibility placeholder)")
@@ -598,15 +683,21 @@ def main(argv=None):
     elif args.series:
         provider = NPZSeriesProvider(args.series)
     else:
-        frames = args.frames or infer_frames(args.path, args.pattern)
-        if frames == 0:
-            raise SystemExit("No frames found. Check --path/--pattern or use --demo.")
-        provider = NPZFramesProvider(args.path, args.pattern, frames)
+        pattern = args.pattern or ("point_{:05d}.npz" if args.mode == "point" else "frame_{:04d}.npz")
+        if args.mode == "point":
+            count = args.points or infer_point_files(args.path, pattern)
+            if count == 0:
+                raise SystemExit("No point files found. Check --path/--pattern or use --demo.")
+            provider = PointFilesProvider(args.path, pattern, count)
+        else:
+            frames = args.frames or infer_frames(args.path, pattern)
+            if frames == 0:
+                raise SystemExit("No frames found. Check --path/--pattern or use --demo.")
+            provider = NPZFramesProvider(args.path, pattern, frames)
 
     params = VizParams(
         cmap="Viridis",
-        size_min=args.size_min,
-        size_max=args.size_max,
+        size_scale=max(0.1, args.size_scale),
         downsample=max(0, args.downsample),
     )
 
