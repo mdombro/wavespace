@@ -17,6 +17,8 @@ Dependencies:
 import argparse
 import os
 import sys
+import re
+from pathlib import Path
 from dataclasses import dataclass
 
 # Detect early whether the current environment has a display server. This lets us
@@ -133,30 +135,28 @@ class PointFilesProvider(ProviderBase):
     def __init__(self, path, pattern="point_{:05d}.npz", points=None):
         self.path = path
         self.pattern = pattern
-        self._N = int(points) if points else None
         self._xyz = None
         self._val_series = None
         self._T = None
+
+        files = list_point_files(path, pattern)
+        if points:
+            files = files[: int(points)]
+        self._files = files
+        self._N = len(self._files)
+        if self._N == 0:
+            raise ValueError("No point files found. Check --path/--pattern or use --demo.")
+
         self._load_all()
 
     def __len__(self):
         return self._T
 
-    def _filename(self, idx):
-        return os.path.join(self.path, self.pattern.format(idx))
-
     def _load_all(self):
-        if self._N is None:
-            self._N = infer_point_files(self.path, self.pattern)
-        if self._N <= 0:
-            raise ValueError("No point files found. Check --path/--pattern or use --demo.")
-
         xyz_list = []
         series_list = []
-        for idx in range(self._N):
-            fn = self._filename(idx)
-            if not os.path.exists(fn):
-                raise FileNotFoundError(f"Missing point file: {fn}")
+        min_frames = None
+        for fn in self._files:
             data = np.load(fn, allow_pickle=False)
             if "xyz" not in data or "val" not in data:
                 raise KeyError(f"Point file {fn} must contain 'xyz' and 'val'")
@@ -164,18 +164,46 @@ class PointFilesProvider(ProviderBase):
             if xyz.size != 3:
                 raise ValueError(f"'xyz' in {fn} must have 3 elements, got {xyz.shape}")
             series = np.clip(np.asarray(data["val"], dtype=np.float32), 0.0, 1.0).reshape(-1)
-            if self._T is None:
-                self._T = series.shape[0]
-            elif series.shape[0] != self._T:
-                raise ValueError(
-                    f"Point file {fn} has {series.shape[0]} frames but expected {self._T}"
-                )
+            frame_count = series.shape[0]
+            if min_frames is None or frame_count < min_frames:
+                min_frames = frame_count
             xyz_list.append(xyz)
             series_list.append(series)
-        self._xyz = np.vstack(xyz_list)
-        self._val_series = np.stack(series_list, axis=1)  # shape [T, N]
+
+        if min_frames is None or min_frames == 0:
+            raise ValueError("Point files did not contain any frames.")
+
+        trimmed = []
+        kept_xyz = []
+        kept_files = []
+        for series, xyz, fn in zip(series_list, xyz_list, self._files):
+            if series.shape[0] < min_frames:
+                print(
+                    f"[point-loader] dropping {fn}: only {series.shape[0]} frame(s) available (need {min_frames})",
+                    file=sys.stderr,
+                )
+                continue
+            if series.shape[0] > min_frames:
+                print(
+                    f"[point-loader] trimming {fn} from {series.shape[0]} to {min_frames} frame(s)",
+                    file=sys.stderr,
+                )
+            trimmed.append(series[:min_frames])
+            kept_xyz.append(xyz)
+            kept_files.append(fn)
+
+        if not trimmed:
+            raise ValueError("All point files were dropped due to insufficient frame counts.")
+
+        self._files = kept_files
+        self._xyz = np.vstack(kept_xyz)
+        self._ragged_series = [np.asarray(series, dtype=np.float32) for series in trimmed]
+        self._val_series = None
+        self._T = max(series.shape[0] for series in self._ragged_series)
 
     def get(self, t):
+        if self._val_series is None:
+            self._materialize_series()
         tt = int(t)
         if tt < 0 or tt >= self._T:
             raise IndexError(f"Frame {tt} out of range for T={self._T}")
@@ -183,6 +211,19 @@ class PointFilesProvider(ProviderBase):
 
     def static_xyz(self):
         return True
+
+    def _materialize_series(self):
+        max_len = self._T
+        padded = []
+        for series, fn in zip(self._ragged_series, self._files):
+            length = series.shape[0]
+            if length < max_len:
+                pad = np.zeros(max_len - length, dtype=np.float32)
+                series = np.concatenate([series, pad])
+            elif length > max_len:
+                series = series[:max_len]
+            padded.append(series)
+        self._val_series = np.stack(padded, axis=1)
 
 
 def make_demo_provider(T=160, N=1000, radius=1.0):
@@ -617,10 +658,39 @@ def infer_frames(path, pattern):
 
 
 def infer_point_files(path, pattern):
-    idx = 0
-    while os.path.exists(os.path.join(path, pattern.format(idx))):
-        idx += 1
-    return idx
+    return len(list_point_files(path, pattern))
+
+
+def list_point_files(path, pattern):
+    placeholder = None
+    if "{" in pattern and "}" in pattern:
+        start = pattern.index("{")
+        end = pattern.index("}", start)
+        placeholder = pattern[start : end + 1]
+        glob_pattern = pattern[:start] + "*" + pattern[end + 1 :]
+        regex = re.compile(
+            "^"
+            + re.escape(pattern[:start])
+            + r"(\d+)"
+            + re.escape(pattern[end + 1 :])
+            + "$"
+        )
+    else:
+        glob_pattern = pattern
+        regex = re.compile("^" + re.escape(pattern) + "$")
+
+    base = Path(path)
+    files = []
+    for candidate in sorted(base.glob(glob_pattern)):
+        name = candidate.name
+        match = regex.match(name)
+        if not match:
+            continue
+        idx = int(match.group(1)) if match.groups() else 0
+        files.append((idx, candidate))
+
+    files.sort(key=lambda item: item[0])
+    return [str(candidate) for _, candidate in files]
 
 
 def main(argv=None):

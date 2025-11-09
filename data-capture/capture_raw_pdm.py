@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Capture raw PDM bitstream blocks from the Pico over USB CDC, a vendor-specific USB
-bulk endpoint, or Wi-Fi UDP.
+Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC,
+a vendor-specific USB bulk endpoint, or Wi-Fi UDP.
 
 When talking to the device over USB this helper understands the interactive
 debug CLI that the firmware now exposes. It will automatically:
@@ -15,7 +15,8 @@ debug CLI that the firmware now exposes. It will automatically:
     * Restore the previous CLI state when finished (unless --no-restore).
 
 In Wi-Fi mode the script simply listens for fixed-size UDP payloads from the
-Pico and writes them directly to the requested output file.
+Pico and writes them directly to the requested output file. Each block's
+metadata (block index, byte offset, timestamp_us) is recorded in a CSV sidecar.
 """
 
 from __future__ import annotations
@@ -24,9 +25,12 @@ import argparse
 import re
 import sys
 import time
+import csv
+import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+
+from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
 import socket
 
@@ -40,12 +44,14 @@ try:
     import usb.util  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     usb = None  # type: ignore
+    NoBackendError = Exception  # type: ignore[assignment]
 else:
     import usb  # type: ignore
+    from usb.core import NoBackendError  # type: ignore
 
 
 DEFAULT_BLOCK_BITS = 8192
-DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8
+DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # payload size (no metadata header)
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_WIFI_PORT = 5000
 CLI_READ_WINDOW = 1.0
@@ -53,6 +59,9 @@ DEFAULT_USB_VENDOR_VID = 0x2E8A
 DEFAULT_USB_VENDOR_PID = 0x4001
 DEFAULT_USB_VENDOR_INTERFACE = 2
 DEFAULT_USB_VENDOR_ENDPOINT = 0x83
+
+METADATA_STRUCT = struct.Struct("<QQQ")  # block_index, first_sample_byte_index, capture_start_time_us
+METADATA_BYTES = METADATA_STRUCT.size
 
 COMMAND_HELP = b"?"
 COMMAND_TOGGLE_STREAM = b"b"
@@ -82,6 +91,127 @@ class CliState:
     def fully_known(self) -> bool:
         # Vendor streaming was added later; allow older firmware to omit it.
         return self.stream is not None and self.stats is not None and self.dump is not None
+
+
+@dataclass(frozen=True)
+class BlockMetadata:
+    block_index: int
+    byte_offset: int
+    timestamp_us: int
+
+
+def metadata_path_for(data_path: Path) -> Path:
+    return data_path.with_name(data_path.name + ".metadata.csv")
+
+
+def metadata_is_plausible(meta: BlockMetadata, payload_bytes: int) -> bool:
+    if payload_bytes <= 0:
+        return False
+    if meta.byte_offset % payload_bytes != 0:
+        return False
+    expected_index = meta.byte_offset // payload_bytes
+    return expected_index == meta.block_index
+
+
+class PacketAligner:
+    """
+    Maintains framing when reading fixed-size packets from a byte stream by sliding one byte at a time
+    until the metadata header looks coherent (block index matches byte offset).
+    """
+
+    def __init__(
+        self,
+        *,
+        read_chunk: Callable[[int], bytes],
+        packet_bytes: int,
+        payload_bytes: int,
+        label: str,
+        verbose: bool,
+    ) -> None:
+        self._read_chunk = read_chunk
+        self._packet_bytes = packet_bytes
+        self._payload_bytes = payload_bytes
+        self._label = label
+        self._verbose = verbose
+        self._last_block_index: Optional[int] = None
+
+    def next_packet(self) -> Tuple[memoryview, BlockMetadata]:
+        raw_packet = bytearray(self._read_chunk(self._packet_bytes))
+        metadata = self._ensure_aligned(raw_packet)
+        packet_view = memoryview(bytes(raw_packet))
+        payload = packet_view[METADATA_BYTES:]
+        return payload, metadata
+
+    def _ensure_aligned(self, buffer: bytearray) -> BlockMetadata:
+        shifts = 0
+        while True:
+            metadata, _ = parse_block_packet(bytes(buffer), self._payload_bytes)
+            if self._metadata_valid(metadata):
+                if shifts and self._verbose:
+                    debug(
+                        f"[{self._label}] resynchronized after {shifts} byte shift(s) (block {metadata.block_index})",
+                        verbose=True,
+                    )
+                if (
+                    self._last_block_index is not None
+                    and metadata.block_index > self._last_block_index + 1
+                    and self._verbose
+                ):
+                    debug(
+                        f"[{self._label}] skipped {metadata.block_index - self._last_block_index - 1} block(s)",
+                        verbose=True,
+                    )
+                self._last_block_index = metadata.block_index
+                return metadata
+
+            shifts += 1
+            if shifts > self._packet_bytes * 4:
+                raise RuntimeError(
+                    f"[{self._label}] unable to resynchronize to packet boundary after {shifts} byte shifts"
+                )
+
+            next_byte = self._read_chunk(1)
+            if not next_byte:
+                raise TimeoutError(f"[{self._label}] timed out while searching for packet boundary")
+
+            del buffer[0]
+            buffer.extend(next_byte)
+
+    def _metadata_valid(self, metadata: BlockMetadata) -> bool:
+        if not metadata_is_plausible(metadata, self._payload_bytes):
+            return False
+        if self._last_block_index is not None and metadata.block_index < self._last_block_index:
+            return False
+        return True
+
+
+class ProgressReporter:
+    """Periodically print capture progress without overwhelming stdout."""
+
+    def __init__(self, label: str, interval: float = 1.0) -> None:
+        self.label = label
+        self.interval = max(0.1, interval)
+        self._last = time.monotonic()
+
+    def update(self, blocks: int, bytes_total: int) -> None:
+        now = time.monotonic()
+        if now - self._last < self.interval:
+            return
+        self._last = now
+        print(
+            f"[{self.label}] captured {blocks} block(s) ({bytes_total} payload bytes)...",
+            file=sys.stderr,
+        )
+
+
+def parse_block_packet(packet: bytes, payload_bytes: int) -> Tuple[BlockMetadata, memoryview]:
+    expected = payload_bytes + METADATA_BYTES
+    if len(packet) != expected:
+        raise ValueError(f"Malformed block packet: expected {expected} bytes, received {len(packet)} bytes")
+
+    block_index, byte_offset, timestamp_us = METADATA_STRUCT.unpack_from(packet, 0)
+    metadata = BlockMetadata(block_index=block_index, byte_offset=byte_offset, timestamp_us=timestamp_us)
+    return metadata, memoryview(packet)[METADATA_BYTES:]
 
 
 def debug(msg: str, *, verbose: bool) -> None:
@@ -301,6 +431,42 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
     return bytes(buffer)
 
 
+class UsbStreamReader:
+    """
+    Wrapper around a TinyUSB bulk endpoint that always requests at least one
+    full packet's worth of data from the device and parcels it out in the
+    caller's requested chunk sizes. This prevents LIBUSB_ERROR_OVERFLOW when
+    the firmware is streaming continuously and the aligner wants to inspect
+    single bytes while searching for metadata headers.
+    """
+
+    def __init__(self, endpoint: usb.core.Endpoint, timeout_ms: int):  # type: ignore[name-defined]
+        self._endpoint = endpoint
+        self._timeout_ms = timeout_ms
+        self._packet_size = max(1, getattr(endpoint, "wMaxPacketSize", 64))
+        self._stash = bytearray()
+
+    def read(self, length: int) -> bytes:
+        if length <= 0:
+            return b""
+
+        output = bytearray()
+        while len(output) < length:
+            if self._stash:
+                take = min(length - len(output), len(self._stash))
+                output.extend(self._stash[:take])
+                del self._stash[:take]
+                continue
+
+            request = self._packet_size
+            data = self._endpoint.read(request, timeout=self._timeout_ms)
+            if not data:
+                raise TimeoutError("Timed out waiting for data from the USB vendor endpoint")
+            self._stash.extend(data)
+
+        return bytes(output)
+
+
 def capture_stream_usb(
     port: str,
     output_path: Path,
@@ -316,9 +482,17 @@ def capture_stream_usb(
     verbose: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_path_for(output_path)
+    packet_bytes = block_bytes + METADATA_BYTES
 
     serial_timeout = None if timeout <= 0 else timeout
-    with serial.Serial(port=port, baudrate=115200, timeout=serial_timeout) as device, output_path.open("wb") as sink:
+    with (
+        serial.Serial(port=port, baudrate=115200, timeout=serial_timeout) as device,
+        output_path.open("wb") as sink,
+        metadata_path.open("w", newline="") as metadata_file,
+    ):
+        metadata_writer = csv.writer(metadata_file)
+        metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
         debug(f"[cli] connected to {port}", verbose=verbose)
 
         start_state, toggled = configure_device(
@@ -337,22 +511,38 @@ def capture_stream_usb(
         # Drop any pending output before we begin consuming binary blocks.
         device.reset_input_buffer()
 
+        packet_source = PacketAligner(
+            read_chunk=lambda size: read_exact(device, size),
+            packet_bytes=packet_bytes,
+            payload_bytes=block_bytes,
+            label="usb",
+            verbose=verbose,
+        )
+
         block_count = 0
+        progress = ProgressReporter("usb")
 
         try:
             while blocks is None or block_count < blocks:
-                data = read_exact(device, block_bytes)
-                sink.write(data)
+                payload_view, metadata = packet_source.next_packet()
+                sink.write(payload_view)
+                metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
                 block_count += 1
+                progress.update(block_count, block_count * block_bytes)
 
         except KeyboardInterrupt:
             debug("[capture] interrupted by user", verbose=True)
         finally:
             sink.flush()
+            metadata_file.flush()
             if restore:
                 restore_device(device, start_state=start_state, toggled=toggled, verbose=verbose)
 
-    print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
+    print(
+        f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path})",
+        file=sys.stderr,
+    )
 
 
 def capture_stream_wifi(
@@ -367,8 +557,16 @@ def capture_stream_wifi(
     verbose: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_path_for(output_path)
+    packet_bytes = block_bytes + METADATA_BYTES
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock, output_path.open("wb") as sink:
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock,
+        output_path.open("wb") as sink,
+        metadata_path.open("w", newline="") as metadata_file,
+    ):
+        metadata_writer = csv.writer(metadata_file)
+        metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((bind_host, bind_port))
         sock.settimeout(None if timeout <= 0 else timeout)
@@ -376,6 +574,8 @@ def capture_stream_wifi(
         debug(f"[wifi] listening on {bind_host}:{bind_port}", verbose=verbose)
         block_count = 0
         source_addr: Optional[Tuple[str, int]] = None
+        last_block_index: Optional[int] = None
+        progress = ProgressReporter("wifi")
 
         try:
             while blocks is None or block_count < blocks:
@@ -392,23 +592,54 @@ def capture_stream_wifi(
                     source_addr = addr
                     debug(f"[wifi] receiving from {addr[0]}:{addr[1]}", verbose=verbose)
 
-                if len(data) != block_bytes:
+                if len(data) != packet_bytes:
                     debug(
-                        f"[wifi] unexpected payload size {len(data)} (expected {block_bytes}), "
+                        f"[wifi] unexpected payload size {len(data)} (expected {packet_bytes}), "
                         "packet skipped",
                         verbose=verbose,
                     )
                     continue
 
-                sink.write(data)
+                metadata, payload = parse_block_packet(data, block_bytes)
+                if not metadata_is_plausible(metadata, block_bytes):
+                    debug(
+                        f"[wifi] discarded packet with incoherent metadata "
+                        f"(block_index={metadata.block_index}, byte_offset={metadata.byte_offset})",
+                        verbose=verbose,
+                    )
+                    continue
+
+                if last_block_index is not None:
+                    if metadata.block_index <= last_block_index:
+                        debug(
+                            f"[wifi] non-monotonic block index {metadata.block_index} (previous {last_block_index}), packet skipped",
+                            verbose=verbose,
+                        )
+                        continue
+                    if metadata.block_index > last_block_index + 1:
+                        debug(
+                            f"[wifi] skipped {metadata.block_index - last_block_index - 1} block(s) (network loss)",
+                            verbose=verbose,
+                        )
+
+                last_block_index = metadata.block_index
+
+                sink.write(payload)
+                metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
                 block_count += 1
+                progress.update(block_count, block_count * block_bytes)
 
         except KeyboardInterrupt:
             debug("[wifi] capture interrupted by user", verbose=True)
         finally:
             sink.flush()
+            metadata_file.flush()
 
-    print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
+    print(
+        f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path})",
+        file=sys.stderr,
+    )
 
 
 def capture_stream_usb_vendor(
@@ -438,6 +669,8 @@ def capture_stream_usb_vendor(
         debug("[cli] note: CLI options requested but no serial port provided; skipping device reconfiguration.", verbose=verbose)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_path_for(output_path)
+    packet_bytes = block_bytes + METADATA_BYTES
 
     cli_device: Optional[serial.Serial] = None
     start_state = CliState()
@@ -462,72 +695,98 @@ def capture_stream_usb_vendor(
         )
         cli_device.reset_input_buffer()
 
-    dev = usb.core.find(idVendor=vendor_vid, idProduct=vendor_pid)
-    if dev is None:
-        if cli_device:
-            cli_device.close()
-        raise RuntimeError(
-            f"Unable to locate USB device (VID=0x{vendor_vid:04X}, PID=0x{vendor_pid:04X}). "
-            "Ensure the Pico is connected and the new firmware is running."
-        )
-
-    detach_kernel = False
-    claimed_interface = False
+    dev = None
     try:
-        if dev.is_kernel_driver_active(vendor_interface):
-            try:
-                dev.detach_kernel_driver(vendor_interface)
-                detach_kernel = True
-            except usb.core.USBError as exc:  # type: ignore[attr-defined]
-                raise RuntimeError(f"Failed to detach kernel driver from interface {vendor_interface}: {exc}") from exc
+        try:
+            dev = usb.core.find(idVendor=vendor_vid, idProduct=vendor_pid)
+        except NoBackendError as exc:  # type: ignore[misc]
+            raise RuntimeError(
+                "pyusb is installed but no backend (such as libusb-1.0) is available. "
+                "Install libusb and ensure it is discoverable (e.g. `sudo apt install libusb-1.0-0-dev`)."
+            ) from exc
+        if dev is None:
+            raise RuntimeError(
+                f"Unable to locate USB device (VID=0x{vendor_vid:04X}, PID=0x{vendor_pid:04X}). "
+                "Ensure the Pico is connected and the new firmware is running."
+            )
 
-        cfg = dev.get_active_configuration()
-        interface = usb.util.find_descriptor(cfg, bInterfaceNumber=vendor_interface)
-        if interface is None:
-            raise RuntimeError(f"USB interface {vendor_interface} not found on the device")
+        detach_kernel = False
+        claimed_interface = False
+        try:
+            if dev.is_kernel_driver_active(vendor_interface):
+                try:
+                    dev.detach_kernel_driver(vendor_interface)
+                    detach_kernel = True
+                except usb.core.USBError as exc:  # type: ignore[attr-defined]
+                    raise RuntimeError(f"Failed to detach kernel driver from interface {vendor_interface}: {exc}") from exc
 
-        endpoint = usb.util.find_descriptor(interface, bEndpointAddress=vendor_endpoint)
-        if endpoint is None:
-            raise RuntimeError(f"USB endpoint 0x{vendor_endpoint:02X} not found on interface {vendor_interface}")
+            cfg = dev.get_active_configuration()
+            interface = usb.util.find_descriptor(cfg, bInterfaceNumber=vendor_interface)
+            if interface is None:
+                raise RuntimeError(f"USB interface {vendor_interface} not found on the device")
 
-        usb.util.claim_interface(dev, vendor_interface)
-        claimed_interface = True
+            endpoint = usb.util.find_descriptor(interface, bEndpointAddress=vendor_endpoint)
+            if endpoint is None:
+                raise RuntimeError(f"USB endpoint 0x{vendor_endpoint:02X} not found on interface {vendor_interface}")
 
-        usb_timeout = 0 if timeout <= 0 else int(timeout * 1000)
-        block_count = 0
+            usb.util.claim_interface(dev, vendor_interface)
+            claimed_interface = True
 
-        with output_path.open("wb") as sink:
-            try:
-                while blocks is None or block_count < blocks:
-                    try:
-                        data = endpoint.read(block_bytes, timeout=usb_timeout)
-                    except usb.core.USBError as exc:  # type: ignore[attr-defined]
-                        errno = getattr(exc, "errno", None)
-                        message = str(exc).lower()
-                        if timeout > 0 and (errno in (110, "TIMED_OUT") or "timed out" in message):
-                            raise TimeoutError("Timed out waiting for data from the USB vendor endpoint") from exc
-                        raise
+            usb_timeout = 0 if timeout <= 0 else int(timeout * 1000)
+            usb_reader = UsbStreamReader(endpoint, usb_timeout)
+            packet_source = PacketAligner(
+                read_chunk=usb_reader.read,
+                packet_bytes=packet_bytes,
+                payload_bytes=block_bytes,
+                label="usb-vendor",
+                verbose=verbose,
+            )
+            block_count = 0
+            progress = ProgressReporter("usb-vendor")
 
-                    sink.write(bytes(data))
-                    block_count += 1
+            with output_path.open("wb") as sink, metadata_path.open("w", newline="") as metadata_file:
+                metadata_writer = csv.writer(metadata_file)
+                metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
+                try:
+                    while blocks is None or block_count < blocks:
+                        try:
+                            payload_view, metadata = packet_source.next_packet()
+                        except usb.core.USBError as exc:  # type: ignore[attr-defined]
+                            errno = getattr(exc, "errno", None)
+                            message = str(exc).lower()
+                            if timeout > 0 and (errno in (110, "TIMED_OUT") or "timed out" in message):
+                                raise TimeoutError("Timed out waiting for data from the USB vendor endpoint") from exc
+                            raise
 
-            except KeyboardInterrupt:
-                debug("[usb] capture interrupted by user", verbose=True)
-            finally:
-                sink.flush()
+                        sink.write(payload_view)
+                        metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
+                        block_count += 1
+                        progress.update(block_count, block_count * block_bytes)
 
-        print(f"Captured {block_count} block(s) ({block_count * block_bytes} bytes) to {output_path}", file=sys.stderr)
+                except KeyboardInterrupt:
+                    debug("[usb] capture interrupted by user", verbose=True)
+                finally:
+                    sink.flush()
+                    metadata_file.flush()
+
+            print(
+                f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
+                f"(metadata -> {metadata_path})",
+                file=sys.stderr,
+            )
+
+        finally:
+            if claimed_interface:
+                usb.util.release_interface(dev, vendor_interface)
+            if detach_kernel:
+                try:
+                    dev.attach_kernel_driver(vendor_interface)
+                except usb.core.USBError:  # type: ignore[attr-defined]
+                    pass
+            if dev is not None:
+                usb.util.dispose_resources(dev)
 
     finally:
-        if claimed_interface:
-            usb.util.release_interface(dev, vendor_interface)
-        if detach_kernel:
-            try:
-                dev.attach_kernel_driver(vendor_interface)
-            except usb.core.USBError:  # type: ignore[attr-defined]
-                pass
-        usb.util.dispose_resources(dev)
-
         if cli_device:
             try:
                 if restore:
@@ -538,7 +797,9 @@ def capture_stream_usb_vendor(
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture raw PDM bitstream blocks from the Pico over USB (CDC or vendor) or Wi-Fi (UDP)."
+        description=(
+            "Capture raw PDM bitstream blocks (and their metadata) from the Pico over USB (CDC or vendor) or Wi-Fi (UDP)."
+        )
     )
     parser.add_argument(
         "source",
@@ -548,7 +809,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             " ignored for Wi-Fi captures."
         ),
     )
-    parser.add_argument("output", help="Destination file path for the captured binary data")
+    parser.add_argument(
+        "output",
+        help="Destination file path for the captured binary payload; metadata is written to <output>.metadata.csv",
+    )
     parser.add_argument(
         "--transport",
         choices=("usb", "usb-vendor", "wifi"),
@@ -583,7 +847,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--block-bytes",
         type=int,
         default=DEFAULT_BLOCK_BYTES,
-        help=f"Number of bytes per block (default: {DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits).",
+        help=(
+            "Number of payload bytes per block before metadata (default: "
+            f"{DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits)."
+        ),
     )
     parser.add_argument(
         "--blocks",
@@ -654,101 +921,105 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Block size must be positive", file=sys.stderr)
         return 2
 
-    if args.transport == "usb":
-        if not args.source:
-            print("USB transport requires a serial port argument", file=sys.stderr)
-            return 2
+    try:
+        if args.transport == "usb":
+            if not args.source:
+                print("USB transport requires a serial port argument", file=sys.stderr)
+                return 2
 
-        if serial is None:
-            print("pyserial is required for USB captures. Install with `pip install pyserial`.", file=sys.stderr)
-            return 2
+            if serial is None:
+                print("pyserial is required for USB captures. Install with `pip install pyserial`.", file=sys.stderr)
+                return 2
 
-        try:
-            capture_stream_usb(
-                args.source,
-                Path(args.output),
-                args.block_bytes,
-                args.blocks,
-                args.timeout,
-                disable_stats=not args.keep_stats,
-                disable_dump=not args.keep_dumps,
-                enable_stream=True,
-                restore=not args.no_restore,
-                clock=args.clock,
-                verbose=args.verbose,
-            )
-        except TimeoutError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        except serial.SerialException as exc:
-            print(f"Serial error: {exc}", file=sys.stderr)
-            return 1
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-    elif args.transport == "usb-vendor":
-        if usb is None:
-            print("pyusb is required for usb-vendor captures. Install with `pip install pyusb`.", file=sys.stderr)
-            return 2
+            try:
+                capture_stream_usb(
+                    args.source,
+                    Path(args.output),
+                    args.block_bytes,
+                    args.blocks,
+                    args.timeout,
+                    disable_stats=not args.keep_stats,
+                    disable_dump=not args.keep_dumps,
+                    enable_stream=True,
+                    restore=not args.no_restore,
+                    clock=args.clock,
+                    verbose=args.verbose,
+                )
+            except TimeoutError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            except serial.SerialException as exc:
+                print(f"Serial error: {exc}", file=sys.stderr)
+                return 1
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        elif args.transport == "usb-vendor":
+            if usb is None:
+                print("pyusb is required for usb-vendor captures. Install with `pip install pyusb`.", file=sys.stderr)
+                return 2
 
-        if args.source and serial is None:
-            print(
-                "pyserial is required when supplying a CLI serial port for usb-vendor captures."
-                " Install with `pip install pyserial`.",
-                file=sys.stderr,
-            )
-            return 2
+            if args.source and serial is None:
+                print(
+                    "pyserial is required when supplying a CLI serial port for usb-vendor captures."
+                    " Install with `pip install pyserial`.",
+                    file=sys.stderr,
+                )
+                return 2
 
-        try:
-            capture_stream_usb_vendor(
-                args.source,
-                Path(args.output),
-                args.block_bytes,
-                args.blocks,
-                args.timeout,
-                disable_stats=not args.keep_stats,
-                disable_dump=not args.keep_dumps,
-                restore=not args.no_restore,
-                clock=args.clock,
-                verbose=args.verbose,
-                vendor_vid=args.usb_vendor_vid,
-                vendor_pid=args.usb_vendor_pid,
-                vendor_interface=args.usb_vendor_interface,
-                vendor_endpoint=args.usb_vendor_endpoint,
-            )
-        except TimeoutError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        except usb.core.USBError as exc:  # type: ignore[attr-defined]
-            print(f"USB error: {exc}", file=sys.stderr)
-            return 1
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-    else:
-        if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
-            print(
-                "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.",
-                file=sys.stderr,
-            )
+            try:
+                capture_stream_usb_vendor(
+                    args.source,
+                    Path(args.output),
+                    args.block_bytes,
+                    args.blocks,
+                    args.timeout,
+                    disable_stats=not args.keep_stats,
+                    disable_dump=not args.keep_dumps,
+                    restore=not args.no_restore,
+                    clock=args.clock,
+                    verbose=args.verbose,
+                    vendor_vid=args.usb_vendor_vid,
+                    vendor_pid=args.usb_vendor_pid,
+                    vendor_interface=args.usb_vendor_interface,
+                    vendor_endpoint=args.usb_vendor_endpoint,
+                )
+            except TimeoutError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            except usb.core.USBError as exc:  # type: ignore[attr-defined]
+                print(f"USB error: {exc}", file=sys.stderr)
+                return 1
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
+                print(
+                    "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.",
+                    file=sys.stderr,
+                )
 
-        try:
-            capture_stream_wifi(
-                args.wifi_bind,
-                args.wifi_port,
-                Path(args.output),
-                args.block_bytes,
-                args.blocks,
-                args.timeout,
-                allow_host=args.wifi_allow,
-                verbose=args.verbose,
-            )
-        except TimeoutError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        except OSError as exc:
-            print(f"Socket error: {exc}", file=sys.stderr)
-            return 1
+            try:
+                capture_stream_wifi(
+                    args.wifi_bind,
+                    args.wifi_port,
+                    Path(args.output),
+                    args.block_bytes,
+                    args.blocks,
+                    args.timeout,
+                    allow_host=args.wifi_allow,
+                    verbose=args.verbose,
+                )
+            except TimeoutError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            except OSError as exc:
+                print(f"Socket error: {exc}", file=sys.stderr)
+                return 1
+    except KeyboardInterrupt:
+        print("Capture cancelled by user", file=sys.stderr)
+        return 130
 
     return 0
 

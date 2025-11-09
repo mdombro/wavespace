@@ -8,6 +8,8 @@
 #ifndef _PICO_PDM_MICROPHONE_H_
 #define _PICO_PDM_MICROPHONE_H_
 
+#include <stdint.h>
+
 #include "hardware/pio.h"
 
 // Application callback invoked from the DMA IRQ when a fresh buffer is ready.
@@ -21,6 +23,14 @@ struct pdm_microphone_config {
     uint pio_sm;
     uint sample_rate;
     uint sample_buffer_size;
+};
+
+// Metadata describing when a raw buffer started capturing and how it maps to the
+// overall PDM stream.
+struct pdm_block_metadata {
+    uint64_t block_index;              // Monotonic block sequence number.
+    uint64_t first_sample_byte_index;  // Offset of the first captured byte.
+    uint64_t capture_start_time_us;    // Time (us) when the buffer began filling.
 };
 
 // Initialise the library and underlying PIO + DMA resources.
@@ -38,5 +48,11 @@ void pdm_microphone_set_samples_ready_handler(pdm_samples_ready_handler_t handle
 
 // Copy the next raw buffer into caller-provided memory; returns bytes copied.
 int pdm_microphone_read(uint8_t* buffer, size_t max_bytes);
+
+// Variant of pdm_microphone_read() that also returns capture metadata.
+int pdm_microphone_read_with_metadata(
+    uint8_t* buffer,
+    size_t max_bytes,
+    struct pdm_block_metadata* metadata);
 
 #endif

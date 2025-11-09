@@ -13,6 +13,8 @@
 #include "hardware/irq.h"
 #include "hardware/sync.h"
 
+#include "pico/time.h"
+
 #include "pdm_microphone.pio.h"
 
 #include "pico/pdm_microphone.h"
@@ -30,9 +32,12 @@ static struct {
     volatile uint raw_buffer_ready_count;
     uint dma_irq;
     pdm_samples_ready_handler_t samples_ready_handler;
+    struct pdm_block_metadata buffer_metadata[PDM_RAW_BUFFER_COUNT];
+    uint64_t next_block_index;
 } pdm_mic;
 
 static void pdm_dma_handler();
+static inline void pdm_record_buffer_metadata(uint index);
 
 // Configure the PIO state machine and DMA to begin buffering raw PDM data.
 int pdm_microphone_init(const struct pdm_microphone_config* config) {
@@ -97,6 +102,7 @@ int pdm_microphone_init(const struct pdm_microphone_config* config) {
     pdm_mic.raw_buffer_write_index = 0;
     pdm_mic.raw_buffer_read_index = 0;
     pdm_mic.raw_buffer_ready_count = 0;
+    pdm_mic.next_block_index = 0;
 
     return 0;
 }
@@ -144,9 +150,11 @@ int pdm_microphone_start() {
         false
     );
 
+    pdm_record_buffer_metadata(pdm_mic.raw_buffer_write_index);
+
     dma_channel_transfer_to_buffer_now(
         pdm_mic.dma_channel,
-        pdm_mic.raw_buffer[0],
+        pdm_mic.raw_buffer[pdm_mic.raw_buffer_write_index],
         pdm_mic.raw_buffer_size
     );
 
@@ -199,6 +207,8 @@ static void pdm_dma_handler() {
     // get the next capture index to send the dma to start
     pdm_mic.raw_buffer_write_index = (pdm_mic.raw_buffer_write_index + 1) % PDM_RAW_BUFFER_COUNT;
 
+    pdm_record_buffer_metadata(pdm_mic.raw_buffer_write_index);
+
     // give the channel a new buffer to write to and re-trigger it
     dma_channel_transfer_to_buffer_now(
         pdm_mic.dma_channel,
@@ -217,7 +227,7 @@ void pdm_microphone_set_samples_ready_handler(pdm_samples_ready_handler_t handle
 }
 
 // Copy the next available raw buffer into the caller-provided scratch space.
-int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
+int pdm_microphone_read_with_metadata(uint8_t* buffer, size_t max_bytes, struct pdm_block_metadata* metadata) {
     if (!buffer || max_bytes == 0) {
         return 0;
     }
@@ -234,9 +244,15 @@ int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
         return 0;
     }
 
-    memcpy(buffer, pdm_mic.raw_buffer[pdm_mic.raw_buffer_read_index], pdm_mic.raw_buffer_size);
+    uint read_index = pdm_mic.raw_buffer_read_index;
 
-    pdm_mic.raw_buffer_read_index = (pdm_mic.raw_buffer_read_index + 1) % PDM_RAW_BUFFER_COUNT;
+    memcpy(buffer, pdm_mic.raw_buffer[read_index], pdm_mic.raw_buffer_size);
+
+    if (metadata) {
+        *metadata = pdm_mic.buffer_metadata[read_index];
+    }
+
+    pdm_mic.raw_buffer_read_index = (read_index + 1) % PDM_RAW_BUFFER_COUNT;
     if (pdm_mic.raw_buffer_ready_count > 0) {
         pdm_mic.raw_buffer_ready_count--;
     }
@@ -244,4 +260,17 @@ int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
     restore_interrupts(status);
 
     return (int)pdm_mic.raw_buffer_size;
+}
+
+int pdm_microphone_read(uint8_t* buffer, size_t max_bytes) {
+    return pdm_microphone_read_with_metadata(buffer, max_bytes, NULL);
+}
+
+static inline void pdm_record_buffer_metadata(uint index) {
+    struct pdm_block_metadata* meta = &pdm_mic.buffer_metadata[index];
+    uint64_t block_index = pdm_mic.next_block_index++;
+
+    meta->block_index = block_index;
+    meta->first_sample_byte_index = block_index * (uint64_t)pdm_mic.raw_buffer_size;
+    meta->capture_start_time_us = time_us_64();
 }

@@ -51,6 +51,7 @@
 
 #define PDM_BLOCK_BITS   8192
 #define PDM_BLOCK_BYTES  (PDM_BLOCK_BITS / 8)
+#define PDM_BLOCK_PACKET_BYTES  (PDM_BLOCK_BYTES + sizeof(struct pdm_block_metadata))
 
 #define SERIAL_UART_ID         uart0
 #define SERIAL_UART_TX_PIN     0
@@ -64,6 +65,8 @@
 
 static uint8_t sample_buffer[PDM_BLOCK_BYTES];
 static uint8_t discard_buffer[PDM_BLOCK_BYTES];
+static struct pdm_block_metadata sample_metadata;
+static struct pdm_block_metadata discard_metadata;
 static volatile bool block_pending = false;
 static volatile int block_length = 0;
 
@@ -74,7 +77,6 @@ static volatile uint32_t overruns = 0;
 
 static uint32_t blocks_streamed = 0;
 static uint32_t bytes_sent = 0;
-static uint32_t block_counter = 0;
 
 static bool debug_stats_enabled = true;
 static bool debug_dump_samples = false;
@@ -95,7 +97,12 @@ static ip_addr_t wifi_remote_addr;
 #define WIFI_QUEUE_CAPACITY 128
 
 typedef struct {
-    uint8_t data[PDM_BLOCK_BYTES];
+    struct pdm_block_metadata metadata;
+    uint8_t payload[PDM_BLOCK_BYTES];
+} pdm_block_packet_t;
+
+typedef struct {
+    uint8_t data[PDM_BLOCK_PACKET_BYTES];
     uint16_t length;
 } wifi_packet_t;
 
@@ -266,7 +273,8 @@ cleanup:
 static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t* target = block_pending ? discard_buffer : sample_buffer;
-    int read = pdm_microphone_read(target, PDM_BLOCK_BYTES);
+    struct pdm_block_metadata* target_metadata = block_pending ? &discard_metadata : &sample_metadata;
+    int read = pdm_microphone_read_with_metadata(target, PDM_BLOCK_BYTES, target_metadata);
 
     if (!block_pending && read > 0) {
         blocks_ready++;
@@ -375,7 +383,6 @@ static void clear_stats(void) {
     overruns = 0;
     blocks_streamed = 0;
     bytes_sent = 0;
-    block_counter = 0;
     restore_interrupts(status);
 
     wifi_packets_sent = 0;
@@ -506,13 +513,18 @@ static void handle_console_input(void) {
     }
 }
 
-static void dump_block_summary(const uint8_t* data, size_t length, uint32_t block_id) {
+static void dump_block_summary(const pdm_block_packet_t* packet, size_t length) {
     const size_t max_preview = 32;
     size_t preview = length < max_preview ? length : max_preview;
     uint32_t ones = 0;
     uint32_t zeros = 0;
+    const uint8_t* data = packet->payload;
+    const struct pdm_block_metadata* meta = &packet->metadata;
 
-    printf("Block %lu len=%lu:", (unsigned long)block_id, (unsigned long)length);
+    printf("Block %llu len=%lu t0=%llu us:",
+           (unsigned long long)meta->block_index,
+           (unsigned long)length,
+           (unsigned long long)meta->capture_start_time_us);
     for (size_t i = 0; i < preview; i++) {
         printf(" %02X", data[i]);
     }
@@ -531,6 +543,10 @@ static void dump_block_summary(const uint8_t* data, size_t length, uint32_t bloc
 
 static bool wifi_queue_push(const uint8_t* data, size_t length) {
     if (!wifi_stream_enabled || !wifi_ready || wifi_udp_socket == NULL || length == 0) {
+        return false;
+    }
+
+    if (length > PDM_BLOCK_PACKET_BYTES) {
         return false;
     }
 
@@ -777,13 +793,17 @@ int main(void) {
             continue;
         }
 
-        uint8_t transfer_buffer[PDM_BLOCK_BYTES];
+        pdm_block_packet_t transfer_packet;
+        size_t packet_bytes = 0;
         int bytes_to_send = 0;
 
         uint32_t status = save_and_disable_interrupts();
         if (block_pending) {
             bytes_to_send = block_length;
-            memcpy(transfer_buffer, sample_buffer, (size_t)bytes_to_send);
+            if (bytes_to_send > 0) {
+                memcpy(transfer_packet.payload, sample_buffer, (size_t)bytes_to_send);
+                transfer_packet.metadata = sample_metadata;
+            }
             block_length = 0;
             block_pending = false;
         }
@@ -794,29 +814,29 @@ int main(void) {
             continue;
         }
 
-        uint32_t block_id = block_counter++;
+        packet_bytes = sizeof(transfer_packet.metadata) + (size_t)bytes_to_send;
 
         if (debug_dump_samples) {
-            dump_block_summary(transfer_buffer, (size_t)bytes_to_send, block_id);
+            dump_block_summary(&transfer_packet, (size_t)bytes_to_send);
         }
 
-        wifi_queue_push(transfer_buffer, (size_t)bytes_to_send);
+        wifi_queue_push((const uint8_t*)&transfer_packet, packet_bytes);
         wifi_queue_service();
 
         if (usb_vendor_stream_enabled) {
-            if (!usb_vendor_stream_block(transfer_buffer, (size_t)bytes_to_send)) {
+            if (!usb_vendor_stream_block((const uint8_t*)&transfer_packet, packet_bytes)) {
                 usb_vendor_failures++;
             }
         }
 
         if (serial_stream_enabled) {
-            if (!serial_stream_block(transfer_buffer, (size_t)bytes_to_send)) {
+            if (!serial_stream_block((const uint8_t*)&transfer_packet, packet_bytes)) {
                 serial_failures++;
             }
         }
 
         if (stream_binary_data) {
-            usb_write_blocking(transfer_buffer, (size_t)bytes_to_send);
+            usb_write_blocking((const uint8_t*)&transfer_packet, packet_bytes);
             bytes_sent += (uint32_t)bytes_to_send;
             blocks_streamed++;
         }
