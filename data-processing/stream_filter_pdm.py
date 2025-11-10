@@ -22,7 +22,7 @@ from collections import deque
 class BlockMeta:
     block_index: int
     byte_offset: int
-    timestamp_us: int
+    timestamp_us: int  # End-of-block timestamp from metadata (microseconds)
     bytes_per_channel: int
     channel_count: int
     dropped: bool = False

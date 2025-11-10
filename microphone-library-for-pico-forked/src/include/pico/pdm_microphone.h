@@ -37,7 +37,7 @@ struct pdm_microphone_config {
 struct pdm_block_metadata {
     uint64_t block_index;              // Monotonic block sequence number.
     uint64_t first_sample_byte_index;  // Offset of the first captured byte.
-    uint64_t capture_start_time_us;    // Time (us) when the buffer began filling.
+    uint64_t capture_end_time_us;    // Time (us) when the buffer finished filling (end-of-block timestamp).
     uint32_t payload_bytes_per_channel;// Bytes per channel in this block.
     uint16_t channel_count;            // Number of channels captured in this block.
     uint16_t reserved;                 // Reserved for future metadata.

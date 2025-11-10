@@ -72,7 +72,7 @@ class SampleMapper:
     ):
         self.samples = samples.astype(np.float32, copy=False)
         self.fs_out = fs_out
-        self.samples_per_us = fs_out / 1e6
+        self.samples_per_us = fs_out / 1e6 if fs_out > 0 else 0.0
         self.total_samples = len(self.samples)
 
         sample_index = sample_index.astype(np.int64)
@@ -89,7 +89,11 @@ class SampleMapper:
             delay_us = (len(taps) // 2) / fs_in * 1e6
 
         self.start_sample_index = int(sample_index[first])
-        self.start_time_us = float(timestamp_us[first]) + delay_us
+
+        sample_period_us = 1e6 / fs_out if fs_out > 0 else 0.0
+        block_duration_us = sample_count[first] * sample_period_us
+        block_start_us = float(timestamp_us[first]) - block_duration_us
+        self.start_time_us = block_start_us + delay_us
 
     def extract(self, start_us: float, window_us: float) -> Optional[np.ndarray]:
         offset_us = start_us - self.start_time_us

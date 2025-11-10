@@ -334,7 +334,7 @@ static inline void pdm_record_buffer_metadata(uint index) {
 
     meta->block_index = block_index;
     meta->first_sample_byte_index = block_index * (uint64_t)pdm_mic.bytes_per_channel;
-    meta->capture_start_time_us = 0;
+    meta->capture_end_time_us = 0;
     meta->payload_bytes_per_channel = pdm_mic.bytes_per_channel;
     meta->channel_count = (uint16_t)pdm_mic.config.channels;
     meta->reserved = 0;
@@ -351,7 +351,7 @@ static inline void pdm_prepare_timestamp_dma(uint index) {
     dma_channel_configure(
         pdm_mic.timestamp_dma_channel,
         &pdm_mic.timestamp_dma_config,
-        &meta->capture_start_time_us,
+        &meta->capture_end_time_us,
         &timer_hw->timerawl,
         2,
         false

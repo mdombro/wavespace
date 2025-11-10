@@ -16,7 +16,7 @@ debug CLI that the firmware now exposes. It will automatically:
 
 In Wi-Fi mode the script simply listens for fixed-size UDP payloads from the
 Pico and writes them directly to the requested output file. Each block's
-metadata (block index, byte offset, timestamp_us) is recorded in a CSV sidecar.
+metadata (block index, byte offset, end-of-block timestamp_us) is recorded in a CSV sidecar.
 """
 
 from __future__ import annotations
@@ -60,12 +60,12 @@ DEFAULT_USB_VENDOR_PID = 0x4001
 DEFAULT_USB_VENDOR_INTERFACE = 2
 DEFAULT_USB_VENDOR_ENDPOINT = 0x83
 
-METADATA_STRUCT = struct.Struct("<QQQIHH")  # block_index, first_sample_byte_index, capture_start_time_us, bytes_per_ch, channels, reserved
+METADATA_STRUCT = struct.Struct("<QQQIHH")  # block_index, first_sample_byte_index, capture_end_time_us, bytes_per_ch, channels, reserved
 METADATA_BYTES = METADATA_STRUCT.size
 METADATA_HEADER = [
     "block_index",
     "byte_offset",
-    "timestamp_us",
+    "block_end_time_us",
     "payload_bytes_per_channel",
     "channel_count",
     "dropped",
@@ -106,6 +106,7 @@ class CliState:
 
 @dataclass
 class BlockMetadata:
+    """Metadata parsed from the device; timestamp_us reflects the block end time (microseconds)."""
     block_index: int
     byte_offset: int
     timestamp_us: int

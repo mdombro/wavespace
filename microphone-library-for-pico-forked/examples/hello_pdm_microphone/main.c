@@ -525,10 +525,10 @@ static void dump_block_summary(const pdm_block_packet_t* packet, size_t length) 
     const uint8_t* data = packet->payload;
     const struct pdm_block_metadata* meta = &packet->metadata;
 
-    printf("Block %llu len=%lu t0=%llu us:",
+    printf("Block %llu len=%lu t_end=%llu us:",
            (unsigned long long)meta->block_index,
            (unsigned long)length,
-           (unsigned long long)meta->capture_start_time_us);
+           (unsigned long long)meta->capture_end_time_us);
     for (size_t i = 0; i < preview; i++) {
         printf(" %02X", data[i]);
     }
