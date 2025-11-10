@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         "--window-ms",
         type=float,
         default=20.0,
-        help="Reserve this many ms at the end to keep sample windows in range (default: %(default)s)",
+        help="Spacing between successive timestamps in milliseconds (default: %(default)s)",
     )
     parser.add_argument(
         "--timestamp-column",
@@ -141,7 +141,7 @@ def main() -> int:
         raise ValueError("Grid dimensions must all be positive.")
 
     spacing_us = args.window_ms * 1_000.0
-    time_start = slices[0].start_us
+    time_start = max(slices[0].start_us, spacing_us)
     duration = max(0, (total_points - 1)) * spacing_us
     time_end = slices[-1].end_us - spacing_us
     if duration > time_end - time_start:

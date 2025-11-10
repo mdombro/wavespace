@@ -21,15 +21,6 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from bisect import bisect_right
-
-
-@dataclass
-class BlockSlice:
-    start_us: float
-    end_us: float
-    sample_index: int
-    sample_count: int
 
 
 @dataclass
@@ -45,43 +36,6 @@ def load_filtered_npz(path: Path) -> dict:
         if key not in data:
             raise KeyError(f"{path} missing required dataset '{key}'")
     return data
-
-
-def build_block_slices(
-    timestamp_us: np.ndarray,
-    sample_index: np.ndarray,
-    sample_count: np.ndarray,
-    fs_in: float,
-    fs_out: float,
-    taps: Optional[np.ndarray],
-) -> List[BlockSlice]:
-    valid = sample_count > 0
-    if not np.any(valid):
-        raise ValueError("Filtered NPZ contains no samples.")
-    timestamp_us = timestamp_us.astype(np.float64)
-    sample_index = sample_index.astype(np.int64)
-    sample_count = sample_count.astype(np.int64)
-
-    first = int(np.argmax(valid))
-    delay_us = 0.0
-    if taps is not None and fs_in > 0:
-        delay_us = (len(taps) // 2) / fs_in * 1e6
-
-    current_time = float(timestamp_us[first]) + delay_us
-    slices: List[BlockSlice] = []
-    sample_period_us = 1e6 / fs_out
-
-    for idx in range(first, len(timestamp_us)):
-        count = int(sample_count[idx])
-        if count <= 0:
-            continue
-        start = max(current_time, float(timestamp_us[idx]))
-        duration = count * sample_period_us
-        end = start + duration
-        slices.append(BlockSlice(start_us=start, end_us=end, sample_index=int(sample_index[idx]), sample_count=count))
-        current_time = end
-
-    return slices
 
 
 def load_events(csv_path: Path, timestamp_col: str, x_col: str, y_col: str, z_col: str) -> List[EventPoint]:
@@ -106,34 +60,51 @@ def load_events(csv_path: Path, timestamp_col: str, x_col: str, y_col: str, z_co
 
 
 class SampleMapper:
-    def __init__(self, samples: np.ndarray, slices: List[BlockSlice], fs_out: float):
+    def __init__(
+        self,
+        samples: np.ndarray,
+        timestamp_us: np.ndarray,
+        sample_index: np.ndarray,
+        sample_count: np.ndarray,
+        fs_out: float,
+        fs_in: float,
+        taps: Optional[np.ndarray],
+    ):
         self.samples = samples.astype(np.float32, copy=False)
-        self.slices = slices
         self.fs_out = fs_out
         self.samples_per_us = fs_out / 1e6
-        self.end_times = np.array([sl.end_us for sl in slices], dtype=np.float64)
+        self.total_samples = len(self.samples)
+
+        sample_index = sample_index.astype(np.int64)
+        sample_count = sample_count.astype(np.int64)
+        timestamp_us = timestamp_us.astype(np.float64)
+
+        valid = sample_count > 0
+        if not np.any(valid):
+            raise ValueError("Filtered NPZ contains no samples.")
+
+        first = int(np.argmax(valid))
+        delay_us = 0.0
+        if taps is not None and fs_in > 0:
+            delay_us = (len(taps) // 2) / fs_in * 1e6
+
+        self.start_sample_index = int(sample_index[first])
+        self.start_time_us = float(timestamp_us[first]) + delay_us
 
     def extract(self, start_us: float, window_us: float) -> Optional[np.ndarray]:
-        if not self.slices:
+        offset_us = start_us - self.start_time_us
+        if offset_us < 0:
             return None
 
-        idx = bisect_right(self.end_times, start_us)
-        if idx >= len(self.slices):
-            return None
-        block = self.slices[idx]
-        if start_us < block.start_us:
+        sample_offset = int(round(offset_us * self.samples_per_us)) + self.start_sample_index
+        if sample_offset >= self.total_samples:
             return None
 
-        offset_samples = int(round((start_us - block.start_us) * self.samples_per_us))
-        if offset_samples >= block.sample_count:
-            return None
-
-        global_start = block.sample_index + offset_samples
         window_samples = max(1, int(round(window_us * self.samples_per_us)))
-        global_end = min(len(self.samples), global_start + window_samples)
-        if global_start >= global_end:
+        global_end = min(self.total_samples, sample_offset + window_samples)
+        if sample_offset >= global_end:
             return None
-        return self.samples[global_start:global_end]
+        return self.samples[sample_offset:global_end]
 
 
 def postprocess_series(series: np.ndarray, *, take_abs: bool) -> np.ndarray:
@@ -191,15 +162,15 @@ def main() -> int:
     samples = data["samples"]
     fs_out = float(data["fs_out"])
     fs_in = float(data.get("fs_in", 0.0))
-    slices = build_block_slices(
+    mapper = SampleMapper(
+        samples=samples,
         timestamp_us=data["timestamp_us"],
         sample_index=data["sample_index"],
         sample_count=data["sample_count"],
-        fs_in=fs_in,
         fs_out=fs_out,
+        fs_in=fs_in,
         taps=data.get("taps"),
     )
-    mapper = SampleMapper(samples, slices, fs_out)
     events = load_events(args.events_csv, args.timestamp_col, args.x_col, args.y_col, args.z_col)
     if not events:
         print("No events found in CSV; nothing to do.", file=sys.stderr)
@@ -211,11 +182,13 @@ def main() -> int:
     skipped = 0
 
     for idx, event in enumerate(events, start=args.start_index):
+        # print(event.timestamp_us, window_us)
         series = mapper.extract(event.timestamp_us, window_us)
         if series is None:
             skipped += 1
             continue
         values = postprocess_series(series, take_abs=args.take_abs)
+        #values = series # do not want to clip to 0,1, leave as full analog range
         fn = args.output_dir / f"point_{idx:05d}.npz"
         np.savez(fn, xyz=event.xyz.astype(np.float32), val=values.astype(np.float32))
         processed += 1

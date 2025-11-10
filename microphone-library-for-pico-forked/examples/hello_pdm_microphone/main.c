@@ -49,9 +49,11 @@
 #define USB_WAIT_TIMEOUT_MS 3000
 #endif
 
-#define PDM_BLOCK_BITS   8192
-#define PDM_BLOCK_BYTES  (PDM_BLOCK_BITS / 8)
-#define PDM_BLOCK_PACKET_BYTES  (PDM_BLOCK_BYTES + sizeof(struct pdm_block_metadata))
+#define PDM_CHANNEL_COUNT       2
+#define PDM_BLOCK_BITS_PER_CH   8192
+#define PDM_BLOCK_BYTES_PER_CH  (PDM_BLOCK_BITS_PER_CH / 8)
+#define PDM_BLOCK_PAYLOAD_BYTES (PDM_BLOCK_BYTES_PER_CH * PDM_CHANNEL_COUNT)
+#define PDM_BLOCK_PACKET_BYTES  (PDM_BLOCK_PAYLOAD_BYTES + sizeof(struct pdm_block_metadata))
 
 #define SERIAL_UART_ID         uart0
 #define SERIAL_UART_TX_PIN     0
@@ -63,8 +65,8 @@
 #define USB_VENDOR_SPIN_MAX    20000
 #define USB_VENDOR_BACKOFF_US  10
 
-static uint8_t sample_buffer[PDM_BLOCK_BYTES];
-static uint8_t discard_buffer[PDM_BLOCK_BYTES];
+static uint8_t sample_buffer[PDM_BLOCK_PAYLOAD_BYTES];
+static uint8_t discard_buffer[PDM_BLOCK_PAYLOAD_BYTES];
 static struct pdm_block_metadata sample_metadata;
 static struct pdm_block_metadata discard_metadata;
 static volatile bool block_pending = false;
@@ -98,7 +100,7 @@ static ip_addr_t wifi_remote_addr;
 
 typedef struct {
     struct pdm_block_metadata metadata;
-    uint8_t payload[PDM_BLOCK_BYTES];
+    uint8_t payload[PDM_BLOCK_PAYLOAD_BYTES];
 } pdm_block_packet_t;
 
 typedef struct {
@@ -130,11 +132,13 @@ static bool serial_initialised = false;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
-    .gpio_clk = 3,
+    .gpio_data_secondary = 3,
+    .gpio_clk = 4,
     .pio = pio0,
     .pio_sm = 0,
     .sample_rate = 2048000,
-    .sample_buffer_size = PDM_BLOCK_BYTES,
+    .sample_buffer_size = PDM_BLOCK_BYTES_PER_CH,
+    .channels = PDM_CHANNEL_COUNT,
 };
 
 static void clear_stats(void);
@@ -274,7 +278,7 @@ static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t* target = block_pending ? discard_buffer : sample_buffer;
     struct pdm_block_metadata* target_metadata = block_pending ? &discard_metadata : &sample_metadata;
-    int read = pdm_microphone_read_with_metadata(target, PDM_BLOCK_BYTES, target_metadata);
+    int read = pdm_microphone_read_with_metadata(target, PDM_BLOCK_PAYLOAD_BYTES, target_metadata);
 
     if (!block_pending && read > 0) {
         blocks_ready++;

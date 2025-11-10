@@ -83,8 +83,10 @@
 #error "MEASUREMENT_MAX_DATA_BYTES must be positive"
 #endif
 
-#define PDM_BLOCK_BITS   8192
-#define PDM_BLOCK_BYTES  (PDM_BLOCK_BITS / 8)
+#define PDM_CHANNEL_COUNT       2
+#define PDM_BLOCK_BITS_PER_CH   8192
+#define PDM_BLOCK_BYTES_PER_CH  (PDM_BLOCK_BITS_PER_CH / 8)
+#define PDM_BLOCK_PAYLOAD_BYTES (PDM_BLOCK_BYTES_PER_CH * PDM_CHANNEL_COUNT)
 
 #define SERIAL_UART_ID         uart0
 #define SERIAL_UART_TX_PIN     0
@@ -96,8 +98,8 @@
 #define USB_VENDOR_SPIN_MAX    20000
 #define USB_VENDOR_BACKOFF_US  10
 
-static uint8_t sample_buffer[PDM_BLOCK_BYTES];
-static uint8_t discard_buffer[PDM_BLOCK_BYTES];
+static uint8_t sample_buffer[PDM_BLOCK_PAYLOAD_BYTES];
+static uint8_t discard_buffer[PDM_BLOCK_PAYLOAD_BYTES];
 static volatile bool block_pending = false;
 static volatile int block_length = 0;
 
@@ -175,11 +177,13 @@ static uint32_t measurement_payload_bytes_sent = 0;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
-    .gpio_clk = 3,
+    .gpio_data_secondary = 3,
+    .gpio_clk = 4,
     .pio = pio0,
     .pio_sm = 0,
     .sample_rate = 2048000,
-    .sample_buffer_size = PDM_BLOCK_BYTES,
+    .sample_buffer_size = PDM_BLOCK_BYTES_PER_CH,
+    .channels = PDM_CHANNEL_COUNT,
 };
 
 static void clear_stats(void);
@@ -327,7 +331,7 @@ cleanup:
 static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t* target = block_pending ? discard_buffer : sample_buffer;
-    int read = pdm_microphone_read(target, PDM_BLOCK_BYTES);
+    int read = pdm_microphone_read(target, PDM_BLOCK_PAYLOAD_BYTES);
 
     if (!block_pending && read > 0) {
         blocks_ready++;
@@ -997,7 +1001,7 @@ int main(void) {
             continue;
         }
 
-        uint8_t transfer_buffer[PDM_BLOCK_BYTES];
+        uint8_t transfer_buffer[PDM_BLOCK_PAYLOAD_BYTES];
         int bytes_to_send = 0;
 
         uint32_t status = save_and_disable_interrupts();

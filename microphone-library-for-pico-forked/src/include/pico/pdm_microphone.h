@@ -15,14 +15,21 @@
 // Application callback invoked from the DMA IRQ when a fresh buffer is ready.
 typedef void (*pdm_samples_ready_handler_t)(void);
 
-// Hardware configuration for a single PDM microphone capture stream.
+// Maximum number of simultaneously sampled microphones supported by the helper library.
+#define PDM_MIC_MAX_CHANNELS 2u
+
+#define PDM_MIC_MAX_CHANNELS 2u
+
+// Hardware configuration for one or two PDM microphones sharing the same capture context.
 struct pdm_microphone_config {
-    uint gpio_data;
-    uint gpio_clk;
+    uint gpio_data;            // Primary microphone data pin.
+    uint gpio_data_secondary;  // Secondary mic data pin (must equal gpio_data + 1 when channels == 2).
+    uint gpio_clk;             // Shared clock pin.
     PIO pio;
     uint pio_sm;
-    uint sample_rate;
-    uint sample_buffer_size;
+    uint channels;             // 1 (default) or 2.
+    uint sample_rate;          // PDM clock in Hz.
+    uint sample_buffer_size;   // Bytes captured per channel in each block.
 };
 
 // Metadata describing when a raw buffer started capturing and how it maps to the
@@ -31,6 +38,9 @@ struct pdm_block_metadata {
     uint64_t block_index;              // Monotonic block sequence number.
     uint64_t first_sample_byte_index;  // Offset of the first captured byte.
     uint64_t capture_start_time_us;    // Time (us) when the buffer began filling.
+    uint32_t payload_bytes_per_channel;// Bytes per channel in this block.
+    uint16_t channel_count;            // Number of channels captured in this block.
+    uint16_t reserved;                 // Reserved for future metadata.
 };
 
 // Initialise the library and underlying PIO + DMA resources.

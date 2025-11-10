@@ -14,6 +14,15 @@
     nop side 1
 .wrap
 
+.program pdm_microphone_data_dual
+.side_set 1
+.wrap_target
+    nop side 0
+    in pins, 2 side 0
+    push iffull noblock side 1
+    nop side 1
+.wrap
+
 % c-sdk {
 
 static inline void pdm_microphone_data_init(PIO pio, uint sm, uint offset, float clk_div, uint data_pin, uint clk_pin) {
@@ -33,6 +42,27 @@ static inline void pdm_microphone_data_init(PIO pio, uint sm, uint offset, float
 
     sm_config_set_clkdiv(&c, clk_div);
     
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void pdm_microphone_data_dual_init(PIO pio, uint sm, uint offset, float clk_div, uint data_pin, uint clk_pin) {
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 2, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, clk_pin, 1, true);
+
+    pio_sm_config c = pdm_microphone_data_dual_program_get_default_config(offset);
+
+    sm_config_set_sideset_pins(&c, clk_pin);
+    sm_config_set_in_pins(&c, data_pin);
+
+    pio_gpio_init(pio, clk_pin);
+    pio_gpio_init(pio, data_pin);
+    pio_gpio_init(pio, data_pin + 1);
+
+    sm_config_set_in_shift(&c, false, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    sm_config_set_clkdiv(&c, clk_div);
+
     pio_sm_init(pio, sm, offset, &c);
 }
 %}

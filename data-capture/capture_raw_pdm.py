@@ -50,8 +50,8 @@ else:
     from usb.core import NoBackendError  # type: ignore
 
 
-DEFAULT_BLOCK_BITS = 8192
-DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # payload size (no metadata header)
+DEFAULT_BLOCK_BITS = 16384  # Two channels @ 8192 bits each by default
+DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # total payload bytes across all channels
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_WIFI_PORT = 5000
 CLI_READ_WINDOW = 1.0
@@ -60,8 +60,16 @@ DEFAULT_USB_VENDOR_PID = 0x4001
 DEFAULT_USB_VENDOR_INTERFACE = 2
 DEFAULT_USB_VENDOR_ENDPOINT = 0x83
 
-METADATA_STRUCT = struct.Struct("<QQQ")  # block_index, first_sample_byte_index, capture_start_time_us
+METADATA_STRUCT = struct.Struct("<QQQIHH")  # block_index, first_sample_byte_index, capture_start_time_us, bytes_per_ch, channels, reserved
 METADATA_BYTES = METADATA_STRUCT.size
+METADATA_HEADER = [
+    "block_index",
+    "byte_offset",
+    "timestamp_us",
+    "payload_bytes_per_channel",
+    "channel_count",
+    "dropped",
+]
 
 COMMAND_HELP = b"?"
 COMMAND_TOGGLE_STREAM = b"b"
@@ -73,6 +81,9 @@ COMMAND_CLOCK = {
     512_000: b"1",
     1_024_000: b"2",
     2_048_000: b"3",
+    3_000_000: b"4",
+    4_000_000: b"5",
+    4_800_000: b"6",
 }
 
 STREAM_LINE = re.compile(r"toggle binary streaming \(currently (ON|OFF)\)", re.IGNORECASE)
@@ -93,23 +104,50 @@ class CliState:
         return self.stream is not None and self.stats is not None and self.dump is not None
 
 
-@dataclass(frozen=True)
+@dataclass
 class BlockMetadata:
     block_index: int
     byte_offset: int
     timestamp_us: int
+    payload_bytes_per_channel: int
+    channel_count: int
+
+    @property
+    def total_payload_bytes(self) -> int:
+        return self.payload_bytes_per_channel * max(1, self.channel_count)
 
 
 def metadata_path_for(data_path: Path) -> Path:
     return data_path.with_name(data_path.name + ".metadata.csv")
 
 
-def metadata_is_plausible(meta: BlockMetadata, payload_bytes: int) -> bool:
-    if payload_bytes <= 0:
+def emit_dropped_blocks(
+    writer: csv.writer,
+    expected_index: Optional[int],
+    current_index: int,
+    *,
+    label: str,
+    verbose: bool,
+) -> int:
+    if expected_index is None:
+        return current_index
+    if current_index <= expected_index:
+        return expected_index
+
+    for missing in range(expected_index, current_index):
+        writer.writerow([missing, -1, -1, 0, 0, 1])
+        if verbose:
+            debug(f"[{label}] block {missing} dropped", verbose=True)
+
+    return current_index
+
+
+def metadata_is_plausible(meta: BlockMetadata) -> bool:
+    if meta.payload_bytes_per_channel <= 0 or meta.channel_count <= 0:
         return False
-    if meta.byte_offset % payload_bytes != 0:
+    if meta.byte_offset % meta.payload_bytes_per_channel != 0:
         return False
-    expected_index = meta.byte_offset // payload_bytes
+    expected_index = meta.byte_offset // meta.payload_bytes_per_channel
     return expected_index == meta.block_index
 
 
@@ -145,8 +183,12 @@ class PacketAligner:
     def _ensure_aligned(self, buffer: bytearray) -> BlockMetadata:
         shifts = 0
         while True:
-            metadata, _ = parse_block_packet(bytes(buffer), self._payload_bytes)
-            if self._metadata_valid(metadata):
+            try:
+                metadata, _ = parse_block_packet(bytes(buffer), self._payload_bytes)
+            except ValueError:
+                metadata = None
+
+            if metadata and self._metadata_valid(metadata):
                 if shifts and self._verbose:
                     debug(
                         f"[{self._label}] resynchronized after {shifts} byte shift(s) (block {metadata.block_index})",
@@ -162,6 +204,11 @@ class PacketAligner:
                         verbose=True,
                     )
                 self._last_block_index = metadata.block_index
+                actual_payload = metadata.total_payload_bytes
+                self._payload_bytes = actual_payload
+                packet_bytes = METADATA_BYTES + actual_payload
+                if packet_bytes != self._packet_bytes:
+                    self._packet_bytes = packet_bytes
                 return metadata
 
             shifts += 1
@@ -178,7 +225,7 @@ class PacketAligner:
             buffer.extend(next_byte)
 
     def _metadata_valid(self, metadata: BlockMetadata) -> bool:
-        if not metadata_is_plausible(metadata, self._payload_bytes):
+        if not metadata_is_plausible(metadata):
             return False
         if self._last_block_index is not None and metadata.block_index < self._last_block_index:
             return False
@@ -204,14 +251,42 @@ class ProgressReporter:
         )
 
 
-def parse_block_packet(packet: bytes, payload_bytes: int) -> Tuple[BlockMetadata, memoryview]:
-    expected = payload_bytes + METADATA_BYTES
-    if len(packet) != expected:
-        raise ValueError(f"Malformed block packet: expected {expected} bytes, received {len(packet)} bytes")
+def parse_block_packet(packet: bytes, payload_bytes_hint: int) -> Tuple[BlockMetadata, memoryview]:
+    if len(packet) < METADATA_BYTES:
+        raise ValueError("Packet shorter than metadata header")
 
-    block_index, byte_offset, timestamp_us = METADATA_STRUCT.unpack_from(packet, 0)
-    metadata = BlockMetadata(block_index=block_index, byte_offset=byte_offset, timestamp_us=timestamp_us)
-    return metadata, memoryview(packet)[METADATA_BYTES:]
+    block_index, byte_offset, timestamp_us, bytes_per_channel, channel_count, _ = METADATA_STRUCT.unpack_from(
+        packet, 0
+    )
+    metadata = BlockMetadata(
+        block_index=block_index,
+        byte_offset=byte_offset,
+        timestamp_us=timestamp_us,
+        payload_bytes_per_channel=bytes_per_channel,
+        channel_count=channel_count,
+    )
+
+    total_payload = metadata.total_payload_bytes
+    available_payload = max(0, len(packet) - METADATA_BYTES)
+
+    if total_payload <= 0 or total_payload > available_payload:
+        if payload_bytes_hint > 0:
+            total_payload = min(payload_bytes_hint, available_payload)
+        else:
+            total_payload = available_payload
+
+        if metadata.channel_count <= 0:
+            metadata.channel_count = 1
+        metadata.payload_bytes_per_channel = max(1, total_payload // metadata.channel_count)
+
+    expected = METADATA_BYTES + metadata.total_payload_bytes
+    if len(packet) < expected:
+        raise ValueError(
+            f"Malformed block packet: expected {expected} bytes, received {len(packet)} bytes "
+            f"(payload hint {payload_bytes_hint})"
+        )
+
+    return metadata, memoryview(packet)[METADATA_BYTES:expected]
 
 
 def debug(msg: str, *, verbose: bool) -> None:
@@ -492,7 +567,7 @@ def capture_stream_usb(
         metadata_path.open("w", newline="") as metadata_file,
     ):
         metadata_writer = csv.writer(metadata_file)
-        metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
+        metadata_writer.writerow(METADATA_HEADER)
         debug(f"[cli] connected to {port}", verbose=verbose)
 
         start_state, toggled = configure_device(
@@ -520,15 +595,50 @@ def capture_stream_usb(
         )
 
         block_count = 0
+        dropped_blocks = 0
+        bytes_captured = 0
         progress = ProgressReporter("usb")
+        expected_block_index: Optional[int] = None
 
         try:
             while blocks is None or block_count < blocks:
                 payload_view, metadata = packet_source.next_packet()
+
+                if expected_block_index is not None:
+                    if metadata.block_index < expected_block_index:
+                        debug(
+                            f"[usb] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
+                            verbose=verbose,
+                        )
+                        continue
+                    if metadata.block_index > expected_block_index:
+                        dropped_blocks = emit_dropped_blocks(
+                            metadata_writer,
+                            expected_block_index,
+                            metadata.block_index,
+                            label="usb",
+                            verbose=verbose,
+                        )
+                        progress.update(
+                            block_count,
+                            bytes_captured,
+                        )
+                expected_block_index = metadata.block_index + 1
+
                 sink.write(payload_view)
-                metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
+                metadata_writer.writerow(
+                    [
+                        metadata.block_index,
+                        metadata.byte_offset,
+                        metadata.timestamp_us,
+                        metadata.payload_bytes_per_channel,
+                        metadata.channel_count,
+                        0,
+                    ]
+                )
                 block_count += 1
-                progress.update(block_count, block_count * block_bytes)
+                bytes_captured += metadata.total_payload_bytes
+                progress.update(block_count, bytes_captured)
 
         except KeyboardInterrupt:
             debug("[capture] interrupted by user", verbose=True)
@@ -539,8 +649,9 @@ def capture_stream_usb(
                 restore_device(device, start_state=start_state, toggled=toggled, verbose=verbose)
 
     print(
-        f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
+        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
         f"(metadata -> {metadata_path})",
+        f"Dropped {dropped_blocks} block(s).",
         file=sys.stderr,
     )
 
@@ -566,15 +677,17 @@ def capture_stream_wifi(
         metadata_path.open("w", newline="") as metadata_file,
     ):
         metadata_writer = csv.writer(metadata_file)
-        metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
+        metadata_writer.writerow(METADATA_HEADER)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((bind_host, bind_port))
         sock.settimeout(None if timeout <= 0 else timeout)
 
         debug(f"[wifi] listening on {bind_host}:{bind_port}", verbose=verbose)
         block_count = 0
+        dropped_blocks = 0
+        bytes_captured = 0
         source_addr: Optional[Tuple[str, int]] = None
-        last_block_index: Optional[int] = None
+        expected_block_index: Optional[int] = None
         progress = ProgressReporter("wifi")
 
         try:
@@ -592,16 +705,16 @@ def capture_stream_wifi(
                     source_addr = addr
                     debug(f"[wifi] receiving from {addr[0]}:{addr[1]}", verbose=verbose)
 
-                if len(data) != packet_bytes:
-                    debug(
-                        f"[wifi] unexpected payload size {len(data)} (expected {packet_bytes}), "
-                        "packet skipped",
-                        verbose=verbose,
-                    )
+                if len(data) < METADATA_BYTES:
+                    debug("[wifi] packet shorter than metadata header; skipped", verbose=verbose)
                     continue
 
-                metadata, payload = parse_block_packet(data, block_bytes)
-                if not metadata_is_plausible(metadata, block_bytes):
+                try:
+                    metadata, payload = parse_block_packet(data, len(data) - METADATA_BYTES)
+                except ValueError as exc:
+                    debug(f"[wifi] malformed packet: {exc}", verbose=verbose)
+                    continue
+                if not metadata_is_plausible(metadata):
                     debug(
                         f"[wifi] discarded packet with incoherent metadata "
                         f"(block_index={metadata.block_index}, byte_offset={metadata.byte_offset})",
@@ -609,25 +722,42 @@ def capture_stream_wifi(
                     )
                     continue
 
-                if last_block_index is not None:
-                    if metadata.block_index <= last_block_index:
+                if expected_block_index is not None:
+                    if metadata.block_index < expected_block_index:
                         debug(
-                            f"[wifi] non-monotonic block index {metadata.block_index} (previous {last_block_index}), packet skipped",
+                            f"[wifi] non-monotonic block index {metadata.block_index} (expected {expected_block_index}), packet skipped",
                             verbose=verbose,
                         )
                         continue
-                    if metadata.block_index > last_block_index + 1:
-                        debug(
-                            f"[wifi] skipped {metadata.block_index - last_block_index - 1} block(s) (network loss)",
+                    if metadata.block_index > expected_block_index:
+                        dropped_blocks = emit_dropped_blocks(
+                            metadata_writer,
+                            expected_block_index,
+                            metadata.block_index,
+                            label="wifi",
                             verbose=verbose,
                         )
+                        progress.update(
+                            block_count,
+                            bytes_captured,
+                        )
 
-                last_block_index = metadata.block_index
+                expected_block_index = metadata.block_index + 1
 
                 sink.write(payload)
-                metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
+                metadata_writer.writerow(
+                    [
+                        metadata.block_index,
+                        metadata.byte_offset,
+                        metadata.timestamp_us,
+                        metadata.payload_bytes_per_channel,
+                        metadata.channel_count,
+                        0,
+                    ]
+                )
                 block_count += 1
-                progress.update(block_count, block_count * block_bytes)
+                bytes_captured += metadata.total_payload_bytes
+                progress.update(block_count, bytes_captured)
 
         except KeyboardInterrupt:
             debug("[wifi] capture interrupted by user", verbose=True)
@@ -636,8 +766,8 @@ def capture_stream_wifi(
             metadata_file.flush()
 
     print(
-        f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
-        f"(metadata -> {metadata_path})",
+        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
         file=sys.stderr,
     )
 
@@ -742,11 +872,14 @@ def capture_stream_usb_vendor(
                 verbose=verbose,
             )
             block_count = 0
+            dropped_blocks = 0
+            bytes_captured = 0
             progress = ProgressReporter("usb-vendor")
+            expected_block_index: Optional[int] = None
 
             with output_path.open("wb") as sink, metadata_path.open("w", newline="") as metadata_file:
                 metadata_writer = csv.writer(metadata_file)
-                metadata_writer.writerow(["block_index", "byte_offset", "timestamp_us"])
+                metadata_writer.writerow(METADATA_HEADER)
                 try:
                     while blocks is None or block_count < blocks:
                         try:
@@ -758,10 +891,41 @@ def capture_stream_usb_vendor(
                                 raise TimeoutError("Timed out waiting for data from the USB vendor endpoint") from exc
                             raise
 
+                        if expected_block_index is not None:
+                            if metadata.block_index < expected_block_index:
+                                debug(
+                                    f"[usb-vendor] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
+                                    verbose=verbose,
+                                )
+                                continue
+                            if metadata.block_index > expected_block_index:
+                                dropped_blocks = emit_dropped_blocks(
+                                    metadata_writer,
+                                    expected_block_index,
+                                    metadata.block_index,
+                                    label="usb-vendor",
+                                    verbose=verbose,
+                                )
+                                progress.update(
+                                    block_count,
+                                    bytes_captured,
+                                )
+                        expected_block_index = metadata.block_index + 1
+
                         sink.write(payload_view)
-                        metadata_writer.writerow([metadata.block_index, metadata.byte_offset, metadata.timestamp_us])
+                        metadata_writer.writerow(
+                            [
+                                metadata.block_index,
+                                metadata.byte_offset,
+                                metadata.timestamp_us,
+                                metadata.payload_bytes_per_channel,
+                                metadata.channel_count,
+                                0,
+                            ]
+                        )
                         block_count += 1
-                        progress.update(block_count, block_count * block_bytes)
+                        bytes_captured += metadata.total_payload_bytes
+                        progress.update(block_count, bytes_captured)
 
                 except KeyboardInterrupt:
                     debug("[usb] capture interrupted by user", verbose=True)
@@ -770,10 +934,10 @@ def capture_stream_usb_vendor(
                     metadata_file.flush()
 
             print(
-                f"Captured {block_count} block(s) ({block_count * block_bytes} payload bytes) to {output_path} "
-                f"(metadata -> {metadata_path})",
-                file=sys.stderr,
-            )
+        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
+        file=sys.stderr,
+    )
 
         finally:
             if claimed_interface:
