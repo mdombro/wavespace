@@ -178,12 +178,14 @@ static uint32_t measurement_payload_bytes_sent = 0;
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
     .gpio_data_secondary = 3,
+    .gpio_trigger = 0,
     .gpio_clk = 4,
     .pio = pio0,
     .pio_sm = 0,
     .sample_rate = 2048000,
     .sample_buffer_size = PDM_BLOCK_BYTES_PER_CH,
     .channels = PDM_CHANNEL_COUNT,
+    .capture_trigger = false,
 };
 
 static void clear_stats(void);

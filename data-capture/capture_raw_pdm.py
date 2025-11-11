@@ -60,7 +60,9 @@ DEFAULT_USB_VENDOR_PID = 0x4001
 DEFAULT_USB_VENDOR_INTERFACE = 2
 DEFAULT_USB_VENDOR_ENDPOINT = 0x83
 
-METADATA_STRUCT = struct.Struct("<QQQIHH")  # block_index, first_sample_byte_index, capture_end_time_us, bytes_per_ch, channels, reserved
+METADATA_STRUCT = struct.Struct(
+    "<QQQIHhHHI"
+)  # block_index, first_sample_byte_index, capture_end_time_us, bytes_per_ch, channels, trigger_index, trigger_tail, reserved, padding
 METADATA_BYTES = METADATA_STRUCT.size
 METADATA_HEADER = [
     "block_index",
@@ -68,6 +70,8 @@ METADATA_HEADER = [
     "block_end_time_us",
     "payload_bytes_per_channel",
     "channel_count",
+    "trigger_first_index",
+    "trigger_tail_high",
     "dropped",
 ]
 
@@ -112,6 +116,8 @@ class BlockMetadata:
     timestamp_us: int
     payload_bytes_per_channel: int
     channel_count: int
+    trigger_first_index: int
+    trigger_tail_high: bool
 
     @property
     def total_payload_bytes(self) -> int:
@@ -136,7 +142,7 @@ def emit_dropped_blocks(
         return expected_index
 
     for missing in range(expected_index, current_index):
-        writer.writerow([missing, -1, -1, 0, 0, 1])
+        writer.writerow([missing, -1, -1, 0, 0, -1, 0, 1])
         if verbose:
             debug(f"[{label}] block {missing} dropped", verbose=True)
 
@@ -256,15 +262,25 @@ def parse_block_packet(packet: bytes, payload_bytes_hint: int) -> Tuple[BlockMet
     if len(packet) < METADATA_BYTES:
         raise ValueError("Packet shorter than metadata header")
 
-    block_index, byte_offset, timestamp_us, bytes_per_channel, channel_count, _ = METADATA_STRUCT.unpack_from(
-        packet, 0
-    )
+    (
+        block_index,
+        byte_offset,
+        timestamp_us,
+        bytes_per_channel,
+        channel_count,
+        trigger_index,
+        trigger_tail_high,
+        _,
+        _reserved2,
+    ) = METADATA_STRUCT.unpack_from(packet, 0)
     metadata = BlockMetadata(
         block_index=block_index,
         byte_offset=byte_offset,
         timestamp_us=timestamp_us,
         payload_bytes_per_channel=bytes_per_channel,
         channel_count=channel_count,
+        trigger_first_index=int(trigger_index),
+        trigger_tail_high=bool(trigger_tail_high),
     )
 
     total_payload = metadata.total_payload_bytes
@@ -634,6 +650,8 @@ def capture_stream_usb(
                         metadata.timestamp_us,
                         metadata.payload_bytes_per_channel,
                         metadata.channel_count,
+                        metadata.trigger_first_index,
+                        1 if metadata.trigger_tail_high else 0,
                         0,
                     ]
                 )
@@ -753,6 +771,8 @@ def capture_stream_wifi(
                         metadata.timestamp_us,
                         metadata.payload_bytes_per_channel,
                         metadata.channel_count,
+                        metadata.trigger_first_index,
+                        1 if metadata.trigger_tail_high else 0,
                         0,
                     ]
                 )
@@ -921,6 +941,8 @@ def capture_stream_usb_vendor(
                                 metadata.timestamp_us,
                                 metadata.payload_bytes_per_channel,
                                 metadata.channel_count,
+                                metadata.trigger_first_index,
+                                1 if metadata.trigger_tail_high else 0,
                                 0,
                             ]
                         )

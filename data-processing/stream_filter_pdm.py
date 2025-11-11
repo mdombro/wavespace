@@ -26,6 +26,8 @@ class BlockMeta:
     bytes_per_channel: int
     channel_count: int
     dropped: bool = False
+    trigger_first_index: int = -1
+    trigger_tail_high: bool = False
 
     @property
     def payload_bytes(self) -> int:
@@ -121,7 +123,15 @@ class MetadataTailer:
             try:
                 bytes_per_channel = int(parts[3])
                 channel_count = int(parts[4])
-                dropped = bool(int(parts[5])) if len(parts) > 5 else False
+                trigger_index = -1
+                trigger_tail_high = False
+                dropped = False
+                if len(parts) >= 8:
+                    trigger_index = int(parts[5])
+                    trigger_tail_high = bool(int(parts[6]))
+                    dropped = bool(int(parts[7]))
+                elif len(parts) >= 6:
+                    dropped = bool(int(parts[5]))
                 records.append(
                     BlockMeta(
                         block_index=int(parts[0]),
@@ -130,6 +140,8 @@ class MetadataTailer:
                         bytes_per_channel=bytes_per_channel,
                         channel_count=channel_count,
                         dropped=dropped,
+                        trigger_first_index=trigger_index,
+                        trigger_tail_high=trigger_tail_high,
                     )
                 )
             except ValueError:
@@ -298,16 +310,24 @@ class StreamProcessor:
         )
         sample_index = np.array([rec.sample_index for rec in self.block_records], dtype=np.int64)
         sample_count = np.array([rec.sample_count for rec in self.block_records], dtype=np.int64)
+        trigger_first_index = np.array(
+            [rec.meta.trigger_first_index for rec in self.block_records], dtype=np.int16
+        )
+        trigger_tail_high = np.array(
+            [1 if rec.meta.trigger_tail_high else 0 for rec in self.block_records], dtype=np.uint8
+        )
 
         return {
             "samples": samples,
             "block_index": block_index,
             "byte_offset": byte_offset,
             "timestamp_us": timestamp_us,
-             "channel_count": channel_count,
-             "bytes_per_channel": bytes_per_channel,
+            "channel_count": channel_count,
+            "bytes_per_channel": bytes_per_channel,
             "sample_index": sample_index,
             "sample_count": sample_count,
+            "trigger_first_index": trigger_first_index,
+            "trigger_tail_high": trigger_tail_high,
         }
 
 
@@ -430,6 +450,8 @@ def main() -> int:
         bytes_per_channel=payload["bytes_per_channel"],
         sample_index=payload["sample_index"],
         sample_count=payload["sample_count"],
+        trigger_first_index=payload["trigger_first_index"],
+        trigger_tail_high=payload["trigger_tail_high"],
     )
 
     print(

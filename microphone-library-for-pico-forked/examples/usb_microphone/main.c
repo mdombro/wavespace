@@ -22,12 +22,14 @@
 const struct pdm_microphone_config config = {
   .gpio_data = 2,
   .gpio_data_secondary = 3,
+  .gpio_trigger = 0,
   .gpio_clk = 4,
   .pio = pio0,
   .pio_sm = 0,
   .channels = 1,
   .sample_rate = SAMPLE_RATE,
   .sample_buffer_size = PDM_BUFFER_BYTES,
+  .capture_trigger = false,
 };
 
 // variables

@@ -54,6 +54,7 @@
 #define PDM_BLOCK_BYTES_PER_CH  (PDM_BLOCK_BITS_PER_CH / 8)
 #define PDM_BLOCK_PAYLOAD_BYTES (PDM_BLOCK_BYTES_PER_CH * PDM_CHANNEL_COUNT)
 #define PDM_BLOCK_PACKET_BYTES  (PDM_BLOCK_PAYLOAD_BYTES + sizeof(struct pdm_block_metadata))
+#define CAPTURE_RING_DEPTH      4
 
 #define SERIAL_UART_ID         uart0
 #define SERIAL_UART_TX_PIN     0
@@ -65,12 +66,18 @@
 #define USB_VENDOR_SPIN_MAX    20000
 #define USB_VENDOR_BACKOFF_US  10
 
-static uint8_t sample_buffer[PDM_BLOCK_PAYLOAD_BYTES];
+typedef struct {
+    uint8_t payload[PDM_BLOCK_PAYLOAD_BYTES];
+    struct pdm_block_metadata metadata;
+    int length;
+} capture_slot_t;
+
+static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
+static volatile uint8_t capture_write_index = 0;
+static volatile uint8_t capture_read_index = 0;
+static volatile uint8_t capture_count = 0;
 static uint8_t discard_buffer[PDM_BLOCK_PAYLOAD_BYTES];
-static struct pdm_block_metadata sample_metadata;
 static struct pdm_block_metadata discard_metadata;
-static volatile bool block_pending = false;
-static volatile int block_length = 0;
 
 // Debug/telemetry counters surfaced through the CLI stats.
 static volatile uint32_t blocks_ready = 0;
@@ -133,12 +140,14 @@ static bool serial_initialised = false;
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
     .gpio_data_secondary = 3,
-    .gpio_clk = 4,
+    .gpio_trigger = 4,
+    .gpio_clk = 5,
     .pio = pio0,
     .pio_sm = 0,
     .sample_rate = 2048000,
     .sample_buffer_size = PDM_BLOCK_BYTES_PER_CH,
     .channels = PDM_CHANNEL_COUNT,
+    .capture_trigger = true,
 };
 
 static void clear_stats(void);
@@ -154,8 +163,12 @@ static bool serial_stream_block(const uint8_t* data, size_t length);
 // Clear producer/consumer flags so the next DMA callback restarts cleanly.
 static void reset_capture_state(void) {
     uint32_t status = save_and_disable_interrupts();
-    block_pending = false;
-    block_length = 0;
+    capture_write_index = 0;
+    capture_read_index = 0;
+    capture_count = 0;
+    for (int i = 0; i < CAPTURE_RING_DEPTH; i++) {
+        capture_ring[i].length = 0;
+    }
     restore_interrupts(status);
 
     clear_stats();
@@ -276,16 +289,22 @@ cleanup:
 
 static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
-    uint8_t* target = block_pending ? discard_buffer : sample_buffer;
-    struct pdm_block_metadata* target_metadata = block_pending ? &discard_metadata : &sample_metadata;
+    bool slot_available = capture_count < CAPTURE_RING_DEPTH;
+    uint8_t write_index = capture_write_index;
+    capture_slot_t* slot = slot_available ? &capture_ring[write_index] : NULL;
+    uint8_t* target = slot_available ? slot->payload : discard_buffer;
+    struct pdm_block_metadata* target_metadata = slot_available ? &slot->metadata : &discard_metadata;
     int read = pdm_microphone_read_with_metadata(target, PDM_BLOCK_PAYLOAD_BYTES, target_metadata);
 
-    if (!block_pending && read > 0) {
-        blocks_ready++;
-        block_length = read;
-        block_pending = true;
-    } else if (block_pending && read > 0) {
-        blocks_discarded++;
+    if (read > 0) {
+        if (slot_available) {
+            slot->length = read;
+            capture_write_index = (uint8_t)((capture_write_index + 1) % CAPTURE_RING_DEPTH);
+            capture_count++;
+            blocks_ready++;
+        } else {
+            blocks_discarded++;
+        }
     }
 }
 
@@ -525,10 +544,12 @@ static void dump_block_summary(const pdm_block_packet_t* packet, size_t length) 
     const uint8_t* data = packet->payload;
     const struct pdm_block_metadata* meta = &packet->metadata;
 
-    printf("Block %llu len=%lu t_end=%llu us:",
+    printf("Block %llu len=%lu t_end=%llu us trig_idx=%d tail=%s:",
            (unsigned long long)meta->block_index,
            (unsigned long)length,
-           (unsigned long long)meta->capture_end_time_us);
+           (unsigned long long)meta->capture_end_time_us,
+           (int)meta->trigger_first_index,
+           meta->trigger_tail_high ? "HIGH" : "LOW");
     for (size_t i = 0; i < preview; i++) {
         printf(" %02X", data[i]);
     }
@@ -792,7 +813,7 @@ int main(void) {
         handle_console_input();
         wifi_queue_service();
 
-        if (!block_pending) {
+        if (capture_count == 0) {
             tight_loop_contents();
             continue;
         }
@@ -802,14 +823,16 @@ int main(void) {
         int bytes_to_send = 0;
 
         uint32_t status = save_and_disable_interrupts();
-        if (block_pending) {
-            bytes_to_send = block_length;
+        if (capture_count > 0) {
+            capture_slot_t* slot = &capture_ring[capture_read_index];
+            bytes_to_send = slot->length;
             if (bytes_to_send > 0) {
-                memcpy(transfer_packet.payload, sample_buffer, (size_t)bytes_to_send);
-                transfer_packet.metadata = sample_metadata;
+                memcpy(transfer_packet.payload, slot->payload, (size_t)bytes_to_send);
+                transfer_packet.metadata = slot->metadata;
             }
-            block_length = 0;
-            block_pending = false;
+            slot->length = 0;
+            capture_read_index = (uint8_t)((capture_read_index + 1) % CAPTURE_RING_DEPTH);
+            capture_count--;
         }
         restore_interrupts(status);
 
