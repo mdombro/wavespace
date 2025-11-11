@@ -41,16 +41,19 @@ def build_block_slices(
     if taps is not None and fs_in > 0:
         delay_us = (len(taps) // 2) / fs_in * 1e6
 
-    sample_period_us = 1e6 / fs_out
-    current = float(timestamp_us[first]) + delay_us
+    sample_period_us = 1e6 / fs_out if fs_out > 0 else 0.0
+    first_duration = sample_count[first] * sample_period_us
+    first_start = float(timestamp_us[first]) - first_duration
+    current = first_start + delay_us
     slices: List[BlockSlice] = []
 
     for idx in range(first, len(timestamp_us)):
         count = int(sample_count[idx])
         if count <= 0:
             continue
-        start = max(current, float(timestamp_us[idx]))
         duration = count * sample_period_us
+        block_start = float(timestamp_us[idx]) - duration
+        start = max(current, block_start + delay_us)
         end = start + duration
         slices.append(BlockSlice(start_us=start, end_us=end))
         current = end
@@ -104,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         "--window-ms",
         type=float,
         default=20.0,
-        help="Reserve this many ms at the end to keep sample windows in range (default: %(default)s)",
+        help="Spacing between successive timestamps in milliseconds (default: %(default)s)",
     )
     parser.add_argument(
         "--timestamp-column",
@@ -141,7 +144,7 @@ def main() -> int:
         raise ValueError("Grid dimensions must all be positive.")
 
     spacing_us = args.window_ms * 1_000.0
-    time_start = slices[0].start_us
+    time_start = max(slices[0].start_us, spacing_us)
     duration = max(0, (total_points - 1)) * spacing_us
     time_end = slices[-1].end_us - spacing_us
     if duration > time_end - time_start:

@@ -22,7 +22,16 @@ from collections import deque
 class BlockMeta:
     block_index: int
     byte_offset: int
-    timestamp_us: int
+    timestamp_us: int  # End-of-block timestamp from metadata (microseconds)
+    bytes_per_channel: int
+    channel_count: int
+    dropped: bool = False
+    trigger_first_index: int = -1
+    trigger_tail_high: bool = False
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.bytes_per_channel * max(1, self.channel_count)
 
 
 @dataclass
@@ -108,15 +117,31 @@ class MetadataTailer:
             if not line:
                 continue
             parts = line.split(",")
-            if len(parts) < 3:
+            if len(parts) < 5:
                 self.file.seek(pos)
                 break
             try:
+                bytes_per_channel = int(parts[3])
+                channel_count = int(parts[4])
+                trigger_index = -1
+                trigger_tail_high = False
+                dropped = False
+                if len(parts) >= 8:
+                    trigger_index = int(parts[5])
+                    trigger_tail_high = bool(int(parts[6]))
+                    dropped = bool(int(parts[7]))
+                elif len(parts) >= 6:
+                    dropped = bool(int(parts[5]))
                 records.append(
                     BlockMeta(
                         block_index=int(parts[0]),
                         byte_offset=int(parts[1]),
                         timestamp_us=int(parts[2]),
+                        bytes_per_channel=bytes_per_channel,
+                        channel_count=channel_count,
+                        dropped=dropped,
+                        trigger_first_index=trigger_index,
+                        trigger_tail_high=trigger_tail_high,
                     )
                 )
             except ValueError:
@@ -126,9 +151,8 @@ class MetadataTailer:
 
 
 class BinaryTailer:
-    def __init__(self, path: Path, block_bytes: int, poll_interval: float) -> None:
+    def __init__(self, path: Path, poll_interval: float) -> None:
         self.path = path
-        self.block_bytes = block_bytes
         self.poll_interval = poll_interval
         self.file = self._wait_for_file(path)
         self.offset = 0
@@ -138,13 +162,15 @@ class BinaryTailer:
             time.sleep(self.poll_interval)
         return open(path, "rb")  # pylint: disable=consider-using-with
 
-    def read_block(self) -> Optional[bytes]:
+    def read_block(self, length: int) -> Optional[bytes]:
+        if length <= 0:
+            return b""
         self.file.seek(self.offset)
-        chunk = self.file.read(self.block_bytes)
-        if len(chunk) < self.block_bytes:
+        chunk = self.file.read(length)
+        if len(chunk) < length:
             self.file.seek(self.offset)
             return None
-        self.offset += self.block_bytes
+        self.offset += length
         return chunk
 
 
@@ -153,17 +179,19 @@ class StreamProcessor:
         self,
         data_path: Path,
         metadata_path: Path,
-        block_bytes: int,
         poll_interval: float,
+        default_block_bytes: int,
         filter_taps: np.ndarray,
         decimation: int,
         bit_msbfirst: bool,
         map_pm1: bool,
     ) -> None:
-        self.data_tailer = BinaryTailer(data_path, block_bytes, poll_interval)
+        self.data_tailer = BinaryTailer(data_path, poll_interval)
         self.meta_tailer = MetadataTailer(metadata_path, poll_interval)
-        self.filter = StreamingFilter(filter_taps, decimation)
-        self.block_bytes = block_bytes
+        self.filters: List[StreamingFilter] = []
+        self.default_block_bytes = max(0, default_block_bytes)
+        self.filter_taps = filter_taps
+        self.decimation = decimation
         self.poll_interval = poll_interval
         self.bitorder = "big" if bit_msbfirst else "little"
         self.map_pm1 = map_pm1
@@ -183,11 +211,27 @@ class StreamProcessor:
 
             made_progress = False
             while self.pending_meta:
-                chunk = self.data_tailer.read_block()
-                if chunk is None:
-                    break
                 meta = self.pending_meta.popleft()
-                samples = self._process_chunk(chunk)
+                if meta.dropped:
+                    self.block_records.append(
+                        ProcessedBlock(
+                            meta=meta,
+                            sample_index=self.sample_cursor,
+                            sample_count=0,
+                        )
+                    )
+                    self.blocks_processed += 1
+                    made_progress = True
+                    continue
+
+                bytes_to_read = meta.payload_bytes if meta.payload_bytes > 0 else self.default_block_bytes
+                if bytes_to_read <= 0:
+                    raise RuntimeError("Unable to determine payload size for incoming block.")
+                chunk = self.data_tailer.read_block(bytes_to_read)
+                if chunk is None:
+                    self.pending_meta.appendleft(meta)
+                    break
+                samples = self._process_chunk(chunk, meta.channel_count)
                 sample_count = samples.size
                 if sample_count:
                     self.samples.append(samples)
@@ -213,13 +257,43 @@ class StreamProcessor:
             if idle_timeout > 0 and idle_elapsed >= idle_timeout:
                 break
 
-    def _process_chunk(self, chunk: bytes) -> np.ndarray:
+    def _process_chunk(self, chunk: bytes, channel_count: int) -> np.ndarray:
+        self._ensure_filters(channel_count)
         byte_view = np.frombuffer(chunk, dtype=np.uint8)
         bits = np.unpackbits(byte_view, bitorder=self.bitorder)
-        signal = bits.astype(np.float64)
-        if self.map_pm1:
-            signal = 2.0 * signal - 1.0
-        return self.filter.process(signal)
+        if channel_count <= 1:
+            signal = bits.astype(np.float64)
+            if self.map_pm1:
+                signal = 2.0 * signal - 1.0
+            return self.filters[0].process(signal)
+
+        if bits.size % channel_count != 0:
+            raise ValueError(
+                f"Bitstream length {bits.size} is not divisible by channel count {channel_count}"
+            )
+
+        samples_per_channel = bits.size // channel_count
+        combined: Optional[np.ndarray] = None
+        for ch in range(channel_count):
+            ch_bits = bits[ch::channel_count][:samples_per_channel]
+            signal = ch_bits.astype(np.float64)
+            if self.map_pm1:
+                signal = 2.0 * signal - 1.0
+            filtered = self.filters[ch].process(signal)
+            if combined is None:
+                combined = filtered.copy()
+            else:
+                if filtered.size != combined.size:
+                    raise ValueError("Channel outputs have mismatched sizes; cannot combine.")
+                # Combination hook: replace this summation if future processing needs a different strategy.
+                combined += filtered
+
+        return combined if combined is not None else np.empty(0, dtype=np.float64)
+
+    def _ensure_filters(self, channel_count: int) -> None:
+        required = max(1, channel_count)
+        while len(self.filters) < required:
+            self.filters.append(StreamingFilter(self.filter_taps, self.decimation))
 
     def export(self) -> dict:
         if self.samples:
@@ -228,18 +302,32 @@ class StreamProcessor:
             samples = np.empty(0, dtype=np.float32)
 
         block_index = np.array([rec.meta.block_index for rec in self.block_records], dtype=np.uint64)
-        byte_offset = np.array([rec.meta.byte_offset for rec in self.block_records], dtype=np.uint64)
-        timestamp_us = np.array([rec.meta.timestamp_us for rec in self.block_records], dtype=np.uint64)
+        byte_offset = np.array([rec.meta.byte_offset for rec in self.block_records], dtype=np.int64)
+        timestamp_us = np.array([rec.meta.timestamp_us for rec in self.block_records], dtype=np.int64)
+        channel_count = np.array([rec.meta.channel_count for rec in self.block_records], dtype=np.uint16)
+        bytes_per_channel = np.array(
+            [rec.meta.bytes_per_channel for rec in self.block_records], dtype=np.uint32
+        )
         sample_index = np.array([rec.sample_index for rec in self.block_records], dtype=np.int64)
         sample_count = np.array([rec.sample_count for rec in self.block_records], dtype=np.int64)
+        trigger_first_index = np.array(
+            [rec.meta.trigger_first_index for rec in self.block_records], dtype=np.int16
+        )
+        trigger_tail_high = np.array(
+            [1 if rec.meta.trigger_tail_high else 0 for rec in self.block_records], dtype=np.uint8
+        )
 
         return {
             "samples": samples,
             "block_index": block_index,
             "byte_offset": byte_offset,
             "timestamp_us": timestamp_us,
+            "channel_count": channel_count,
+            "bytes_per_channel": bytes_per_channel,
             "sample_index": sample_index,
             "sample_count": sample_count,
+            "trigger_first_index": trigger_first_index,
+            "trigger_tail_high": trigger_tail_high,
         }
 
 
@@ -255,8 +343,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--block-bytes",
         type=int,
-        default=1024,
-        help="Payload bytes per block (default: %(default)s).",
+        default=2048,
+        help="Fallback payload bytes per block if metadata is incomplete (default: %(default)s).",
     )
     parser.add_argument(
         "--sample-rate",
@@ -331,7 +419,7 @@ def main() -> int:
     processor = StreamProcessor(
         data_path=args.data,
         metadata_path=args.metadata,
-        block_bytes=args.block_bytes,
+        default_block_bytes=args.block_bytes,
         poll_interval=args.poll_interval,
         filter_taps=taps,
         decimation=decimation,
@@ -358,8 +446,12 @@ def main() -> int:
         block_index=payload["block_index"],
         byte_offset=payload["byte_offset"],
         timestamp_us=payload["timestamp_us"],
+        channel_count=payload["channel_count"],
+        bytes_per_channel=payload["bytes_per_channel"],
         sample_index=payload["sample_index"],
         sample_count=payload["sample_count"],
+        trigger_first_index=payload["trigger_first_index"],
+        trigger_tail_high=payload["trigger_tail_high"],
     )
 
     print(
