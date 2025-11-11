@@ -52,6 +52,8 @@ static inline void pdm_prepare_timestamp_dma(uint index);
 static void pdm_unpack_buffer(uint read_index, uint8_t* dest);
 static inline uint8_t pdm_read_bit(const uint8_t* buffer, uint32_t bit_index);
 static inline void pdm_write_bit(uint8_t* buffer, uint32_t bit_index, uint8_t value);
+static void pdm_compact_channel_payload(const uint8_t* src, uint8_t* dest);
+static void pdm_scan_trigger_stream(const uint8_t* src, struct pdm_block_metadata* meta);
 
 // Configure the PIO state machine and DMA to begin buffering raw PDM data.
 int pdm_microphone_init(const struct pdm_microphone_config* config) {
@@ -436,16 +438,22 @@ static void pdm_unpack_buffer(uint read_index, uint8_t* dest) {
         return;
     }
 
+    pdm_compact_channel_payload(src, dest);
+    pdm_scan_trigger_stream(src, meta);
+}
+
+static void pdm_compact_channel_payload(const uint8_t* src, uint8_t* dest) {
     memset(dest, 0, pdm_mic.raw_buffer_size);
 
     const uint32_t channel_count = pdm_mic.config.channels;
     const uint32_t samples_per_channel = pdm_mic.bytes_per_channel * 8u;
+    const uint32_t bits_per_sample = pdm_mic.capture_bits_per_sample;
+    const uint32_t skip_bits = bits_per_sample > channel_count
+        ? bits_per_sample - channel_count
+        : 0;
+
     uint32_t src_bit = 0;
     uint32_t dest_bit = 0;
-    int16_t trigger_index = -1;
-    bool carry = pdm_mic.trigger_tail_carry;
-    bool seen_zero_after_carry = !carry;
-    uint8_t last_trigger = carry ? 1u : 0u;
 
     for (uint32_t sample = 0; sample < samples_per_channel; sample++) {
         for (uint32_t ch = 0; ch < channel_count; ch++) {
@@ -456,22 +464,49 @@ static void pdm_unpack_buffer(uint read_index, uint8_t* dest) {
             dest_bit++;
         }
 
-        uint8_t trigger_bit = pdm_read_bit(src, src_bit++);
+        src_bit += skip_bits;
+    }
+}
+
+static void pdm_scan_trigger_stream(const uint8_t* src, struct pdm_block_metadata* meta) {
+    const uint32_t channel_count = pdm_mic.config.channels;
+    const uint32_t bits_per_sample = pdm_mic.capture_bits_per_sample;
+
+    if (bits_per_sample <= channel_count) {
+        meta->trigger_first_index = -1;
+        meta->trigger_tail_high = 0;
+        pdm_mic.trigger_tail_carry = false;
+        return;
+    }
+
+    const uint32_t samples_per_channel = pdm_mic.bytes_per_channel * 8u;
+    const uint32_t trigger_stride = bits_per_sample;
+    uint32_t trigger_bit_index = channel_count;
+
+    int16_t trigger_index = -1;
+    bool carry = pdm_mic.trigger_tail_carry;
+    bool seen_zero_after_carry = !carry;
+    uint8_t last_trigger = carry ? 1u : 0u;
+
+    for (uint32_t sample = 0; sample < samples_per_channel; sample++, trigger_bit_index += trigger_stride) {
+        uint8_t trigger_bit = pdm_read_bit(src, trigger_bit_index);
         last_trigger = trigger_bit;
 
-        if (trigger_index < 0) {
-            if (!carry) {
-                if (trigger_bit) {
-                    trigger_index = (int16_t)sample;
+        if (trigger_index >= 0) {
+            continue;
+        }
+
+        if (!carry) {
+            if (trigger_bit) {
+                trigger_index = (int16_t)sample;
+            }
+        } else {
+            if (!seen_zero_after_carry) {
+                if (!trigger_bit) {
+                    seen_zero_after_carry = true;
                 }
-            } else {
-                if (!seen_zero_after_carry) {
-                    if (!trigger_bit) {
-                        seen_zero_after_carry = true;
-                    }
-                } else if (trigger_bit) {
-                    trigger_index = (int16_t)sample;
-                }
+            } else if (trigger_bit) {
+                trigger_index = (int16_t)sample;
             }
         }
     }
