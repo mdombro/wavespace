@@ -290,8 +290,8 @@ class StreamProcessor:
             samples = np.empty(0, dtype=np.float32)
 
         block_index = np.array([rec.meta.block_index for rec in self.block_records], dtype=np.uint64)
-        byte_offset = np.array([rec.meta.byte_offset for rec in self.block_records], dtype=np.uint64)
-        timestamp_us = np.array([rec.meta.timestamp_us for rec in self.block_records], dtype=np.uint64)
+        byte_offset = np.array([rec.meta.byte_offset for rec in self.block_records], dtype=np.int64)
+        timestamp_us = np.array([rec.meta.timestamp_us for rec in self.block_records], dtype=np.int64)
         channel_count = np.array([rec.meta.channel_count for rec in self.block_records], dtype=np.uint16)
         bytes_per_channel = np.array(
             [rec.meta.bytes_per_channel for rec in self.block_records], dtype=np.uint32
