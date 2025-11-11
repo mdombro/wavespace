@@ -1,0 +1,20 @@
+can you explain in much more detail about the raw_buffer_read/write_index variables? How are those being used to direct DMA data? 
+
+double check that transfer_now can be used with this chip - what about those hgher bits
+
+
+
+src/pdm_microphone.c (lines 25-43) declares two intrinsic DMA buffers (PDM_RAW_BUFFER_COUNT = 2) and a set of indices/counters that turn them into a tiny ring. raw_buffer_write_index says “which slot the DMA should fill next,” raw_buffer_read_index says “which slot the CPU should consume next,” and raw_buffer_ready_count tracks how many slots currently contain valid data.
+
+During init/startup (src/pdm_microphone.c (lines 126-227)), both indices are set to 0. Before arming DMA, the driver calls pdm_record_buffer_metadata() for the current write slot and then starts a transfer into raw_buffer[raw_buffer_write_index]. Because raw_buffer_write_index starts at 0, the very first DMA transfer fills buffer 0.
+
+When the DMA IRQ fires (src/pdm_microphone.c (lines 249-284)), the handler advances through a few steps:
+
+It increments raw_buffer_ready_count, but if the CPU is slow and the count was already at the max, it forces raw_buffer_read_index to move forward (dropping the oldest unread block) to keep the ring from stalling.
+It advances raw_buffer_write_index = (write_index + 1) % PDM_RAW_BUFFER_COUNT, so the “next buffer to fill” is always the opposite slot in this double buffer.
+It records metadata for that next slot and re-triggers the DMA channel, pointing it at raw_buffer[raw_buffer_write_index].
+In other words, the DMA engine is always writing into whichever buffer raw_buffer_write_index currently names, and that pointer flips each time an interrupt completes.
+
+On the consumer side, pdm_microphone_read_with_metadata() (src/pdm_microphone.c (lines 291-325)) disables interrupts momentarily, reads the buffer at raw_buffer_read_index, returns its data/metadata to the caller, then increments raw_buffer_read_index (with wraparound) and decrements raw_buffer_ready_count. That way the CPU always drains buffers in the same order the DMA filled them.
+
+There’s no direct hardware steering using those indices—DMA is explicitly reconfigured in the ISR each time. The indices simply let the driver know which raw_buffer[] pointer to hand to dma_channel_transfer_to_buffer_now(), so the double-buffering scheme keeps the PIO/DMA pipeline running while software processes the previous block.
