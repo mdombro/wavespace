@@ -485,33 +485,41 @@ static void pdm_scan_trigger_stream(const uint8_t* src, struct pdm_block_metadat
 
     int16_t trigger_index = -1;
     bool carry = pdm_mic.trigger_tail_carry;
-    bool seen_zero_after_carry = !carry;
+    bool zero_word_seen = !carry;
     uint8_t last_trigger = carry ? 1u : 0u;
+    uint32_t word_index = 0;
+    uint32_t sample = 0;
 
-    for (uint32_t sample = 0; sample < samples_per_channel; sample++, trigger_bit_index += trigger_stride) {
-        uint8_t trigger_bit = pdm_read_bit(src, trigger_bit_index);
-        last_trigger = trigger_bit;
-
-        if (trigger_index >= 0) {
-            continue;
+    while (sample < samples_per_channel) {
+        bool word_all_zero = true;
+        uint32_t bits_this_word = samples_per_channel - sample;
+        if (bits_this_word > 32u) {
+            bits_this_word = 32u;
         }
 
-        if (!carry) {
+        for (uint32_t bit = 0; bit < bits_this_word; bit++, sample++, trigger_bit_index += trigger_stride) {
+            uint8_t trigger_bit = pdm_read_bit(src, trigger_bit_index);
+            last_trigger = trigger_bit;
             if (trigger_bit) {
-                trigger_index = (int16_t)sample;
-            }
-        } else {
-            if (!seen_zero_after_carry) {
-                if (!trigger_bit) {
-                    seen_zero_after_carry = true;
-                }
-            } else if (trigger_bit) {
-                trigger_index = (int16_t)sample;
+                word_all_zero = false;
             }
         }
+
+        if (word_all_zero) {
+            zero_word_seen = true;
+        } else {
+            if (trigger_index < 0) {
+                if (!carry || zero_word_seen) {
+                    trigger_index = (int16_t)word_index;
+                }
+            }
+            zero_word_seen = false;
+        }
+
+        word_index++;
     }
 
     meta->trigger_first_index = trigger_index;
-    meta->trigger_tail_high = last_trigger;
+    meta->trigger_tail_high = last_trigger != 0;
     pdm_mic.trigger_tail_carry = (last_trigger != 0);
 }

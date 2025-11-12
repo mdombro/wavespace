@@ -43,7 +43,7 @@ struct pdm_block_metadata {
     uint64_t capture_end_time_us;    // Time (us) when the buffer finished filling (end-of-block timestamp).
     uint32_t payload_bytes_per_channel;// Bytes per channel in this block.
     uint16_t channel_count;            // Number of channels captured in this block.
-    int16_t trigger_first_index;       // Index of the first trigger-high bit within this block (-1 if none).
+    int16_t trigger_first_index;       // Index of the first trigger-high 32-bit word within this block (-1 if none).
     uint16_t trigger_tail_high;        // 1 when the final trigger bit in this block was high.
     uint16_t reserved;                 // Reserved for future metadata.
     uint32_t trigger_reserved;         // Reserved/padding for alignment.
