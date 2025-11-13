@@ -2,16 +2,57 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #include "hardware/sync.h"
 #include "hardware/uart.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/cyw43_arch.h"
 #include "pico/pdm_microphone.h"
+
+#include "lwip/ip_addr.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/pbuf.h"
+#include "lwip/udp.h"
+#include "lwip/tcp.h"
 
 #include "tusb.h"
 
 // Example entry point: capture PDM audio and stream over USB CDC and/or UDP.
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "chack-2.4"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "redblueyellowgreen"
+#endif
+
+#ifndef WIFI_AUTH_TYPE
+#define WIFI_AUTH_TYPE CYW43_AUTH_WPA2_AES_PSK
+#endif
+
+#ifndef WIFI_CONNECT_TIMEOUT_MS
+#define WIFI_CONNECT_TIMEOUT_MS 30000
+#endif
+
+#ifndef WIFI_TARGET_IP
+#define WIFI_TARGET_IP "192.168.1.190"
+#endif
+
+#ifndef WIFI_TARGET_PORT
+#define WIFI_TARGET_PORT 6000
+#endif
+
+typedef enum {
+    WIFI_TRANSPORT_UDP = 0,
+    WIFI_TRANSPORT_TCP = 1,
+} wifi_transport_mode_t;
+
+#ifndef WIFI_TRANSPORT_MODE
+#define WIFI_TRANSPORT_MODE WIFI_TRANSPORT_UDP
+#endif
 
 #ifndef USB_WAIT_TIMEOUT_MS
 #define USB_WAIT_TIMEOUT_MS 3000
@@ -31,7 +72,8 @@
 #define SERIAL_WRITE_SPIN_MAX  500000
 #define SERIAL_WRITE_BACKOFF_US 5
 
-#define USB_VENDOR_QUEUE_CAPACITY 16
+#define WIFI_QUEUE_CAPACITY      64
+#define WIFI_TCP_RETRY_MS        1000
 
 typedef struct {
     struct pdm_block_metadata metadata;
@@ -68,29 +110,37 @@ static uint32_t bytes_sent = 0;
 static bool debug_stats_enabled = true;
 static bool debug_dump_samples = false;
 static bool stream_binary_data = false;
-static bool usb_vendor_stream_enabled = false;
 static bool serial_stream_enabled = false;
+static bool wifi_stream_enabled = true;
 
 static uint32_t debug_interval_ms = 1000;
 static uint32_t last_debug_ms = 0;
 static bool mic_running = false;
 
+static bool wifi_initialised = false;
+static bool wifi_ready = false;
+static wifi_transport_mode_t wifi_transport = WIFI_TRANSPORT_MODE;
+static struct udp_pcb* wifi_udp_socket = NULL;
+static struct tcp_pcb* wifi_tcp_pcb = NULL;
+static struct tcp_pcb* wifi_tcp_connecting = NULL;
+static absolute_time_t wifi_tcp_retry_deadline = {0};
+static ip_addr_t wifi_remote_addr;
+
 typedef struct {
-    capture_slot_t* slot;
-    uint32_t length;
-    uint32_t offset;
-} usb_vendor_queue_entry_t;
+    pdm_block_packet_t packet;
+    uint16_t length;
+} wifi_packet_t;
 
-static usb_vendor_queue_entry_t usb_vendor_queue[USB_VENDOR_QUEUE_CAPACITY];
-static uint8_t usb_vendor_queue_head = 0;
-static uint8_t usb_vendor_queue_tail = 0;
-static uint8_t usb_vendor_queue_count = 0;
+static wifi_packet_t wifi_queue[WIFI_QUEUE_CAPACITY];
+static uint8_t wifi_queue_head = 0;
+static uint8_t wifi_queue_tail = 0;
+static uint8_t wifi_queue_count = 0;
 
-static uint32_t usb_vendor_packets_sent = 0;
-static uint32_t usb_vendor_bytes_sent = 0;
-static uint32_t usb_vendor_backpressure_events = 0;
-static uint32_t usb_vendor_failures = 0;
-static uint32_t usb_vendor_queue_drops = 0;
+static uint32_t wifi_packets_sent = 0;
+static uint32_t wifi_bytes_sent = 0;
+static uint32_t wifi_send_failures = 0;
+static uint32_t wifi_alloc_failures = 0;
+static uint32_t wifi_queue_drops = 0;
 
 static uint32_t serial_packets_sent = 0;
 static uint32_t serial_bytes_sent = 0;
@@ -113,10 +163,15 @@ static struct pdm_microphone_config config = {
 
 static void clear_stats(void);
 static void on_pdm_samples_ready(void);
+static bool initialise_wifi(void);
+static bool wifi_queue_push(const pdm_block_packet_t* packet, size_t length);
+static void wifi_queue_service(void);
+static void wifi_queue_clear(void);
+static void wifi_tcp_close(void);
+static bool wifi_tcp_ready(void);
+static err_t wifi_tcp_connected_cb(void* arg, struct tcp_pcb* tpcb, err_t err);
+static void wifi_tcp_err_cb(void* arg, err_t err);
 static void initialise_uart_stream(void);
-static bool usb_vendor_queue_push_slot(capture_slot_t* slot, size_t length);
-static void usb_vendor_queue_service(void);
-static void usb_vendor_queue_clear(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
@@ -155,7 +210,7 @@ static void reset_capture_state(void) {
 
     clear_stats();
     last_debug_ms = to_ms_since_boot(get_absolute_time());
-    usb_vendor_queue_clear();
+    wifi_queue_clear();
 }
 
 // Reconfigure the microphone library at runtime while preserving state trackers.
@@ -203,6 +258,77 @@ static bool restart_microphone(uint32_t new_rate) {
     return success;
 }
 
+static bool initialise_wifi(void) {
+    if (wifi_initialised) {
+        return wifi_ready;
+    }
+
+    wifi_initialised = true;
+    bool success = false;
+
+    if (cyw43_arch_init()) {
+        printf("CYW43 init failed\n");
+        goto cleanup;
+    }
+
+    cyw43_arch_enable_sta_mode();
+
+    printf("Connecting to Wi-Fi \"%s\"...\n", WIFI_SSID);
+    int status = cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH_TYPE, WIFI_CONNECT_TIMEOUT_MS);
+    if (status != 0) {
+        printf("Wi-Fi connection failed (status=%d)\n", status);
+        goto cleanup;
+    }
+
+    if (!ipaddr_aton(WIFI_TARGET_IP, &wifi_remote_addr)) {
+        printf("Invalid WIFI_TARGET_IP \"%s\"\n", WIFI_TARGET_IP);
+        goto cleanup;
+    }
+
+    if (wifi_transport == WIFI_TRANSPORT_UDP) {
+        cyw43_arch_lwip_begin();
+        wifi_udp_socket = udp_new_ip_type(IPADDR_TYPE_ANY);
+        if (wifi_udp_socket == NULL) {
+            cyw43_arch_lwip_end();
+            printf("Failed to allocate UDP socket\n");
+            goto cleanup;
+        }
+        err_t bind_err = udp_bind(wifi_udp_socket, IP_ANY_TYPE, 0);
+        cyw43_arch_lwip_end();
+        if (bind_err != ERR_OK) {
+            printf("UDP bind failed (err=%d)\n", bind_err);
+            goto cleanup;
+        }
+    } else {
+        wifi_tcp_pcb = NULL;
+        wifi_tcp_connecting = NULL;
+        wifi_tcp_retry_deadline = nil_time;
+    }
+
+    wifi_ready = true;
+    success = true;
+    printf("Wi-Fi ready. Streaming %s packets to %s:%d\n",
+           wifi_transport == WIFI_TRANSPORT_TCP ? "TCP" : "UDP",
+           WIFI_TARGET_IP,
+           WIFI_TARGET_PORT);
+
+cleanup:
+    if (!success) {
+        wifi_queue_clear();
+        if (wifi_udp_socket != NULL) {
+            cyw43_arch_lwip_begin();
+            udp_remove(wifi_udp_socket);
+            cyw43_arch_lwip_end();
+            wifi_udp_socket = NULL;
+        }
+        cyw43_arch_deinit();
+        wifi_initialised = false;
+        wifi_ready = false;
+    }
+
+    return success;
+}
+
 static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t write_index = capture_write_index;
@@ -244,14 +370,14 @@ static void print_help(void) {
     printf("  5   - set PDM clock to 4.000 MHz\n");
     printf("  6   - set PDM clock to 4.800 MHz\n");
     printf("  r   - reinitialize microphone with current settings\n\n");
-    printf("  u   - toggle USB vendor streaming (currently %s)\n", usb_vendor_stream_enabled ? "ON" : "OFF");
+    printf("  w   - toggle Wi-Fi streaming (currently %s)\n", wifi_stream_enabled ? "ON" : "OFF");
     printf("  t   - toggle UART streaming (currently %s)\n", serial_stream_enabled ? "ON" : "OFF");
     printf("  n   - print transport status information\n\n");
 }
 
 static void print_stats(void) {
-    const char* usb_state = usb_vendor_stream_enabled
-        ? (tud_vendor_mounted() ? "ON" : "waiting")
+    const char* wifi_state = wifi_ready
+        ? (wifi_stream_enabled ? (wifi_transport == WIFI_TRANSPORT_TCP ? "tcp" : "udp") : "paused")
         : "OFF";
 
     const char* serial_state = serial_stream_enabled
@@ -259,7 +385,7 @@ static void print_stats(void) {
         : "OFF";
 
     printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz "
-           "usb=%s pkt=%lu bytes=%lu err=%lu backp=%lu drop=%lu "
+           "wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu drop=%lu "
            "uart=%s pkt=%lu bytes=%lu err=%lu\n",
            (unsigned long)blocks_ready,
            (unsigned long)blocks_streamed,
@@ -269,12 +395,12 @@ static void print_stats(void) {
            stream_binary_data ? "ON" : "OFF",
            debug_dump_samples ? "ON" : "OFF",
            (unsigned long)config.sample_rate,
-           usb_state,
-           (unsigned long)usb_vendor_packets_sent,
-           (unsigned long)usb_vendor_bytes_sent,
-           (unsigned long)usb_vendor_failures,
-            (unsigned long)usb_vendor_backpressure_events,
-            (unsigned long)usb_vendor_queue_drops,
+           wifi_state,
+           (unsigned long)wifi_packets_sent,
+           (unsigned long)wifi_bytes_sent,
+           (unsigned long)wifi_send_failures,
+           (unsigned long)wifi_alloc_failures,
+           (unsigned long)wifi_queue_drops,
            serial_state,
            (unsigned long)serial_packets_sent,
            (unsigned long)serial_bytes_sent,
@@ -282,13 +408,18 @@ static void print_stats(void) {
 }
 
 static void print_transport_status(void) {
-    printf("USB vendor streaming %s\n", usb_vendor_stream_enabled ? "ENABLED" : "DISABLED");
-    printf("  mounted:     %s\n", tud_vendor_mounted() ? "YES" : "NO");
-    printf("  packets:     %lu\n", (unsigned long)usb_vendor_packets_sent);
-    printf("  bytes:       %lu\n", (unsigned long)usb_vendor_bytes_sent);
-    printf("  backpressure:%lu\n", (unsigned long)usb_vendor_backpressure_events);
-    printf("  failures:    %lu\n", (unsigned long)usb_vendor_failures);
-    printf("  queue drops: %lu\n", (unsigned long)usb_vendor_queue_drops);
+    printf("Wi-Fi streaming %s via %s\n",
+           wifi_stream_enabled ? "ENABLED" : "DISABLED",
+           wifi_transport == WIFI_TRANSPORT_TCP ? "TCP" : "UDP");
+    printf("  initialised: %s\n", wifi_initialised ? "YES" : "NO");
+    printf("  ready:       %s\n", wifi_ready ? "YES" : "NO");
+    printf("  target:      %s:%d\n", WIFI_TARGET_IP, WIFI_TARGET_PORT);
+    printf("  packets:     %lu\n", (unsigned long)wifi_packets_sent);
+    printf("  bytes:       %lu\n", (unsigned long)wifi_bytes_sent);
+    printf("  send error:  %lu\n", (unsigned long)wifi_send_failures);
+    printf("  alloc fail:  %lu\n", (unsigned long)wifi_alloc_failures);
+    printf("  queue depth: %u / %u\n", wifi_queue_count, WIFI_QUEUE_CAPACITY);
+    printf("  queue drops: %lu\n", (unsigned long)wifi_queue_drops);
 
     printf("UART streaming %s\n", serial_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", serial_initialised ? "YES" : "NO");
@@ -306,11 +437,11 @@ static void clear_stats(void) {
     bytes_sent = 0;
     restore_interrupts(status);
 
-    usb_vendor_packets_sent = 0;
-    usb_vendor_bytes_sent = 0;
-    usb_vendor_backpressure_events = 0;
-    usb_vendor_failures = 0;
-    usb_vendor_queue_drops = 0;
+    wifi_packets_sent = 0;
+    wifi_bytes_sent = 0;
+    wifi_send_failures = 0;
+    wifi_alloc_failures = 0;
+    wifi_queue_drops = 0;
 
     serial_packets_sent = 0;
     serial_bytes_sent = 0;
@@ -349,11 +480,16 @@ static void handle_console_input(void) {
                 clear_stats();
                 printf("Counters cleared\n");
                 break;
-            case 'u':
-                usb_vendor_stream_enabled = !usb_vendor_stream_enabled;
-                printf("USB vendor streaming %s\n", usb_vendor_stream_enabled ? "ENABLED" : "DISABLED");
-                if (!usb_vendor_stream_enabled) {
-                    usb_vendor_queue_clear();
+            case 'w':
+                wifi_stream_enabled = !wifi_stream_enabled;
+                printf("Wi-Fi streaming %s\n", wifi_stream_enabled ? "ENABLED" : "DISABLED");
+                if (!wifi_stream_enabled) {
+                    wifi_queue_clear();
+                } else if (!wifi_ready) {
+                    if (!initialise_wifi()) {
+                        printf("Wi-Fi init failed; disabling streaming\n");
+                        wifi_stream_enabled = false;
+                    }
                 }
                 break;
             case 't':
@@ -468,117 +604,184 @@ static void initialise_uart_stream(void) {
     serial_initialised = true;
 }
 
-static void usb_vendor_queue_drop_head(void) {
-    if (usb_vendor_queue_count == 0) {
-        return;
+static void wifi_tcp_close(void) {
+    cyw43_arch_lwip_begin();
+    if (wifi_tcp_pcb) {
+        tcp_arg(wifi_tcp_pcb, NULL);
+        tcp_err(wifi_tcp_pcb, NULL);
+        tcp_sent(wifi_tcp_pcb, NULL);
+        tcp_poll(wifi_tcp_pcb, NULL, 0);
+        if (tcp_close(wifi_tcp_pcb) != ERR_OK) {
+            tcp_abort(wifi_tcp_pcb);
+        }
+        wifi_tcp_pcb = NULL;
     }
-
-    usb_vendor_queue_entry_t* entry = &usb_vendor_queue[usb_vendor_queue_head];
-    if (entry->slot) {
-        capture_slot_output_done(entry->slot);
-        entry->slot = NULL;
+    if (wifi_tcp_connecting) {
+        tcp_abort(wifi_tcp_connecting);
+        wifi_tcp_connecting = NULL;
     }
-    entry->length = 0;
-    entry->offset = 0;
-    usb_vendor_queue_head = (uint8_t)((usb_vendor_queue_head + 1) % USB_VENDOR_QUEUE_CAPACITY);
-    usb_vendor_queue_count--;
-    usb_vendor_queue_drops++;
+    cyw43_arch_lwip_end();
+    wifi_tcp_retry_deadline = make_timeout_time_ms(WIFI_TCP_RETRY_MS);
 }
 
-static void usb_vendor_queue_clear(void) {
-    while (usb_vendor_queue_count > 0) {
-        usb_vendor_queue_drop_head();
+static void wifi_queue_clear(void) {
+    wifi_queue_head = 0;
+    wifi_queue_tail = 0;
+    wifi_queue_count = 0;
+    if (wifi_transport == WIFI_TRANSPORT_TCP) {
+        wifi_tcp_close();
     }
-    usb_vendor_queue_head = 0;
-    usb_vendor_queue_tail = 0;
-    usb_vendor_queue_count = 0;
 }
 
-static bool usb_vendor_queue_push_slot(capture_slot_t* slot, size_t length) {
-    if (!slot || length == 0) {
+static bool wifi_tcp_ready(void) {
+    if (wifi_transport != WIFI_TRANSPORT_TCP) {
+        return false;
+    }
+    if (wifi_tcp_pcb) {
         return true;
     }
-
-    if (!tud_vendor_mounted()) {
+    if (wifi_tcp_connecting) {
+        return false;
+    }
+    if (!wifi_ready) {
+        return false;
+    }
+    if (!is_nil_time(wifi_tcp_retry_deadline) && !time_reached(wifi_tcp_retry_deadline)) {
         return false;
     }
 
-    if (length > PDM_BLOCK_PACKET_BYTES) {
+    cyw43_arch_lwip_begin();
+    struct tcp_pcb* pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!pcb) {
+        cyw43_arch_lwip_end();
+        wifi_tcp_retry_deadline = make_timeout_time_ms(WIFI_TCP_RETRY_MS);
         return false;
     }
 
-    if (usb_vendor_queue_count >= USB_VENDOR_QUEUE_CAPACITY) {
-        // Give the service loop a chance to flush before dropping.
-        usb_vendor_queue_service();
-        if (usb_vendor_queue_count >= USB_VENDOR_QUEUE_CAPACITY) {
-            usb_vendor_queue_drop_head();
-            if (usb_vendor_queue_count >= USB_VENDOR_QUEUE_CAPACITY) {
-                return false;
-            }
-        }
+    tcp_arg(pcb, NULL);
+    tcp_err(pcb, wifi_tcp_err_cb);
+    err_t err = tcp_connect(pcb, ip_2_ip4(&wifi_remote_addr), WIFI_TARGET_PORT, wifi_tcp_connected_cb);
+    cyw43_arch_lwip_end();
+    if (err != ERR_OK) {
+        cyw43_arch_lwip_begin();
+        tcp_abort(pcb);
+        cyw43_arch_lwip_end();
+        wifi_tcp_retry_deadline = make_timeout_time_ms(WIFI_TCP_RETRY_MS);
+        return false;
     }
 
-    usb_vendor_queue_entry_t* entry = &usb_vendor_queue[usb_vendor_queue_tail];
-    entry->slot = slot;
-    entry->length = (uint32_t)length;
-    entry->offset = 0;
-    slot->pending_outputs++;
+    wifi_tcp_connecting = pcb;
+    return false;
+}
 
-    usb_vendor_queue_tail = (uint8_t)((usb_vendor_queue_tail + 1) % USB_VENDOR_QUEUE_CAPACITY);
-    usb_vendor_queue_count++;
+static err_t wifi_tcp_connected_cb(void* arg, struct tcp_pcb* tpcb, err_t err) {
+    (void)arg;
+    if (err != ERR_OK) {
+        tcp_abort(tpcb);
+        wifi_tcp_connecting = NULL;
+        wifi_tcp_retry_deadline = make_timeout_time_ms(WIFI_TCP_RETRY_MS);
+        return err;
+    }
+    wifi_tcp_pcb = tpcb;
+    wifi_tcp_connecting = NULL;
+    return ERR_OK;
+}
+
+static void wifi_tcp_err_cb(void* arg, err_t err) {
+    (void)arg;
+    (void)err;
+    wifi_tcp_pcb = NULL;
+    wifi_tcp_connecting = NULL;
+    wifi_tcp_retry_deadline = make_timeout_time_ms(WIFI_TCP_RETRY_MS);
+}
+
+static bool wifi_queue_push(const pdm_block_packet_t* packet, size_t length) {
+    if (!wifi_stream_enabled || !wifi_ready || length == 0 || packet == NULL) {
+        return false;
+    }
+
+    if (length > sizeof(wifi_queue[0].packet)) {
+        return false;
+    }
+
+    if (wifi_queue_count >= WIFI_QUEUE_CAPACITY) {
+        wifi_queue_drops++;
+        return false;
+    }
+
+    wifi_packet_t* slot = &wifi_queue[wifi_queue_tail];
+    memcpy(&slot->packet, packet, length);
+    slot->length = (uint16_t)length;
+
+    wifi_queue_tail = (uint8_t)((wifi_queue_tail + 1) % WIFI_QUEUE_CAPACITY);
+    wifi_queue_count++;
     return true;
 }
 
-static void usb_vendor_queue_service(void) {
-    if (!usb_vendor_stream_enabled || usb_vendor_queue_count == 0) {
+static void wifi_queue_service(void) {
+    if (!wifi_ready || !wifi_stream_enabled || wifi_queue_count == 0) {
         return;
     }
 
-    if (!tud_vendor_mounted()) {
-        usb_vendor_queue_clear();
+    if (wifi_transport == WIFI_TRANSPORT_UDP) {
+        if (wifi_udp_socket == NULL) {
+            return;
+        }
+        while (wifi_queue_count > 0) {
+            wifi_packet_t* pkt = &wifi_queue[wifi_queue_head];
+            cyw43_arch_lwip_begin();
+            struct pbuf* buffer = pbuf_alloc(PBUF_TRANSPORT, pkt->length, PBUF_RAM);
+            if (buffer == NULL) {
+                cyw43_arch_lwip_end();
+                wifi_alloc_failures++;
+                break;
+            }
+            memcpy(buffer->payload, &pkt->packet, pkt->length);
+            err_t err = udp_sendto(wifi_udp_socket, buffer, &wifi_remote_addr, WIFI_TARGET_PORT);
+            pbuf_free(buffer);
+            cyw43_arch_lwip_end();
+            if (err != ERR_OK) {
+                wifi_send_failures++;
+                break;
+            }
+            wifi_packets_sent++;
+            wifi_bytes_sent += pkt->length;
+            wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
+            wifi_queue_count--;
+        }
         return;
     }
 
-    while (usb_vendor_queue_count > 0) {
-        usb_vendor_queue_entry_t* pkt = &usb_vendor_queue[usb_vendor_queue_head];
-        capture_slot_t* slot = pkt->slot;
-        if (!slot) {
-            usb_vendor_queue_head = (uint8_t)((usb_vendor_queue_head + 1) % USB_VENDOR_QUEUE_CAPACITY);
-            usb_vendor_queue_count--;
-            continue;
-        }
+    if (!wifi_tcp_ready()) {
+        return;
+    }
 
-        if (pkt->offset >= pkt->length) {
-            usb_vendor_packets_sent++;
-            usb_vendor_bytes_sent += pkt->length;
-            capture_slot_output_done(slot);
-            pkt->slot = NULL;
-            pkt->offset = 0;
-            pkt->length = 0;
-            usb_vendor_queue_head = (uint8_t)((usb_vendor_queue_head + 1) % USB_VENDOR_QUEUE_CAPACITY);
-            usb_vendor_queue_count--;
-            continue;
-        }
-
-        tud_task();
-        uint32_t available = tud_vendor_write_available();
-        if (available == 0) {
-            usb_vendor_backpressure_events++;
+    while (wifi_queue_count > 0) {
+        wifi_packet_t* pkt = &wifi_queue[wifi_queue_head];
+        cyw43_arch_lwip_begin();
+        u16_t avail = wifi_tcp_pcb ? tcp_sndbuf(wifi_tcp_pcb) : 0;
+        cyw43_arch_lwip_end();
+        if (avail == 0 || avail < pkt->length) {
             break;
         }
 
-        const uint8_t* data = (const uint8_t*)&slot->packet;
-        uint32_t remaining = pkt->length - pkt->offset;
-        uint32_t chunk = remaining < available ? remaining : available;
-        uint32_t written = tud_vendor_write(&data[pkt->offset], chunk);
-        tud_vendor_flush();
+        cyw43_arch_lwip_begin();
+        err_t err = tcp_write(wifi_tcp_pcb, &pkt->packet, pkt->length, TCP_WRITE_FLAG_COPY);
+        if (err == ERR_OK) {
+            err = tcp_output(wifi_tcp_pcb);
+        }
+        cyw43_arch_lwip_end();
 
-        if (written == 0) {
-            usb_vendor_backpressure_events++;
+        if (err != ERR_OK) {
+            wifi_send_failures++;
+            wifi_tcp_close();
             break;
         }
 
-        pkt->offset += written;
+        wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
+        wifi_queue_count--;
+        wifi_packets_sent++;
+        wifi_bytes_sent += pkt->length;
     }
 }
 
@@ -646,6 +849,12 @@ int main(void) {
     stdio_init_all();
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    bool wifi_started = initialise_wifi();
+    if (!wifi_started) {
+        printf("Wi-Fi not available; streaming disabled.\n");
+        wifi_stream_enabled = false;
+    }
+
     bool usb_connected = false;
     if (USB_WAIT_TIMEOUT_MS > 0) {
         absolute_time_t usb_wait_deadline = make_timeout_time_ms(USB_WAIT_TIMEOUT_MS);
@@ -695,7 +904,7 @@ int main(void) {
     while (true) {
         tud_task();
         handle_console_input();
-        usb_vendor_queue_service();
+        wifi_queue_service();
 
         if (capture_count == 0) {
             tight_loop_contents();
@@ -713,12 +922,19 @@ int main(void) {
             if (candidate->state == CAPTURE_SLOT_READY && candidate->length > 0) {
                 slot = candidate;
                 slot->state = CAPTURE_SLOT_SENDING;
-                slot->pending_outputs = 1;  // main loop holds one reference
                 bytes_to_send = slot->length;
                 packet = &slot->packet;
                 packet_bytes = sizeof(packet->metadata) + (size_t)bytes_to_send;
                 capture_read_index = (uint8_t)((capture_read_index + 1) % CAPTURE_RING_DEPTH);
                 capture_count--;
+                uint8_t pending = 0;
+                if (serial_stream_enabled) {
+                    pending++;
+                }
+                if (stream_binary_data) {
+                    pending++;
+                }
+                slot->pending_outputs = pending;
             }
         }
         restore_interrupts(status);
@@ -734,16 +950,23 @@ int main(void) {
 
         const uint8_t* packet_data = (const uint8_t*)packet;
 
-        if (usb_vendor_stream_enabled) {
-            if (!usb_vendor_queue_push_slot(slot, packet_bytes)) {
-                usb_vendor_failures++;
-            }
-            usb_vendor_queue_service();
+        if (wifi_stream_enabled) {
+            wifi_queue_push(packet, packet_bytes);
+            wifi_queue_service();
+        }
+
+        if (slot && slot->pending_outputs == 0) {
+            capture_slot_release(slot);
+            slot = NULL;
         }
 
         if (serial_stream_enabled) {
             if (!serial_stream_block(packet_data, packet_bytes)) {
                 serial_failures++;
+            }
+            capture_slot_output_done(slot);
+            if (slot && slot->state == CAPTURE_SLOT_FREE) {
+                slot = NULL;
             }
         }
 
@@ -751,9 +974,16 @@ int main(void) {
             usb_write_blocking(packet_data, packet_bytes);
             bytes_sent += (uint32_t)bytes_to_send;
             blocks_streamed++;
+            capture_slot_output_done(slot);
+            if (slot && slot->state == CAPTURE_SLOT_FREE) {
+                slot = NULL;
+            }
         }
 
-        capture_slot_output_done(slot);
+        if (slot) {
+            capture_slot_output_done(slot);
+            slot = NULL;
+        }
 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
         if (debug_stats_enabled && (now_ms - last_debug_ms >= debug_interval_ms)) {
