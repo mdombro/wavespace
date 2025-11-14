@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC
-or Wi-Fi (UDP or TCP).
+Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC,
+Wi-Fi (UDP or TCP), or an SPI link driven by a Raspberry Pi master.
 
 When talking to the device over USB this helper understands the interactive
 debug CLI that the firmware now exposes. It will automatically:
@@ -38,11 +38,19 @@ try:
 except ImportError:  # pragma: no cover - dependency check only
     serial = None  # type: ignore
 
+try:
+    import spidev  # type: ignore
+except ImportError:  # pragma: no cover - dependency check only
+    spidev = None  # type: ignore
+
 
 DEFAULT_BLOCK_BITS = 16384  # Two channels @ 8192 bits each by default
 DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # total payload bytes across all channels
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_WIFI_PORT = 5000
+SPI_DEFAULT_DEVICE = "0.0"
+SPI_DEFAULT_SPEED_HZ = 8_000_000
+SPI_MAX_SPEED_HZ = 62_000_000
 CLI_READ_WINDOW = 1.0
 
 METADATA_STRUCT = struct.Struct(
@@ -107,6 +115,23 @@ class BlockMetadata:
 
 def metadata_path_for(data_path: Path) -> Path:
     return data_path.with_name(data_path.name + ".metadata.csv")
+
+
+def parse_spi_device_identifier(identifier: str) -> Tuple[int, int]:
+    spec = identifier.strip() or SPI_DEFAULT_DEVICE
+    if spec.startswith("/dev/spidev"):
+        spec = spec.split("/dev/spidev", 1)[1]
+    if "." not in spec:
+        raise ValueError(f"Invalid SPI device '{identifier}'. Expected <bus>.<device> or /dev/spidevX.Y.")
+    bus_str, dev_str = spec.split(".", 1)
+    try:
+        bus = int(bus_str, 0)
+        dev = int(dev_str, 0)
+    except ValueError as exc:
+        raise ValueError(f"Invalid SPI bus/device numbers in '{identifier}'.") from exc
+    if bus < 0 or dev < 0:
+        raise ValueError("SPI bus and device numbers must be non-negative.")
+    return bus, dev
 
 
 def emit_dropped_blocks(
@@ -496,6 +521,27 @@ class TcpStreamReader:
         return bytes(buffer)
 
 
+class SpiStreamReader:
+    def __init__(self, device: "spidev.SpiDev", timeout: float) -> None:
+        self._device = device
+        self._timeout = timeout
+
+    def read(self, length: int) -> bytes:
+        buffer = bytearray()
+        deadline = None if self._timeout <= 0 else time.monotonic() + self._timeout
+        while len(buffer) < length:
+            remaining = length - len(buffer)
+            chunk_size = min(remaining, 4096)
+            data = self._device.readbytes(chunk_size)
+            if not data:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out waiting for data from the SPI stream")
+                time.sleep(0.001)
+                continue
+            buffer.extend(bytes(data))
+        return bytes(buffer)
+
+
 def capture_stream_usb(
     port: str,
     output_path: Path,
@@ -830,6 +876,116 @@ def capture_stream_wifi_tcp(
         f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
         file=sys.stderr,
     )
+
+
+def capture_stream_spi(
+    device_identifier: str,
+    output_path: Path,
+    block_bytes: int,
+    blocks: Optional[int],
+    timeout: float,
+    *,
+    speed_hz: int,
+    mode: int,
+    verbose: bool,
+) -> None:
+    if spidev is None:
+        raise RuntimeError("spidev module not available. Install with `pip install spidev` on the Raspberry Pi host.")
+
+    bus, dev = parse_spi_device_identifier(device_identifier or SPI_DEFAULT_DEVICE)
+    if speed_hz <= 0:
+        raise ValueError("SPI speed must be positive.")
+    spi_speed = min(speed_hz, SPI_MAX_SPEED_HZ)
+    if speed_hz > SPI_MAX_SPEED_HZ:
+        debug(f"[spi] requested {speed_hz} Hz exceeds max {SPI_MAX_SPEED_HZ} Hz; clamped.", verbose=verbose)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_path_for(output_path)
+    packet_bytes = block_bytes + METADATA_BYTES
+
+    spi = spidev.SpiDev()
+    try:
+        spi.open(bus, dev)
+        spi.max_speed_hz = spi_speed
+        spi.mode = mode
+        try:
+            spi.lsbfirst = False  # Ensure MSB-first transfers when supported.
+        except AttributeError:
+            pass
+        spi.bits_per_word = 8
+        debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
+
+        reader = SpiStreamReader(spi, timeout)
+        packet_source = PacketAligner(
+            read_chunk=reader.read,
+            packet_bytes=packet_bytes,
+            payload_bytes=block_bytes,
+            label="spi",
+            verbose=verbose,
+        )
+
+        block_count = 0
+        dropped_blocks = 0
+        bytes_captured = 0
+        expected_block_index: Optional[int] = None
+        progress = ProgressReporter("spi")
+
+        with output_path.open("wb") as sink, metadata_path.open("w", newline="") as metadata_file:
+            metadata_writer = csv.writer(metadata_file)
+            metadata_writer.writerow(METADATA_HEADER)
+
+            try:
+                while blocks is None or block_count < blocks:
+                    payload_view, metadata = packet_source.next_packet()
+
+                    if expected_block_index is not None:
+                        if metadata.block_index < expected_block_index:
+                            debug(
+                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
+                                verbose=verbose,
+                            )
+                            continue
+                        if metadata.block_index > expected_block_index:
+                            dropped_blocks = emit_dropped_blocks(
+                                metadata_writer,
+                                expected_block_index,
+                                metadata.block_index,
+                                label="spi",
+                                verbose=verbose,
+                            )
+                            progress.update(block_count, bytes_captured)
+                    expected_block_index = metadata.block_index + 1
+
+                    sink.write(payload_view)
+                    metadata_writer.writerow(
+                        [
+                            metadata.block_index,
+                            metadata.byte_offset,
+                            metadata.timestamp_us,
+                            metadata.payload_bytes_per_channel,
+                            metadata.channel_count,
+                            metadata.trigger_first_index,
+                            1 if metadata.trigger_tail_high else 0,
+                            0,
+                        ]
+                    )
+                    block_count += 1
+                    bytes_captured += metadata.total_payload_bytes
+                    progress.update(block_count, bytes_captured)
+
+            except KeyboardInterrupt:
+                debug("[spi] capture interrupted by user", verbose=True)
+            finally:
+                sink.flush()
+                metadata_file.flush()
+    finally:
+        spi.close()
+
+    print(
+        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
+        file=sys.stderr,
+    )
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Capture raw PDM bitstream blocks (and their metadata) from the Pico over USB (CDC) or Wi-Fi (UDP/TCP)."
@@ -845,7 +1001,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--transport",
-        choices=("usb", "wifi", "wifi-tcp"),
+        choices=("usb", "wifi", "wifi-tcp", "spi"),
         default="usb",
         help="Select the transport used by the Pico (default: usb).",
     )
@@ -911,6 +1067,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--wifi-allow",
         help="Restrict Wi-Fi capture to packets from a specific source IPv4 address.",
+    )
+    parser.add_argument(
+        "--spi-device",
+        default=SPI_DEFAULT_DEVICE,
+        help="(SPI transport) Bus and device in <bus>.<device> form or /dev/spidevX.Y (default: 0.0).",
+    )
+    parser.add_argument(
+        "--spi-speed-hz",
+        type=int,
+        default=SPI_DEFAULT_SPEED_HZ,
+        help=f"(SPI transport) SPI clock frequency in Hz (max {SPI_MAX_SPEED_HZ}).",
+    )
+    parser.add_argument(
+        "--spi-mode",
+        type=int,
+        choices=(0, 1, 2, 3),
+        default=0,
+        help="(SPI transport) SPI mode (CPOL/CPHA).",
     )
     parser.add_argument(
         "--verbose",
@@ -984,6 +1158,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
             except OSError as exc:
                 print(f"Socket error: {exc}", file=sys.stderr)
+                return 1
+        elif args.transport == "spi":
+            if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
+                print(
+                    "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for SPI captures.",
+                    file=sys.stderr,
+                )
+            try:
+                capture_stream_spi(
+                    args.spi_device,
+                    Path(args.output),
+                    args.block_bytes,
+                    args.blocks,
+                    args.timeout,
+                    speed_hz=args.spi_speed_hz,
+                    mode=args.spi_mode,
+                    verbose=args.verbose,
+                )
+            except TimeoutError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"SPI error: {exc}", file=sys.stderr)
                 return 1
         else:
             if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:

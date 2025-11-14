@@ -6,6 +6,7 @@
 
 #include "hardware/sync.h"
 #include "hardware/uart.h"
+#include "hardware/spi.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
@@ -22,11 +23,13 @@
 // Example entry point: capture PDM audio and stream over USB CDC and/or UDP.
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "chack-2.4"
+// #define WIFI_SSID "chack-2.4"
+#define WIFI_SSID "Routers of Rohan"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "redblueyellowgreen"
+// #define WIFI_PASSWORD "redblueyellowgreen"
+#define WIFI_PASSWORD "ridersoftheolan"
 #endif
 
 #ifndef WIFI_AUTH_TYPE
@@ -38,7 +41,8 @@
 #endif
 
 #ifndef WIFI_TARGET_IP
-#define WIFI_TARGET_IP "192.168.1.190"
+// #define WIFI_TARGET_IP "192.168.1.190"
+#define WIFI_TARGET_IP "192.168.8.209"
 #endif
 
 #ifndef WIFI_TARGET_PORT
@@ -52,6 +56,7 @@ typedef enum {
 
 #ifndef WIFI_TRANSPORT_MODE
 #define WIFI_TRANSPORT_MODE WIFI_TRANSPORT_UDP
+// #define WIFI_TRANSPORT_MODE WIFI_TRANSPORT_TCP
 #endif
 
 #ifndef USB_WAIT_TIMEOUT_MS
@@ -71,6 +76,14 @@ typedef enum {
 #define SERIAL_UART_BAUD       2000000
 #define SERIAL_WRITE_SPIN_MAX  500000
 #define SERIAL_WRITE_BACKOFF_US 5
+
+#define SPI_STREAM_PORT        spi1
+#define SPI_STREAM_SCK_PIN     14
+#define SPI_STREAM_TX_PIN      15
+#define SPI_STREAM_RX_PIN      16
+#define SPI_STREAM_CS_PIN      17
+#define SPI_WRITE_SPIN_MAX     500000
+#define SPI_WRITE_BACKOFF_US   5
 
 #define WIFI_QUEUE_CAPACITY      64
 #define WIFI_TCP_RETRY_MS        1000
@@ -111,6 +124,7 @@ static bool debug_stats_enabled = true;
 static bool debug_dump_samples = false;
 static bool stream_binary_data = false;
 static bool serial_stream_enabled = false;
+static bool spi_stream_enabled = false;
 static bool wifi_stream_enabled = true;
 
 static uint32_t debug_interval_ms = 1000;
@@ -129,6 +143,7 @@ static ip_addr_t wifi_remote_addr;
 typedef struct {
     pdm_block_packet_t packet;
     uint16_t length;
+    uint16_t sent;
 } wifi_packet_t;
 
 static wifi_packet_t wifi_queue[WIFI_QUEUE_CAPACITY];
@@ -147,6 +162,10 @@ static uint32_t serial_bytes_sent = 0;
 static uint32_t serial_failures = 0;
 
 static bool serial_initialised = false;
+static bool spi_initialised = false;
+static uint32_t spi_packets_sent = 0;
+static uint32_t spi_bytes_sent = 0;
+static uint32_t spi_failures = 0;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
@@ -173,6 +192,8 @@ static err_t wifi_tcp_connected_cb(void* arg, struct tcp_pcb* tpcb, err_t err);
 static void wifi_tcp_err_cb(void* arg, err_t err);
 static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
+static void initialise_spi_stream(void);
+static bool spi_stream_block(const uint8_t* data, size_t length);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
     if (!slot) {
@@ -372,6 +393,7 @@ static void print_help(void) {
     printf("  r   - reinitialize microphone with current settings\n\n");
     printf("  w   - toggle Wi-Fi streaming (currently %s)\n", wifi_stream_enabled ? "ON" : "OFF");
     printf("  t   - toggle UART streaming (currently %s)\n", serial_stream_enabled ? "ON" : "OFF");
+    printf("  p   - toggle SPI streaming (currently %s)\n", spi_stream_enabled ? "ON" : "OFF");
     printf("  n   - print transport status information\n\n");
 }
 
@@ -384,8 +406,13 @@ static void print_stats(void) {
         ? (serial_initialised ? "ON" : "init")
         : "OFF";
 
+    const char* spi_state = spi_stream_enabled
+        ? (spi_initialised ? "ON" : "init")
+        : "OFF";
+
     printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz "
            "wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu drop=%lu "
+           "spi=%s pkt=%lu bytes=%lu err=%lu "
            "uart=%s pkt=%lu bytes=%lu err=%lu\n",
            (unsigned long)blocks_ready,
            (unsigned long)blocks_streamed,
@@ -401,6 +428,10 @@ static void print_stats(void) {
            (unsigned long)wifi_send_failures,
            (unsigned long)wifi_alloc_failures,
            (unsigned long)wifi_queue_drops,
+           spi_state,
+           (unsigned long)spi_packets_sent,
+           (unsigned long)spi_bytes_sent,
+           (unsigned long)spi_failures,
            serial_state,
            (unsigned long)serial_packets_sent,
            (unsigned long)serial_bytes_sent,
@@ -420,6 +451,13 @@ static void print_transport_status(void) {
     printf("  alloc fail:  %lu\n", (unsigned long)wifi_alloc_failures);
     printf("  queue depth: %u / %u\n", wifi_queue_count, WIFI_QUEUE_CAPACITY);
     printf("  queue drops: %lu\n", (unsigned long)wifi_queue_drops);
+
+    printf("SPI streaming %s\n", spi_stream_enabled ? "ENABLED" : "DISABLED");
+    printf("  initialised: %s\n", spi_initialised ? "YES" : "NO");
+    printf("  port/pins:   spi1 (SCK=GP14 TX=GP15 RX=GP16 CS=GP17)\n");
+    printf("  packets:     %lu\n", (unsigned long)spi_packets_sent);
+    printf("  bytes:       %lu\n", (unsigned long)spi_bytes_sent);
+    printf("  failures:    %lu\n", (unsigned long)spi_failures);
 
     printf("UART streaming %s\n", serial_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", serial_initialised ? "YES" : "NO");
@@ -446,6 +484,9 @@ static void clear_stats(void) {
     serial_packets_sent = 0;
     serial_bytes_sent = 0;
     serial_failures = 0;
+    spi_packets_sent = 0;
+    spi_bytes_sent = 0;
+    spi_failures = 0;
 }
 
 // Poll the USB CDC RX path for single-character debug commands.
@@ -501,6 +542,14 @@ static void handle_console_input(void) {
                        serial_stream_enabled ? "ENABLED" : "DISABLED",
                        SERIAL_UART_TX_PIN,
                        (unsigned int)SERIAL_UART_BAUD);
+                break;
+            case 'p':
+                spi_stream_enabled = !spi_stream_enabled;
+                if (spi_stream_enabled && !spi_initialised) {
+                    initialise_spi_stream();
+                }
+                printf("SPI streaming %s (spi1 slave on GP14-17)\n",
+                       spi_stream_enabled ? "ENABLED" : "DISABLED");
                 break;
             case 'n':
                 print_transport_status();
@@ -712,6 +761,7 @@ static bool wifi_queue_push(const pdm_block_packet_t* packet, size_t length) {
     wifi_packet_t* slot = &wifi_queue[wifi_queue_tail];
     memcpy(&slot->packet, packet, length);
     slot->length = (uint16_t)length;
+    slot->sent = 0;
 
     wifi_queue_tail = (uint8_t)((wifi_queue_tail + 1) % WIFI_QUEUE_CAPACITY);
     wifi_queue_count++;
@@ -758,15 +808,37 @@ static void wifi_queue_service(void) {
 
     while (wifi_queue_count > 0) {
         wifi_packet_t* pkt = &wifi_queue[wifi_queue_head];
-        cyw43_arch_lwip_begin();
-        u16_t avail = wifi_tcp_pcb ? tcp_sndbuf(wifi_tcp_pcb) : 0;
-        cyw43_arch_lwip_end();
-        if (avail == 0 || avail < pkt->length) {
-            break;
+        uint16_t remaining = (uint16_t)(pkt->length - pkt->sent);
+        if (remaining == 0) {
+            pkt->sent = 0;
+            wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
+            wifi_queue_count--;
+            wifi_packets_sent++;
+            wifi_bytes_sent += pkt->length;
+            continue;
         }
 
         cyw43_arch_lwip_begin();
-        err_t err = tcp_write(wifi_tcp_pcb, &pkt->packet, pkt->length, TCP_WRITE_FLAG_COPY);
+        u16_t avail = wifi_tcp_pcb ? tcp_sndbuf(wifi_tcp_pcb) : 0;
+        cyw43_arch_lwip_end();
+        if (avail == 0) {
+            break;
+        }
+
+        // lwIP's TCP send buffer (tcp_sndbuf) can be smaller than a full block, so stream each packet in chunks.
+        uint16_t chunk = remaining;
+        if (chunk > avail) {
+            chunk = (uint16_t)avail;
+        }
+
+        uint8_t* base = (uint8_t*)&pkt->packet;
+        u8_t flags = TCP_WRITE_FLAG_COPY;
+        if (chunk < remaining) {
+            flags |= TCP_WRITE_FLAG_MORE;
+        }
+
+        cyw43_arch_lwip_begin();
+        err_t err = tcp_write(wifi_tcp_pcb, base + pkt->sent, chunk, flags);
         if (err == ERR_OK) {
             err = tcp_output(wifi_tcp_pcb);
         }
@@ -778,10 +850,14 @@ static void wifi_queue_service(void) {
             break;
         }
 
-        wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
-        wifi_queue_count--;
-        wifi_packets_sent++;
-        wifi_bytes_sent += pkt->length;
+        pkt->sent = (uint16_t)(pkt->sent + chunk);
+        if (pkt->sent >= pkt->length) {
+            pkt->sent = 0;
+            wifi_queue_head = (uint8_t)((wifi_queue_head + 1) % WIFI_QUEUE_CAPACITY);
+            wifi_queue_count--;
+            wifi_packets_sent++;
+            wifi_bytes_sent += pkt->length;
+        }
     }
 }
 
@@ -814,6 +890,71 @@ static bool serial_stream_block(const uint8_t* data, size_t length) {
 
     serial_packets_sent++;
     serial_bytes_sent += (uint32_t)length;
+    return true;
+}
+
+static void spi_drain_rx_fifo(void) {
+    while (spi_is_readable(SPI_STREAM_PORT)) {
+        (void)spi_get_hw(SPI_STREAM_PORT)->dr;
+    }
+}
+
+static void initialise_spi_stream(void) {
+    if (spi_initialised) {
+        return;
+    }
+
+    gpio_init(SPI_STREAM_SCK_PIN);
+    gpio_set_function(SPI_STREAM_SCK_PIN, GPIO_FUNC_SPI);
+    gpio_init(SPI_STREAM_TX_PIN);
+    gpio_set_function(SPI_STREAM_TX_PIN, GPIO_FUNC_SPI);
+    gpio_init(SPI_STREAM_RX_PIN);
+    gpio_set_function(SPI_STREAM_RX_PIN, GPIO_FUNC_SPI);
+    gpio_init(SPI_STREAM_CS_PIN);
+    gpio_set_function(SPI_STREAM_CS_PIN, GPIO_FUNC_SPI);
+    gpio_pull_up(SPI_STREAM_CS_PIN);
+
+    // baudrate argument is ignored when running in slave mode.
+    spi_init(SPI_STREAM_PORT, 1000 * 1000);
+    spi_set_format(SPI_STREAM_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_slave(SPI_STREAM_PORT, true);
+    spi_drain_rx_fifo();
+    spi_initialised = true;
+}
+
+static bool spi_stream_block(const uint8_t* data, size_t length) {
+    if (!spi_stream_enabled || length == 0) {
+        return false;
+    }
+
+    if (!spi_initialised) {
+        initialise_spi_stream();
+    }
+
+    size_t offset = 0;
+    uint32_t spin_loops = 0;
+
+    while (offset < length) {
+        if (spi_is_writable(SPI_STREAM_PORT)) {
+            spi_get_hw(SPI_STREAM_PORT)->dr = data[offset];
+            offset++;
+            spin_loops = 0;
+            spi_drain_rx_fifo();
+            continue;
+        }
+
+        spi_drain_rx_fifo();
+        tight_loop_contents();
+
+        if (++spin_loops > SPI_WRITE_SPIN_MAX) {
+            return false;
+        }
+
+        sleep_us(SPI_WRITE_BACKOFF_US);
+    }
+
+    spi_packets_sent++;
+    spi_bytes_sent += (uint32_t)length;
     return true;
 }
 
@@ -928,6 +1069,9 @@ int main(void) {
                 capture_read_index = (uint8_t)((capture_read_index + 1) % CAPTURE_RING_DEPTH);
                 capture_count--;
                 uint8_t pending = 0;
+                if (spi_stream_enabled) {
+                    pending++;
+                }
                 if (serial_stream_enabled) {
                     pending++;
                 }
@@ -958,6 +1102,16 @@ int main(void) {
         if (slot && slot->pending_outputs == 0) {
             capture_slot_release(slot);
             slot = NULL;
+        }
+
+        if (spi_stream_enabled) {
+            if (!spi_stream_block(packet_data, packet_bytes)) {
+                spi_failures++;
+            }
+            capture_slot_output_done(slot);
+            if (slot && slot->state == CAPTURE_SLOT_FREE) {
+                slot = NULL;
+            }
         }
 
         if (serial_stream_enabled) {

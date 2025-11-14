@@ -12,6 +12,7 @@ target_link_libraries(hello_pdm_microphone
     pico_cyw43_arch_lwip_threadsafe_background
     tinyusb_device
     tinyusb_board
+    hardware_spi
 )
 
 target_include_directories(hello_pdm_microphone PRIVATE ${CMAKE_CURRENT_LIST_DIR})
