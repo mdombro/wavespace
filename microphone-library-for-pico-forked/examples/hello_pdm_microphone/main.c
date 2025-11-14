@@ -1013,25 +1013,20 @@ static bool initialise_trigger_wave_generator(void) {
     }
 
     uint program_offset = pio_add_program(pio, &trigger_wave_program);
-    pio_sm_config config = trigger_wave_program_get_default_config(program_offset);
-    sm_config_set_in_pins(&config, TRIGGER_WAVE_TRIGGER_PIN);
-    sm_config_set_sideset_pins(&config, TRIGGER_WAVE_OUTPUT_PIN);
-
     float clk_div = (float)clock_get_hz(clk_sys) / (2.0f * (float)frequency_hz);
     if (clk_div < 1.0f) {
         clk_div = 1.0f;
     }
-    sm_config_set_clkdiv(&config, clk_div);
-
-    gpio_init(TRIGGER_WAVE_TRIGGER_PIN);
-    gpio_set_dir(TRIGGER_WAVE_TRIGGER_PIN, GPIO_IN);
-    gpio_pull_down(TRIGGER_WAVE_TRIGGER_PIN);
-
-    pio_gpio_init(pio, TRIGGER_WAVE_OUTPUT_PIN);
-    pio_sm_set_consecutive_pindirs(pio, sm, TRIGGER_WAVE_OUTPUT_PIN, 1, true);
 
     pio_sm_set_enabled(pio, sm, false);
-    pio_sm_init(pio, sm, program_offset, &config);
+    trigger_wave_program_init(
+        pio,
+        sm,
+        program_offset,
+        clk_div,
+        TRIGGER_WAVE_TRIGGER_PIN,
+        TRIGGER_WAVE_OUTPUT_PIN
+    );
     pio_sm_clear_fifos(pio, sm);
     pio_sm_restart(pio, sm);
     pio_sm_put_blocking(pio, sm, iterations);

@@ -30,7 +30,7 @@ pico_enable_stdio_usb(hello_pdm_microphone 1)
 pico_enable_stdio_uart(hello_pdm_microphone 0)
 
 # generate PIO headers for the trigger wave program
-pico_generate_pio_header(hello_pdm_microphone ${CMAKE_CURRENT_LIST_DIR}/trigger_wave.pio)
+pico_generate_pio_header(hello_pdm_microphone ${CMAKE_CURRENT_LIST_DIR}/../../src/trigger_wave.pio)
 
 # create map/bin/hex/uf2 file in addition to ELF.
 pico_add_extra_outputs(hello_pdm_microphone)

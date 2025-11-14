@@ -1,0 +1,35 @@
+.program trigger_wave
+.side_set 1 opt
+
+pull block
+mov y, osr
+
+.wrap_target
+wait 0 pin 0
+wait 1 pin 0
+mov x, y
+loop:
+    nop side 1
+    nop side 0
+    jmp x-- loop
+.wrap
+
+% c-sdk {
+
+static inline void trigger_wave_program_init(PIO pio, uint sm, uint offset, float clk_div, uint trigger_pin, uint output_pin) {
+    pio_sm_set_consecutive_pindirs(pio, sm, trigger_pin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, output_pin, 1, true);
+
+    pio_sm_config c = trigger_wave_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, trigger_pin);
+    sm_config_set_sideset_pins(&c, output_pin);
+
+    pio_gpio_init(pio, trigger_pin);
+    gpio_pull_down(trigger_pin);
+    pio_gpio_init(pio, output_pin);
+
+    sm_config_set_clkdiv(&c, clk_div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}
