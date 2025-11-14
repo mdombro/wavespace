@@ -7,10 +7,13 @@
 #include "hardware/sync.h"
 #include "hardware/uart.h"
 #include "hardware/spi.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
 #include "pico/pdm_microphone.h"
+#include "trigger_wave.pio.h"
 
 #include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
@@ -87,6 +90,30 @@ typedef enum {
 
 #define WIFI_QUEUE_CAPACITY      64
 #define WIFI_TCP_RETRY_MS        1000
+
+#ifndef TRIGGER_WAVE_PIO
+#define TRIGGER_WAVE_PIO pio1
+#endif
+
+#ifndef TRIGGER_WAVE_STATE_MACHINE
+#define TRIGGER_WAVE_STATE_MACHINE 1
+#endif
+
+#ifndef TRIGGER_WAVE_TRIGGER_PIN
+#define TRIGGER_WAVE_TRIGGER_PIN 18
+#endif
+
+#ifndef TRIGGER_WAVE_OUTPUT_PIN
+#define TRIGGER_WAVE_OUTPUT_PIN 19
+#endif
+
+#ifndef TRIGGER_WAVE_FREQUENCY_HZ
+#define TRIGGER_WAVE_FREQUENCY_HZ 60000
+#endif
+
+#ifndef TRIGGER_WAVE_DURATION_US
+#define TRIGGER_WAVE_DURATION_US 5000
+#endif
 
 typedef struct {
     struct pdm_block_metadata metadata;
@@ -194,6 +221,7 @@ static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
 static bool spi_stream_block(const uint8_t* data, size_t length);
+static bool initialise_trigger_wave_generator(void);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
     if (!slot) {
@@ -958,6 +986,68 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
     return true;
 }
 
+static bool initialise_trigger_wave_generator(void) {
+    const uint32_t frequency_hz = TRIGGER_WAVE_FREQUENCY_HZ;
+    const uint32_t duration_us = TRIGGER_WAVE_DURATION_US;
+
+    if (frequency_hz == 0 || duration_us == 0) {
+        printf("Trigger wave generator disabled (freq=%lu duration=%lu)\n",
+               (unsigned long)frequency_hz,
+               (unsigned long)duration_us);
+        return false;
+    }
+
+    uint64_t cycles64 = ((uint64_t)frequency_hz * duration_us) / 1000000u;
+    if (cycles64 == 0) {
+        cycles64 = 1;
+    }
+    uint32_t cycles = (uint32_t)cycles64;
+    uint32_t iterations = (cycles > 0) ? (cycles - 1u) : 0u;
+
+    PIO pio = TRIGGER_WAVE_PIO;
+    uint sm = TRIGGER_WAVE_STATE_MACHINE;
+
+    if (!pio_can_add_program(pio, &trigger_wave_program)) {
+        printf("Trigger wave generator: insufficient instruction memory\n");
+        return false;
+    }
+
+    uint program_offset = pio_add_program(pio, &trigger_wave_program);
+    pio_sm_config config = trigger_wave_program_get_default_config(program_offset);
+    sm_config_set_in_pins(&config, TRIGGER_WAVE_TRIGGER_PIN);
+    sm_config_set_sideset_pins(&config, TRIGGER_WAVE_OUTPUT_PIN);
+
+    float clk_div = (float)clock_get_hz(clk_sys) / (2.0f * (float)frequency_hz);
+    if (clk_div < 1.0f) {
+        clk_div = 1.0f;
+    }
+    sm_config_set_clkdiv(&config, clk_div);
+
+    gpio_init(TRIGGER_WAVE_TRIGGER_PIN);
+    gpio_set_dir(TRIGGER_WAVE_TRIGGER_PIN, GPIO_IN);
+    gpio_pull_down(TRIGGER_WAVE_TRIGGER_PIN);
+
+    pio_gpio_init(pio, TRIGGER_WAVE_OUTPUT_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, TRIGGER_WAVE_OUTPUT_PIN, 1, true);
+
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_init(pio, sm, program_offset, &config);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);
+    pio_sm_put_blocking(pio, sm, iterations);
+    pio_sm_set_enabled(pio, sm, true);
+
+    printf("Trigger wave generator ready: trigger=GP%d output=GP%d freq=%luHz duration=%luus cycles=%lu clkdiv=%.2f\n",
+           TRIGGER_WAVE_TRIGGER_PIN,
+           TRIGGER_WAVE_OUTPUT_PIN,
+           (unsigned long)frequency_hz,
+           (unsigned long)duration_us,
+           (unsigned long)cycles,
+           clk_div);
+
+    return true;
+}
+
 static void usb_write_blocking(const uint8_t* data, size_t length) {
     size_t offset = 0;
 
@@ -1041,6 +1131,7 @@ int main(void) {
 
     mic_running = true;
     reset_capture_state();
+    initialise_trigger_wave_generator();
 
     while (true) {
         tud_task();

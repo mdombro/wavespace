@@ -1,0 +1,16 @@
+.program trigger_wave
+.side_set 1 opt
+
+pull block
+mov y, osr
+
+.wrap_target
+wait 0 pin 0 
+wait 1 pin 0
+mov x, y
+loop:
+    nop side 1
+    nop side 0
+    jmp x-- loop
+    ;jmp .wrap_target
+.wrap
