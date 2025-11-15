@@ -527,20 +527,11 @@ class SpiStreamReader:
         self._timeout = timeout
 
     def read(self, length: int) -> bytes:
-        buffer = bytearray()
-        deadline = None if self._timeout <= 0 else time.monotonic() + self._timeout
-        while len(buffer) < length:
-            remaining = length - len(buffer)
-            chunk_size = min(remaining, 4096)
-            # xfer2 clocks data out of the Pico by writing dummy zeros while reading.
-            data = self._device.xfer2([0] * chunk_size)
-            if not data:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("Timed out waiting for data from the SPI stream")
-                time.sleep(0.001)
-                continue
-            buffer.extend(bytes(data))
-        return bytes(buffer)
+        if length <= 0:
+            return b""
+        # Each xfer2() call asserts chip select for the duration of the transfer,
+        # so we must request a whole packet in one transaction to keep framing intact.
+        return bytes(self._device.xfer2([0] * length))
 
 
 def capture_stream_usb(
@@ -917,13 +908,6 @@ def capture_stream_spi(
         debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
 
         reader = SpiStreamReader(spi, timeout)
-        packet_source = PacketAligner(
-            read_chunk=reader.read,
-            packet_bytes=packet_bytes,
-            payload_bytes=block_bytes,
-            label="spi",
-            verbose=verbose,
-        )
 
         block_count = 0
         dropped_blocks = 0
@@ -937,7 +921,14 @@ def capture_stream_spi(
 
             try:
                 while blocks is None or block_count < blocks:
-                    payload_view, metadata = packet_source.next_packet()
+                    raw_packet = reader.read(packet_bytes)
+                    try:
+                        metadata, payload_view = parse_block_packet(raw_packet, block_bytes)
+                    except ValueError as exc:
+                        debug(f"[spi] discarded malformed packet: {exc}", verbose=verbose)
+                        continue
+
+                    packet_bytes = METADATA_BYTES + metadata.total_payload_bytes
 
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
