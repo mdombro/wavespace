@@ -53,6 +53,7 @@ SPI_DEFAULT_SPEED_HZ = 8_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
+SPI_MAX_REASONABLE_INDEX = 1 << 48
 
 METADATA_STRUCT = struct.Struct(
     "<QQQIHhHHI"
@@ -163,6 +164,23 @@ def metadata_is_plausible(meta: BlockMetadata) -> bool:
         return False
     expected_index = meta.byte_offset // meta.payload_bytes_per_channel
     return expected_index == meta.block_index
+
+
+def spi_metadata_is_reasonable(meta: BlockMetadata, block_bytes: int) -> bool:
+    """Looser sanity check for SPI where we control the read size."""
+    if block_bytes <= 0:
+        return False
+    channels = max(1, meta.channel_count)
+    if channels > MAX_CHANNELS_PLAUSIBLE:
+        return False
+    if meta.payload_bytes_per_channel <= 0:
+        return False
+    total_payload = meta.payload_bytes_per_channel * channels
+    if total_payload != block_bytes:
+        return False
+    if meta.block_index >= SPI_MAX_REASONABLE_INDEX or meta.byte_offset >= SPI_MAX_REASONABLE_INDEX:
+        return False
+    return True
 
 
 class PacketAligner:
@@ -935,31 +953,21 @@ def capture_stream_spi(
                         debug(f"[spi] discarded malformed packet: {exc}", verbose=verbose)
                         continue
 
-                    if not metadata_is_plausible(metadata):
+                    if not spi_metadata_is_reasonable(metadata, block_bytes):
                         debug(
-                            f"[spi] ignoring invalid header (block={metadata.block_index} offset={metadata.byte_offset} "
+                            f"[spi] ignoring malformed metadata (block={metadata.block_index} offset={metadata.byte_offset} "
                             f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
                             verbose=verbose,
                         )
-                        time.sleep(0.0005)
                         continue
 
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
-                            if metadata.byte_offset == 0 or (expected_block_index - metadata.block_index) > 1024:
-                                debug(
-                                    f"[spi] block index reset from {expected_block_index - 1} to {metadata.block_index}; "
-                                    "resynchronizing.",
-                                    verbose=verbose,
-                                )
-                                expected_block_index = metadata.block_index + 1
-                            else:
-                                debug(
-                                    f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
-                                    verbose=verbose,
-                                )
-                                continue
-                        if metadata.block_index > expected_block_index:
+                            debug(
+                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), writing anyway",
+                                verbose=verbose,
+                            )
+                        elif metadata.block_index > expected_block_index:
                             dropped_blocks = emit_dropped_blocks(
                                 metadata_writer,
                                 expected_block_index,
@@ -968,9 +976,7 @@ def capture_stream_spi(
                                 verbose=verbose,
                             )
                             progress.update(block_count, bytes_captured)
-                        expected_block_index = metadata.block_index + 1
-                    else:
-                        expected_block_index = metadata.block_index + 1
+                    expected_block_index = metadata.block_index + 1
 
                     sink.write(payload_view)
                     metadata_writer.writerow(
