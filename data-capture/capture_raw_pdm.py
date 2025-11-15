@@ -937,18 +937,28 @@ def capture_stream_spi(
 
                     if not metadata_is_plausible(metadata):
                         debug(
-                            f"[spi] suspicious metadata (block={metadata.block_index} offset={metadata.byte_offset} "
+                            f"[spi] ignoring invalid header (block={metadata.block_index} offset={metadata.byte_offset} "
                             f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
                             verbose=verbose,
                         )
+                        time.sleep(0.0005)
+                        continue
 
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
-                            debug(
-                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
-                                verbose=verbose,
-                            )
-                            continue
+                            if metadata.byte_offset == 0 or (expected_block_index - metadata.block_index) > 1024:
+                                debug(
+                                    f"[spi] block index reset from {expected_block_index - 1} to {metadata.block_index}; "
+                                    "resynchronizing.",
+                                    verbose=verbose,
+                                )
+                                expected_block_index = metadata.block_index + 1
+                            else:
+                                debug(
+                                    f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
+                                    verbose=verbose,
+                                )
+                                continue
                         if metadata.block_index > expected_block_index:
                             dropped_blocks = emit_dropped_blocks(
                                 metadata_writer,
@@ -958,7 +968,9 @@ def capture_stream_spi(
                                 verbose=verbose,
                             )
                             progress.update(block_count, bytes_captured)
-                    expected_block_index = metadata.block_index + 1
+                        expected_block_index = metadata.block_index + 1
+                    else:
+                        expected_block_index = metadata.block_index + 1
 
                     sink.write(payload_view)
                     metadata_writer.writerow(
