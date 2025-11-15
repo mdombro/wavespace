@@ -77,6 +77,7 @@ COMMAND_TOGGLE_STATS = b"s"
 COMMAND_TOGGLE_DUMP = b"d"
 COMMAND_REINIT = b"r"
 COMMAND_TOGGLE_SPI_STREAM = b"p"
+COMMAND_STATUS = b"n"
 COMMAND_CLOCK = {
     512_000: b"1",
     1_024_000: b"2",
@@ -506,6 +507,33 @@ def restore_device(
     if "dump" in toggled and start_state.dump:
         debug("[cli] re-enabling sample dump (restore)", verbose=verbose)
         send_command(device, COMMAND_TOGGLE_DUMP, verbose=verbose)
+
+
+def dump_cli_status(device: serial.Serial, *, label: str) -> None:
+    """Print the Pico transport stats banner (command 'n')."""
+    lines = send_command(device, COMMAND_STATUS, verbose=False)
+    if not lines:
+        print(f"[cli] status dump ({label}) produced no output", file=sys.stderr)
+        return
+    print(f"[cli] status dump ({label}):", file=sys.stderr)
+    for line in lines:
+        print(f"    {line}", file=sys.stderr)
+
+
+def dump_cli_status_via_port(
+    port: str,
+    *,
+    timeout: Optional[float],
+    label: str,
+) -> None:
+    if serial is None:
+        print("[cli] pyserial not available; cannot read Pico status", file=sys.stderr)
+        return
+    try:
+        with serial.Serial(port=port, baudrate=115200, timeout=timeout) as device:
+            dump_cli_status(device, label=label)
+    except Exception as exc:  # pragma: no cover - diagnostic helper
+        print(f"[cli] failed to read status from {port}: {exc}", file=sys.stderr)
 
 
 def configure_spi_streaming(
@@ -1009,6 +1037,7 @@ def capture_stream_spi(
     speed_hz: int,
     mode: int,
     cli_port: Optional[str],
+    cli_show_stats: bool,
     restore_cli_spi: bool,
     verbose: bool,
 ) -> None:
@@ -1029,6 +1058,13 @@ def capture_stream_spi(
     cli_start_state: Optional[bool] = None
     spi_cli_toggled = False
     cli_timeout = None if timeout <= 0 else timeout
+
+    if cli_port and cli_show_stats:
+        dump_cli_status_via_port(
+            cli_port,
+            timeout=cli_timeout,
+            label="pre-capture",
+        )
 
     if cli_port:
         if serial is None:
@@ -1121,6 +1157,12 @@ def capture_stream_spi(
                 metadata_file.flush()
     finally:
         spi.close()
+        if cli_port and cli_show_stats:
+            dump_cli_status_via_port(
+                cli_port,
+                timeout=cli_timeout,
+                label="post-capture",
+            )
         if cli_port and spi_cli_toggled and restore_cli_spi and cli_start_state is not None:
             try:
                 debug(f"[spi] restoring CLI SPI streaming state via {cli_port}", verbose=verbose)
@@ -1247,6 +1289,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="(SPI transport) Leave SPI streaming enabled after capture (requires --spi-cli-port or SOURCE).",
     )
     parser.add_argument(
+        "--spi-show-stats",
+        action="store_true",
+        help="(SPI transport) Issue the CLI 'n' command before/after capture to show SPI packet counters.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print diagnostic information about CLI or network interactions to stderr.",
@@ -1336,6 +1383,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     speed_hz=args.spi_speed_hz,
                     mode=args.spi_mode,
                     cli_port=spi_cli_port,
+                    cli_show_stats=args.spi_show_stats,
                     restore_cli_spi=not args.spi_keep_streaming,
                     verbose=args.verbose,
                 )
