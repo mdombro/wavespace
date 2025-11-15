@@ -532,7 +532,8 @@ class SpiStreamReader:
         while len(buffer) < length:
             remaining = length - len(buffer)
             chunk_size = min(remaining, 4096)
-            data = self._device.readbytes(chunk_size)
+            # xfer2 clocks data out of the Pico by writing dummy zeros while reading.
+            data = self._device.xfer2([0] * chunk_size)
             if not data:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Timed out waiting for data from the SPI stream")

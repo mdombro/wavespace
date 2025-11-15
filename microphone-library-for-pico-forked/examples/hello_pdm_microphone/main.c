@@ -81,11 +81,11 @@ typedef enum {
 #define SERIAL_WRITE_BACKOFF_US 5
 
 #define SPI_STREAM_PORT        spi1
-#define SPI_STREAM_SCK_PIN     14
-#define SPI_STREAM_TX_PIN      15
-#define SPI_STREAM_RX_PIN      16
-#define SPI_STREAM_CS_PIN      17
-#define SPI_WRITE_SPIN_MAX     500000
+#define SPI_STREAM_SCK_PIN     10
+#define SPI_STREAM_TX_PIN      11
+#define SPI_STREAM_RX_PIN      12
+#define SPI_STREAM_CS_PIN      13
+#define SPI_WRITE_TIMEOUT_US   5000
 #define SPI_WRITE_BACKOFF_US   5
 
 #define WIFI_QUEUE_CAPACITY      64
@@ -221,6 +221,7 @@ static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
 static bool spi_stream_block(const uint8_t* data, size_t length);
+static bool spi_slave_selected(void);
 static bool initialise_trigger_wave_generator(void);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
@@ -927,6 +928,11 @@ static void spi_drain_rx_fifo(void) {
     }
 }
 
+static bool spi_slave_selected(void) {
+    // CS is active-low; if it's high the Pi isn't clocking data out.
+    return gpio_get(SPI_STREAM_CS_PIN) == 0;
+}
+
 static void initialise_spi_stream(void) {
     if (spi_initialised) {
         return;
@@ -959,14 +965,27 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
         initialise_spi_stream();
     }
 
+    absolute_time_t select_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
+    while (!spi_slave_selected()) {
+        if (time_reached(select_deadline)) {
+            return false;
+        }
+        tight_loop_contents();
+        sleep_us(SPI_WRITE_BACKOFF_US);
+    }
+
     size_t offset = 0;
-    uint32_t spin_loops = 0;
+    absolute_time_t write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
 
     while (offset < length) {
+        if (!spi_slave_selected()) {
+            return false;
+        }
+
         if (spi_is_writable(SPI_STREAM_PORT)) {
             spi_get_hw(SPI_STREAM_PORT)->dr = data[offset];
             offset++;
-            spin_loops = 0;
+            write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
             spi_drain_rx_fifo();
             continue;
         }
@@ -974,7 +993,7 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
         spi_drain_rx_fifo();
         tight_loop_contents();
 
-        if (++spin_loops > SPI_WRITE_SPIN_MAX) {
+        if (time_reached(write_deadline)) {
             return false;
         }
 
