@@ -485,7 +485,11 @@ static void print_transport_status(void) {
 
     printf("SPI streaming %s\n", spi_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", spi_initialised ? "YES" : "NO");
-    printf("  port/pins:   spi1 (SCK=GP14 TX=GP15 RX=GP16 CS=GP17)\n");
+    printf("  port/pins:   spi1 (SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
+           SPI_STREAM_SCK_PIN,
+           SPI_STREAM_TX_PIN,
+           SPI_STREAM_RX_PIN,
+           SPI_STREAM_CS_PIN);
     printf("  packets:     %lu\n", (unsigned long)spi_packets_sent);
     printf("  bytes:       %lu\n", (unsigned long)spi_bytes_sent);
     printf("  failures:    %lu\n", (unsigned long)spi_failures);
@@ -579,8 +583,12 @@ static void handle_console_input(void) {
                 if (spi_stream_enabled && !spi_initialised) {
                     initialise_spi_stream();
                 }
-                printf("SPI streaming %s (spi1 slave on GP14-17)\n",
-                       spi_stream_enabled ? "ENABLED" : "DISABLED");
+                printf("SPI streaming %s (spi1 slave on SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
+                       spi_stream_enabled ? "ENABLED" : "DISABLED",
+                       SPI_STREAM_SCK_PIN,
+                       SPI_STREAM_TX_PIN,
+                       SPI_STREAM_RX_PIN,
+                       SPI_STREAM_CS_PIN);
                 break;
             case 'n':
                 print_transport_status();

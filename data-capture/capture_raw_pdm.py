@@ -76,6 +76,7 @@ COMMAND_TOGGLE_STREAM = b"b"
 COMMAND_TOGGLE_STATS = b"s"
 COMMAND_TOGGLE_DUMP = b"d"
 COMMAND_REINIT = b"r"
+COMMAND_TOGGLE_SPI_STREAM = b"p"
 COMMAND_CLOCK = {
     512_000: b"1",
     1_024_000: b"2",
@@ -88,6 +89,7 @@ COMMAND_CLOCK = {
 STREAM_LINE = re.compile(r"toggle binary streaming \(currently (ON|OFF)\)", re.IGNORECASE)
 STATS_LINE = re.compile(r"toggle periodic stats \(currently (ON|OFF)\)", re.IGNORECASE)
 DUMP_LINE = re.compile(r"toggle per-block sample dump \(currently (ON|OFF)\)", re.IGNORECASE)
+SPI_LINE = re.compile(r"toggle SPI streaming \(currently (ON|OFF)\)", re.IGNORECASE)
 
 
 @dataclass
@@ -95,6 +97,7 @@ class CliState:
     stream: Optional[bool] = None
     stats: Optional[bool] = None
     dump: Optional[bool] = None
+    spi_stream: Optional[bool] = None
 
     def fully_known(self) -> bool:
         return self.stream is not None and self.stats is not None and self.dump is not None
@@ -389,6 +392,12 @@ def parse_cli_state(lines: Iterable[str]) -> CliState:
                 state.dump = match.group(1).upper() == "ON"
                 continue
 
+        if state.spi_stream is None:
+            match = SPI_LINE.search(line)
+            if match:
+                state.spi_stream = match.group(1).upper() == "ON"
+                continue
+
     return state
 
 
@@ -409,7 +418,7 @@ def query_cli_state(device: serial.Serial, *, verbose: bool) -> CliState:
 
     # Fall back to safe defaults if we never managed to parse the help text.
     debug("[cli] failed to parse help output, assuming defaults.", verbose=verbose)
-    return CliState(stream=False, stats=True, dump=False)
+    return CliState(stream=False, stats=True, dump=False, spi_stream=None)
 
 
 def send_command(device: serial.Serial, command: bytes, *, verbose: bool, read_response: bool = True) -> List[str]:
@@ -497,6 +506,46 @@ def restore_device(
     if "dump" in toggled and start_state.dump:
         debug("[cli] re-enabling sample dump (restore)", verbose=verbose)
         send_command(device, COMMAND_TOGGLE_DUMP, verbose=verbose)
+
+
+def configure_spi_streaming(
+    device: serial.Serial,
+    *,
+    enable: bool,
+    verbose: bool,
+) -> Tuple[bool, bool]:
+    """
+    Ensure the Pico's SPI streaming toggle matches `enable`.
+
+    Returns the starting state and whether we flipped it.
+    """
+    state = query_cli_state(device, verbose=verbose)
+    if state.spi_stream is None:
+        raise RuntimeError("Unable to determine SPI streaming state from the CLI output.")
+
+    if state.spi_stream == enable:
+        debug(f"[cli] SPI streaming already {'ENABLED' if enable else 'DISABLED'}", verbose=verbose)
+        return state.spi_stream, False
+
+    debug(f"[cli] {'enabling' if enable else 'disabling'} SPI streaming", verbose=verbose)
+    send_command(device, COMMAND_TOGGLE_SPI_STREAM, verbose=verbose)
+    time.sleep(0.1)
+    device.reset_input_buffer()
+    return state.spi_stream, True
+
+
+def restore_spi_streaming(
+    device: serial.Serial,
+    *,
+    start_state: bool,
+    verbose: bool,
+) -> None:
+    """Restore the SPI streaming toggle to its starting state."""
+    debug(
+        f"[cli] restoring SPI streaming to {'ENABLED' if start_state else 'DISABLED'}",
+        verbose=verbose,
+    )
+    send_command(device, COMMAND_TOGGLE_SPI_STREAM, verbose=verbose)
 
 
 def read_exact(device: serial.Serial, length: int) -> bytes:
@@ -959,6 +1008,8 @@ def capture_stream_spi(
     *,
     speed_hz: int,
     mode: int,
+    cli_port: Optional[str],
+    restore_cli_spi: bool,
     verbose: bool,
 ) -> None:
     if spidev is None:
@@ -974,6 +1025,21 @@ def capture_stream_spi(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = metadata_path_for(output_path)
     packet_bytes = block_bytes + METADATA_BYTES
+
+    cli_start_state: Optional[bool] = None
+    spi_cli_toggled = False
+    cli_timeout = None if timeout <= 0 else timeout
+
+    if cli_port:
+        if serial is None:
+            raise RuntimeError("pyserial is required to control SPI streaming via the CLI. Install with `pip install pyserial`.")
+        debug(f"[spi] opening CLI control port {cli_port} to manage SPI streaming", verbose=verbose)
+        with serial.Serial(port=cli_port, baudrate=115200, timeout=cli_timeout) as cli_device:
+            cli_start_state, spi_cli_toggled = configure_spi_streaming(
+                cli_device,
+                enable=True,
+                verbose=verbose,
+            )
 
     spi = spidev.SpiDev()
     try:
@@ -1055,6 +1121,13 @@ def capture_stream_spi(
                 metadata_file.flush()
     finally:
         spi.close()
+        if cli_port and spi_cli_toggled and restore_cli_spi and cli_start_state is not None:
+            try:
+                debug(f"[spi] restoring CLI SPI streaming state via {cli_port}", verbose=verbose)
+                with serial.Serial(port=cli_port, baudrate=115200, timeout=cli_timeout) as cli_device:
+                    restore_spi_streaming(cli_device, start_state=cli_start_state, verbose=verbose)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                print(f"Warning: failed to restore SPI streaming state via CLI: {exc}", file=sys.stderr)
 
     print(
         f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
@@ -1068,7 +1141,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "source",
         nargs="?",
-        help="Serial port exposed by the Pico's CLI. Required for --transport usb, ignored for Wi-Fi captures.",
+        help=(
+            "Serial port exposed by the Pico's CLI. Required for --transport usb, optional for SPI captures "
+            "to auto-toggle the SPI streaming control."
+        ),
     )
     parser.add_argument(
         "output",
@@ -1162,6 +1238,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="(SPI transport) SPI mode (CPOL/CPHA).",
     )
     parser.add_argument(
+        "--spi-cli-port",
+        help="(SPI transport) Serial port to talk to the Pico CLI; defaults to SOURCE when provided.",
+    )
+    parser.add_argument(
+        "--spi-keep-streaming",
+        action="store_true",
+        help="(SPI transport) Leave SPI streaming enabled after capture (requires --spi-cli-port or SOURCE).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print diagnostic information about CLI or network interactions to stderr.",
@@ -1240,6 +1325,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for SPI captures.",
                     file=sys.stderr,
                 )
+            spi_cli_port = args.spi_cli_port or args.source
             try:
                 capture_stream_spi(
                     args.spi_device,
@@ -1249,6 +1335,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.timeout,
                     speed_hz=args.spi_speed_hz,
                     mode=args.spi_mode,
+                    cli_port=spi_cli_port,
+                    restore_cli_spi=not args.spi_keep_streaming,
                     verbose=args.verbose,
                 )
             except TimeoutError as exc:
