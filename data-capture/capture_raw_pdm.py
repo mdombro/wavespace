@@ -937,11 +937,10 @@ def capture_stream_spi(
 
                     if not metadata_is_plausible(metadata):
                         debug(
-                            f"[spi] discarded implausible metadata (block={metadata.block_index} offset={metadata.byte_offset} "
+                            f"[spi] suspicious metadata (block={metadata.block_index} offset={metadata.byte_offset} "
                             f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
                             verbose=verbose,
                         )
-                        continue
 
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
