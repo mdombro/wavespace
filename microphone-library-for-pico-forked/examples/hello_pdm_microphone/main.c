@@ -87,6 +87,7 @@ typedef enum {
 #define SPI_STREAM_CS_PIN      13
 #define SPI_WRITE_TIMEOUT_US   5000
 #define SPI_WRITE_BACKOFF_US   5
+#define SPI_STREAM_MAGIC       0x50444D31u  // 'PDM1' framing marker
 
 #define WIFI_QUEUE_CAPACITY      64
 #define WIFI_TCP_RETRY_MS        1000
@@ -222,6 +223,7 @@ static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
 static bool spi_stream_block(const uint8_t* data, size_t length);
 static bool spi_slave_selected(void);
+static bool spi_write_bytes(const uint8_t* data, size_t length);
 static bool initialise_trigger_wave_generator(void);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
@@ -933,6 +935,35 @@ static bool spi_slave_selected(void) {
     return gpio_get(SPI_STREAM_CS_PIN) == 0;
 }
 
+static bool spi_write_bytes(const uint8_t* data, size_t length) {
+    size_t offset = 0;
+    absolute_time_t write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
+
+    while (offset < length) {
+        if (!spi_slave_selected()) {
+            return false;
+        }
+
+        if (spi_is_writable(SPI_STREAM_PORT)) {
+            spi_get_hw(SPI_STREAM_PORT)->dr = data[offset++];
+            spi_drain_rx_fifo();
+            write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
+            continue;
+        }
+
+        spi_drain_rx_fifo();
+        tight_loop_contents();
+
+        if (time_reached(write_deadline)) {
+            return false;
+        }
+
+        sleep_us(SPI_WRITE_BACKOFF_US);
+    }
+
+    return true;
+}
+
 static void initialise_spi_stream(void) {
     if (spi_initialised) {
         return;
@@ -974,34 +1005,20 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
         sleep_us(SPI_WRITE_BACKOFF_US);
     }
 
-    size_t offset = 0;
-    absolute_time_t write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
+    uint32_t magic = SPI_STREAM_MAGIC;
+    uint8_t magic_bytes[sizeof(magic)];
+    memcpy(magic_bytes, &magic, sizeof(magic_bytes));
 
-    while (offset < length) {
-        if (!spi_slave_selected()) {
-            return false;
-        }
+    if (!spi_write_bytes(magic_bytes, sizeof(magic_bytes))) {
+        return false;
+    }
 
-        if (spi_is_writable(SPI_STREAM_PORT)) {
-            spi_get_hw(SPI_STREAM_PORT)->dr = data[offset];
-            offset++;
-            write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
-            spi_drain_rx_fifo();
-            continue;
-        }
-
-        spi_drain_rx_fifo();
-        tight_loop_contents();
-
-        if (time_reached(write_deadline)) {
-            return false;
-        }
-
-        sleep_us(SPI_WRITE_BACKOFF_US);
+    if (!spi_write_bytes(data, length)) {
+        return false;
     }
 
     spi_packets_sent++;
-    spi_bytes_sent += (uint32_t)length;
+    spi_bytes_sent += (uint32_t)(length + sizeof(magic_bytes));
     return true;
 }
 

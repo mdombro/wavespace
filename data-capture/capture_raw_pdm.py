@@ -53,7 +53,8 @@ SPI_DEFAULT_SPEED_HZ = 8_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
-SPI_MAX_REASONABLE_INDEX = 1 << 48
+SPI_STREAM_MAGIC = b"PDM1"
+SPI_STREAM_MAGIC_LEN = len(SPI_STREAM_MAGIC)
 
 METADATA_STRUCT = struct.Struct(
     "<QQQIHhHHI"
@@ -164,23 +165,6 @@ def metadata_is_plausible(meta: BlockMetadata) -> bool:
         return False
     expected_index = meta.byte_offset // meta.payload_bytes_per_channel
     return expected_index == meta.block_index
-
-
-def spi_metadata_is_reasonable(meta: BlockMetadata, block_bytes: int) -> bool:
-    """Looser sanity check for SPI where we control the read size."""
-    if block_bytes <= 0:
-        return False
-    channels = max(1, meta.channel_count)
-    if channels > MAX_CHANNELS_PLAUSIBLE:
-        return False
-    if meta.payload_bytes_per_channel <= 0:
-        return False
-    total_payload = meta.payload_bytes_per_channel * channels
-    if total_payload != block_bytes:
-        return False
-    if meta.block_index >= SPI_MAX_REASONABLE_INDEX or meta.byte_offset >= SPI_MAX_REASONABLE_INDEX:
-        return False
-    return True
 
 
 class PacketAligner:
@@ -559,6 +543,77 @@ class SpiStreamReader:
         return bytes(self._device.xfer2([0] * length))
 
 
+class SpiPacketStream:
+    """Aggregate SPI transfers into framed packets using the per-block magic prefix."""
+
+    def __init__(self, reader: SpiStreamReader, payload_bytes: int, timeout: float) -> None:
+        self._reader = reader
+        self._payload_hint = payload_bytes
+        self._timeout = timeout
+        self._buffer = bytearray()
+        self._chunk_bytes = SPI_STREAM_MAGIC_LEN + METADATA_BYTES + max(1, payload_bytes)
+
+    def next_packet(self) -> Tuple[BlockMetadata, bytes]:
+        deadline = None if self._timeout <= 0 else time.monotonic() + self._timeout
+        while True:
+            packet = self._try_extract_packet()
+            if packet is not None:
+                return packet
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for data from the SPI stream")
+            self._buffer.extend(self._reader.read(self._chunk_bytes))
+
+    def _try_extract_packet(self) -> Optional[Tuple[BlockMetadata, bytes]]:
+        idx = self._buffer.find(SPI_STREAM_MAGIC)
+        if idx == -1:
+            # Retain only the tail so partial magic sequences survive to the next read.
+            keep = SPI_STREAM_MAGIC_LEN - 1
+            if keep > 0 and len(self._buffer) > keep:
+                del self._buffer[:-keep]
+            return None
+
+        if idx > 0:
+            del self._buffer[:idx]
+
+        if len(self._buffer) < SPI_STREAM_MAGIC_LEN + METADATA_BYTES:
+            return None
+
+        header_slice = self._buffer[
+            SPI_STREAM_MAGIC_LEN : SPI_STREAM_MAGIC_LEN + METADATA_BYTES
+        ]
+        (
+            block_index,
+            byte_offset,
+            timestamp_us,
+            bytes_per_channel,
+            channel_count,
+            trigger_index,
+            trigger_tail_high,
+            _,
+            _reserved2,
+        ) = METADATA_STRUCT.unpack(bytes(header_slice))
+
+        channels = max(1, channel_count)
+        payload_bytes = max(1, bytes_per_channel) * channels
+        total_len = SPI_STREAM_MAGIC_LEN + METADATA_BYTES + payload_bytes
+
+        if len(self._buffer) < total_len:
+            return None
+
+        packet_bytes = bytes(self._buffer[SPI_STREAM_MAGIC_LEN:total_len])
+
+        try:
+            metadata, payload_view = parse_block_packet(packet_bytes, self._payload_hint)
+        except ValueError:
+            # Drop this magic prefix and rescan.
+            del self._buffer[:SPI_STREAM_MAGIC_LEN]
+            return None
+
+        payload_bytes_out = bytes(payload_view)
+        del self._buffer[:total_len]
+        return metadata, payload_bytes_out
+
+
 def capture_stream_usb(
     port: str,
     output_path: Path,
@@ -933,6 +988,7 @@ def capture_stream_spi(
         debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
 
         reader = SpiStreamReader(spi, timeout)
+        packet_stream = SpiPacketStream(reader, block_bytes, timeout)
 
         block_count = 0
         dropped_blocks = 0
@@ -946,16 +1002,12 @@ def capture_stream_spi(
 
             try:
                 while blocks is None or block_count < blocks:
-                    raw_packet = reader.read(packet_bytes)
-                    try:
-                        metadata, payload_view = parse_block_packet(raw_packet, block_bytes)
-                    except ValueError as exc:
-                        debug(f"[spi] discarded malformed packet: {exc}", verbose=verbose)
-                        continue
+                    metadata, payload_bytes = packet_stream.next_packet()
 
-                    if not spi_metadata_is_reasonable(metadata, block_bytes):
+                    if not metadata_is_plausible(metadata):
                         debug(
-                            f"[spi] ignoring malformed metadata (block={metadata.block_index} offset={metadata.byte_offset} "
+                            f"[spi] received implausible block header "
+                            f"(block={metadata.block_index} offset={metadata.byte_offset} "
                             f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
                             verbose=verbose,
                         )
@@ -964,10 +1016,11 @@ def capture_stream_spi(
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
                             debug(
-                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), writing anyway",
+                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
                                 verbose=verbose,
                             )
-                        elif metadata.block_index > expected_block_index:
+                            continue
+                        if metadata.block_index > expected_block_index:
                             dropped_blocks = emit_dropped_blocks(
                                 metadata_writer,
                                 expected_block_index,
@@ -978,7 +1031,7 @@ def capture_stream_spi(
                             progress.update(block_count, bytes_captured)
                     expected_block_index = metadata.block_index + 1
 
-                    sink.write(payload_view)
+                    sink.write(payload_bytes)
                     metadata_writer.writerow(
                         [
                             metadata.block_index,
