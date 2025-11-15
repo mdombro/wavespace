@@ -52,6 +52,7 @@ SPI_DEFAULT_DEVICE = "0.0"
 SPI_DEFAULT_SPEED_HZ = 8_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
 CLI_READ_WINDOW = 1.0
+MAX_CHANNELS_PLAUSIBLE = 8
 
 METADATA_STRUCT = struct.Struct(
     "<QQQIHhHHI"
@@ -289,20 +290,26 @@ def parse_block_packet(packet: bytes, payload_bytes_hint: int) -> Tuple[BlockMet
         trigger_tail_high=bool(trigger_tail_high),
     )
 
-    total_payload = metadata.total_payload_bytes
     available_payload = max(0, len(packet) - METADATA_BYTES)
+    raw_channel_count = metadata.channel_count
+    sanitized_channel_count = raw_channel_count
+    if sanitized_channel_count <= 0 or sanitized_channel_count > MAX_CHANNELS_PLAUSIBLE:
+        sanitized_channel_count = max(1, min(sanitized_channel_count, MAX_CHANNELS_PLAUSIBLE))
+    metadata.channel_count = sanitized_channel_count
 
+    total_payload = metadata.payload_bytes_per_channel * max(1, raw_channel_count)
     if total_payload <= 0 or total_payload > available_payload:
+        total_payload = available_payload
         if payload_bytes_hint > 0:
-            total_payload = min(payload_bytes_hint, available_payload)
-        else:
-            total_payload = available_payload
+            total_payload = min(payload_bytes_hint, total_payload)
+        channels = max(1, metadata.channel_count)
+        metadata.payload_bytes_per_channel = max(1, total_payload // channels)
+        total_payload = metadata.payload_bytes_per_channel * channels
+    else:
+        metadata.payload_bytes_per_channel = max(1, metadata.payload_bytes_per_channel)
+        total_payload = metadata.payload_bytes_per_channel * metadata.channel_count
 
-        if metadata.channel_count <= 0:
-            metadata.channel_count = 1
-        metadata.payload_bytes_per_channel = max(1, total_payload // metadata.channel_count)
-
-    expected = METADATA_BYTES + metadata.total_payload_bytes
+    expected = METADATA_BYTES + total_payload
     if len(packet) < expected:
         raise ValueError(
             f"Malformed block packet: expected {expected} bytes, received {len(packet)} bytes "
@@ -928,7 +935,13 @@ def capture_stream_spi(
                         debug(f"[spi] discarded malformed packet: {exc}", verbose=verbose)
                         continue
 
-                    packet_bytes = METADATA_BYTES + metadata.total_payload_bytes
+                    if not metadata_is_plausible(metadata):
+                        debug(
+                            f"[spi] discarded implausible metadata (block={metadata.block_index} offset={metadata.byte_offset} "
+                            f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
+                            verbose=verbose,
+                        )
+                        continue
 
                     if expected_block_index is not None:
                         if metadata.block_index < expected_block_index:
