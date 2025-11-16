@@ -138,14 +138,8 @@ typedef struct {
     uint8_t pending_outputs;
 } capture_slot_t;
 
-typedef struct {
-    uint32_t transaction_index;
-    uint32_t expected_bytes;
-    uint32_t actual_bytes;
-} spi_block_header_t;
-
-#define SPI_BLOCK_HEADER_BYTES ((size_t)sizeof(spi_block_header_t))
-#define SPI_PACKET_MAX_BYTES   (SPI_BLOCK_HEADER_BYTES + PDM_BLOCK_PAYLOAD_BYTES)
+#define SPI_READY_BYTES       ((size_t)sizeof(uint32_t))
+#define SPI_MAX_PAYLOAD_BYTES (PDM_BLOCK_PAYLOAD_BYTES * CAPTURE_RING_DEPTH)
 
 static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
 static volatile uint8_t capture_write_index = 0;
@@ -213,8 +207,8 @@ static bool spi_initialised = false;
 static uint32_t spi_packets_sent = 0;
 static uint32_t spi_bytes_sent = 0;
 static uint32_t spi_failures = 0;
-static uint8_t spi_dma_buffer[SPI_PACKET_MAX_BYTES];
-static uint32_t spi_transaction_index = 0;
+static uint8_t spi_dma_buffer[SPI_MAX_PAYLOAD_BYTES];
+static uint8_t spi_ready_buffer[SPI_READY_BYTES];
 static int spi_dma_channel = -1;
 static dma_channel_config spi_dma_config;
 static bool spi_dma_configured = false;
@@ -271,6 +265,21 @@ static inline void capture_slot_output_done(capture_slot_t* slot) {
     if (slot->pending_outputs == 0) {
         capture_slot_release(slot);
     }
+}
+
+static inline bool spi_exclusive_mode(void) {
+    if (!spi_stream_enabled) {
+        return false;
+    }
+    if (serial_stream_enabled || stream_binary_data) {
+        return false;
+    }
+#if ENABLE_WIFI_STREAMING
+    if (wifi_stream_enabled) {
+        return false;
+    }
+#endif
+    return true;
 }
 
 // Clear producer/consumer flags so the next DMA callback restarts cleanly.
@@ -1073,29 +1082,98 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
         initialise_spi_stream();
     }
 
-    size_t total_bytes = SPI_BLOCK_HEADER_BYTES + length;
-    if (total_bytes > sizeof(spi_dma_buffer)) {
-        spi_log_failure("SPI packet larger than DMA buffer", total_bytes);
-        return false;
+    capture_slot_t* extra_slots[CAPTURE_RING_DEPTH];
+    uint16_t extra_lengths[CAPTURE_RING_DEPTH];
+    size_t extra_count = 0;
+    size_t total_bytes = length;
+    bool extras_claimed = false;
+    uint8_t original_read_index = 0;
+    uint8_t original_capture_count = 0;
+
+    if (spi_exclusive_mode()) {
+        uint32_t status = save_and_disable_interrupts();
+        uint8_t index = capture_read_index;
+        uint8_t count = capture_count;
+        original_read_index = capture_read_index;
+        original_capture_count = capture_count;
+        while (count > 0 && extra_count < CAPTURE_RING_DEPTH) {
+            capture_slot_t* candidate = &capture_ring[index];
+            if (candidate->state != CAPTURE_SLOT_READY || candidate->length == 0) {
+                break;
+            }
+            if ((total_bytes + candidate->length) > sizeof(spi_dma_buffer)) {
+                break;
+            }
+            candidate->state = CAPTURE_SLOT_SENDING;
+            candidate->pending_outputs = 1;
+            extra_slots[extra_count] = candidate;
+            extra_lengths[extra_count] = candidate->length;
+            total_bytes += candidate->length;
+            index = (uint8_t)((index + 1) % CAPTURE_RING_DEPTH);
+            extra_count++;
+            count--;
+        }
+        if (extra_count > 0) {
+            capture_read_index = index;
+            capture_count = count;
+            extras_claimed = true;
+        }
+        restore_interrupts(status);
     }
 
-    spi_block_header_t header = {
-        .transaction_index = spi_transaction_index++,
-        .expected_bytes = (uint32_t)length,
-        .actual_bytes = (uint32_t)length,
-    };
+    bool success = false;
+    size_t extras_sent = 0;
 
-    memcpy(spi_dma_buffer, &header, SPI_BLOCK_HEADER_BYTES);
-    memcpy(spi_dma_buffer + SPI_BLOCK_HEADER_BYTES, data, length);
+    if (total_bytes > sizeof(spi_dma_buffer)) {
+        spi_log_failure("SPI payload larger than DMA buffer", total_bytes);
+        goto cleanup;
+    }
+
+    size_t offset = 0;
+    memcpy(spi_dma_buffer + offset, data, length);
+    offset += length;
+
+    for (size_t i = 0; i < extra_count; i++) {
+        memcpy(spi_dma_buffer + offset, extra_slots[i]->packet.payload, extra_lengths[i]);
+        offset += extra_lengths[i];
+    }
+
+    uint32_t ready_bytes = (uint32_t)total_bytes;
+    memcpy(spi_ready_buffer, &ready_bytes, SPI_READY_BYTES);
+
+    if (!spi_write_bytes(spi_ready_buffer, SPI_READY_BYTES)) {
+        spi_log_failure("Failed while sending SPI ready length", 0);
+        goto cleanup;
+    }
 
     if (!spi_write_bytes(spi_dma_buffer, total_bytes)) {
         spi_log_failure("Failed while sending SPI payload", 0);
-        return false;
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < extra_count; i++) {
+        capture_slot_output_done(extra_slots[i]);
+        extras_sent++;
     }
 
     spi_packets_sent++;
-    spi_bytes_sent += (uint32_t)total_bytes;
-    return true;
+    spi_bytes_sent += (uint32_t)(total_bytes + SPI_READY_BYTES);
+    success = true;
+
+cleanup:
+    if (!success) {
+        for (size_t i = extras_sent; i < extra_count; i++) {
+            extra_slots[i]->state = CAPTURE_SLOT_READY;
+            extra_slots[i]->pending_outputs = 0;
+        }
+        if (extras_claimed) {
+            uint32_t status = save_and_disable_interrupts();
+            capture_read_index = original_read_index;
+            capture_count = original_capture_count;
+            restore_interrupts(status);
+        }
+    }
+    return success;
 }
 
 static bool initialise_trigger_wave_generator(void) {

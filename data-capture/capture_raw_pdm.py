@@ -47,14 +47,11 @@ DEFAULT_TIMEOUT = 1.0
 SPI_DEFAULT_DEVICE = "0.0"
 SPI_DEFAULT_SPEED_HZ = 3_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
-SPI_TRANSACTION_HEADER_STRUCT = struct.Struct("<III")
-SPI_TRANSACTION_HEADER_BYTES = SPI_TRANSACTION_HEADER_STRUCT.size
+SPI_READY_STRUCT = struct.Struct("<I")
+SPI_READY_BYTES = SPI_READY_STRUCT.size
+SPI_READY_MULTIPLIER = 16
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
-SPI_STREAM_MAGIC = b"PDM1"
-SPI_STREAM_MAGIC_LE = SPI_STREAM_MAGIC[::-1]
-SPI_STREAM_MAGIC_LEN = len(SPI_STREAM_MAGIC)
-SPI_STREAM_MAGIC_LEN = len(SPI_STREAM_MAGIC)
 
 METADATA_STRUCT = struct.Struct(
     "<QQQIHhHHI"
@@ -589,34 +586,53 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
 
 
 
-class SpiBlockReader:
-    """Read one full header+payload packet per transfer while reusing buffers for speed."""
+def spi_read_bytes(device: "spidev.SpiDev", count: int) -> bytes:
+    try:
+        if hasattr(device, "readbytes"):
+            data = device.readbytes(count)
+        else:
+            data = device.xfer2([0] * count)
+    except OSError as exc:  # pragma: no cover - hardware errors are runtime concerns
+        raise RuntimeError(f"SPI transfer failed: {exc}") from exc
 
-    def __init__(self, device: "spidev.SpiDev", packet_bytes: int, timeout: float) -> None:
-        self._device = device
-        self._packet_bytes = packet_bytes
-        self._timeout = timeout
-        self._supports_read = hasattr(device, "readbytes")
-        self._tx_template = [0] * packet_bytes if not self._supports_read else None
+    if len(data) != count:
+        raise RuntimeError(f"Received {len(data)} byte(s) from SPI, expected {count}.")
 
-    def read_packet(self) -> bytes:
-        deadline = None if self._timeout <= 0 else time.monotonic() + self._timeout
-        while True:
-            try:
-                if self._supports_read:
-                    data = self._device.readbytes(self._packet_bytes)
-                else:
-                    data = self._device.xfer2(self._tx_template)
-            except OSError as exc:
-                raise RuntimeError(f"SPI transfer failed: {exc}") from exc
+    return bytes(data)
 
-            if len(data) == self._packet_bytes:
-                return bytes(data)
 
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for a complete SPI packet from the Pico")
+def spi_read_ready_bytes(
+    device: "spidev.SpiDev",
+    timeout: float,
+    max_ready_bytes: int,
+    *,
+    verbose: bool,
+) -> int:
+    deadline = None if timeout <= 0 else time.monotonic() + timeout
+    max_ready_bytes = max(1, max_ready_bytes)
+    while True:
+        ready_raw = spi_read_bytes(device, SPI_READY_BYTES)
+        ready_bytes = SPI_READY_STRUCT.unpack(ready_raw)[0]
+        if 0 < ready_bytes <= max_ready_bytes:
+            return ready_bytes
 
-            time.sleep(0.0002)
+        if ready_bytes > max_ready_bytes:
+            debug(
+                f"[spi] ignoring implausible ready-byte count {ready_bytes} (max {max_ready_bytes})",
+                verbose=verbose,
+            )
+
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Timed out waiting for SPI ready bytes from the Pico")
+
+        time.sleep(0.0002)
+
+
+def spi_read_payload(device: "spidev.SpiDev", length: int) -> bytes:
+    if length <= 0:
+        return b""
+    return spi_read_bytes(device, length)
+
 
 def capture_stream_usb(
     port: str,
@@ -793,47 +809,41 @@ def capture_stream_spi(
         spi.bits_per_word = 8
         debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
 
-        reader = SpiBlockReader(
-            spi,
-            block_bytes + SPI_TRANSACTION_HEADER_BYTES,
-            timeout,
-        )
-
         block_count = 0
         bytes_captured = 0
         progress = ProgressReporter("spi")
+        transaction_index = 0
 
         with (
             output_path.open("wb") as sink,
             metadata_path.open("w", newline="") as metadata_file,
         ):
             metadata_writer = csv.writer(metadata_file)
-            metadata_writer.writerow(["transaction", "expected_bytes", "actual_bytes", "file_offset"])
+            metadata_writer.writerow(["transaction", "ready_bytes", "actual_bytes", "file_offset", "timestamp_us"])
             file_offset = 0
 
             try:
+                max_ready_bytes = max(block_bytes, block_bytes * SPI_READY_MULTIPLIER)
                 while blocks is None or block_count < blocks:
-                    raw_packet = reader.read_packet()
-                    if len(raw_packet) < SPI_TRANSACTION_HEADER_BYTES:
-                        debug("[spi] packet shorter than header; skipping", verbose=verbose)
-                        continue
-
-                    tx_index, expected_bytes, actual_bytes = SPI_TRANSACTION_HEADER_STRUCT.unpack(
-                        raw_packet[:SPI_TRANSACTION_HEADER_BYTES]
+                    ready_bytes = spi_read_ready_bytes(
+                        spi,
+                        timeout,
+                        max_ready_bytes,
+                        verbose=verbose,
                     )
-                    payload = raw_packet[SPI_TRANSACTION_HEADER_BYTES:]
-
-                    expected = min(expected_bytes, len(payload))
-                    actual = min(actual_bytes, expected)
-
+                    timestamp_us = int(time.time() * 1_000_000)
+                    payload = spi_read_payload(spi, ready_bytes)
+                    actual = len(payload)
                     current_offset = file_offset
+
                     if actual > 0:
-                        sink.write(payload[:actual])
+                        sink.write(payload)
                         file_offset += actual
                         bytes_captured += actual
 
-                    metadata_writer.writerow([tx_index, expected_bytes, actual_bytes, current_offset])
+                    metadata_writer.writerow([transaction_index, ready_bytes, actual, current_offset, timestamp_us])
                     block_count += 1
+                    transaction_index += 1
                     progress.update(block_count, bytes_captured)
 
             except KeyboardInterrupt:
