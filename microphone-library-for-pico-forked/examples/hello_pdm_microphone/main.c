@@ -139,12 +139,13 @@ typedef struct {
 } capture_slot_t;
 
 typedef struct {
-    uint32_t transaction_index;
-    uint32_t expected_bytes;
+    uint32_t ready_bytes;
 } spi_block_header_t;
 
 #define SPI_BLOCK_HEADER_BYTES ((size_t)sizeof(spi_block_header_t))
-#define SPI_PACKET_MAX_BYTES   (SPI_BLOCK_HEADER_BYTES + PDM_BLOCK_PAYLOAD_BYTES)
+#define SPI_MAKE_CMD(a, b, c, d) ((((uint32_t)(a)) << 24) | (((uint32_t)(b)) << 16) | (((uint32_t)(c)) << 8) | ((uint32_t)(d)))
+#define SPI_CMD_STATUS SPI_MAKE_CMD('S', 'T', 'A', 'T')
+#define SPI_CMD_READ   SPI_MAKE_CMD('R', 'E', 'A', 'D')
 
 static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
 static volatile uint8_t capture_write_index = 0;
@@ -212,8 +213,19 @@ static bool spi_initialised = false;
 static uint32_t spi_packets_sent = 0;
 static uint32_t spi_bytes_sent = 0;
 static uint32_t spi_failures = 0;
-static uint8_t spi_dma_buffer[SPI_PACKET_MAX_BYTES];
-static uint32_t spi_transaction_index = 0;
+typedef struct {
+    capture_slot_t* slot;
+    const uint8_t* payload;
+    size_t length;
+} spi_pending_transfer_t;
+static spi_pending_transfer_t spi_pending_queue[CAPTURE_RING_DEPTH];
+static uint8_t spi_pending_head = 0;
+static uint8_t spi_pending_tail = 0;
+static uint8_t spi_pending_count = 0;
+static uint8_t spi_command_buffer[4];
+static uint8_t spi_command_bytes = 0;
+static bool spi_collecting_command = false;
+static size_t spi_dummy_bytes = 0;
 static int spi_dma_channel = -1;
 static dma_channel_config spi_dma_config;
 static bool spi_dma_configured = false;
@@ -246,9 +258,11 @@ static void wifi_tcp_err_cb(void* arg, err_t err);
 static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
-static bool spi_stream_block(const uint8_t* data, size_t length);
 static bool spi_slave_selected(void);
 static bool spi_write_bytes(const uint8_t* data, size_t length);
+static bool spi_queue_block_for_spi(capture_slot_t* slot, const uint8_t* payload, size_t length);
+static void spi_service_stream(void);
+static void spi_pending_clear(void);
 static bool initialise_trigger_wave_generator(void);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
@@ -624,6 +638,8 @@ static void handle_console_input(void) {
                 spi_stream_enabled = !spi_stream_enabled;
                 if (spi_stream_enabled && !spi_initialised) {
                     initialise_spi_stream();
+                } else if (!spi_stream_enabled) {
+                    spi_pending_clear();
                 }
                 printf("SPI streaming %s (spi1 slave on SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
                        spi_stream_enabled ? "ENABLED" : "DISABLED",
@@ -1027,6 +1043,156 @@ static bool spi_write_bytes(const uint8_t* data, size_t length) {
     return true;
 }
 
+static void spi_pending_clear(void) {
+    while (spi_pending_count > 0) {
+        capture_slot_output_done(spi_pending_queue[spi_pending_head].slot);
+        spi_pending_head = (uint8_t)((spi_pending_head + 1) % CAPTURE_RING_DEPTH);
+        spi_pending_count--;
+    }
+    spi_pending_head = 0;
+    spi_pending_tail = 0;
+    spi_command_bytes = 0;
+    spi_collecting_command = false;
+    spi_dummy_bytes = 0;
+}
+
+static bool spi_pending_enqueue(capture_slot_t* slot, const uint8_t* payload, size_t length) {
+    if (spi_pending_count >= CAPTURE_RING_DEPTH) {
+        return false;
+    }
+    spi_pending_queue[spi_pending_tail].slot = slot;
+    spi_pending_queue[spi_pending_tail].payload = payload;
+    spi_pending_queue[spi_pending_tail].length = length;
+    spi_pending_tail = (uint8_t)((spi_pending_tail + 1) % CAPTURE_RING_DEPTH);
+    spi_pending_count++;
+    return true;
+}
+
+static spi_pending_transfer_t spi_pending_dequeue(void) {
+    spi_pending_transfer_t result = {0};
+    if (spi_pending_count == 0) {
+        return result;
+    }
+    result = spi_pending_queue[spi_pending_head];
+    spi_pending_head = (uint8_t)((spi_pending_head + 1) % CAPTURE_RING_DEPTH);
+    spi_pending_count--;
+    return result;
+}
+
+static spi_pending_transfer_t* spi_pending_peek(void) {
+    if (spi_pending_count == 0) {
+        return NULL;
+    }
+    return &spi_pending_queue[spi_pending_head];
+}
+
+static bool spi_queue_block_for_spi(capture_slot_t* slot, const uint8_t* payload, size_t length) {
+    if (length == 0 || slot == NULL) {
+        return false;
+    }
+    if (!spi_pending_enqueue(slot, payload, length)) {
+        spi_log_failure("SPI pending queue full", length);
+        return false;
+    }
+    return true;
+}
+
+static void spi_send_status_response(void) {
+    uint32_t ready = 0;
+    spi_pending_transfer_t* pending = spi_pending_peek();
+    if (pending != NULL) {
+        ready = (uint32_t)pending->length;
+    }
+    if (!spi_write_bytes((const uint8_t*)&ready, sizeof(ready))) {
+        spi_failures++;
+    }
+    spi_dummy_bytes += sizeof(ready);
+}
+
+static void spi_send_payload_response(void) {
+    if (spi_pending_count == 0) {
+        uint32_t zero = 0;
+        if (!spi_write_bytes((const uint8_t*)&zero, sizeof(zero))) {
+            spi_failures++;
+        }
+        spi_dummy_bytes += sizeof(zero);
+        return;
+    }
+
+    spi_pending_transfer_t transfer = spi_pending_dequeue();
+    if (!spi_write_bytes(transfer.payload, transfer.length)) {
+        spi_failures++;
+        capture_slot_output_done(transfer.slot);
+        return;
+    }
+
+    spi_packets_sent++;
+    spi_bytes_sent += (uint32_t)transfer.length;
+    capture_slot_output_done(transfer.slot);
+    spi_dummy_bytes += transfer.length;
+}
+
+static void spi_service_stream(void) {
+    if (!spi_stream_enabled || !spi_initialised) {
+        spi_drain_rx_fifo();
+        spi_command_bytes = 0;
+        spi_collecting_command = false;
+        spi_dummy_bytes = 0;
+        return;
+    }
+
+    bool cs_low = spi_slave_selected();
+    if (cs_low) {
+        while (spi_is_readable(SPI_STREAM_PORT)) {
+            uint8_t byte = (uint8_t)spi_get_hw(SPI_STREAM_PORT)->dr;
+            if (spi_dummy_bytes > 0) {
+                spi_dummy_bytes--;
+                continue;
+            }
+            if (spi_command_bytes < sizeof(spi_command_buffer)) {
+                spi_command_buffer[spi_command_bytes++] = byte;
+                spi_collecting_command = true;
+            }
+        }
+        return;
+    }
+
+    if (spi_dummy_bytes > 0) {
+        return;
+    }
+
+    if (!spi_collecting_command || spi_command_bytes == 0) {
+        return;
+    }
+
+    if (spi_command_bytes != sizeof(spi_command_buffer)) {
+        printf(
+            "SPI command length %u (expected 4)\n",
+            (unsigned)spi_command_bytes
+        );
+        spi_command_bytes = 0;
+        spi_collecting_command = false;
+        return;
+    }
+
+    if (memcmp(spi_command_buffer, "STAT", 4) == 0) {
+        spi_send_status_response();
+    } else if (memcmp(spi_command_buffer, "READ", 4) == 0) {
+        spi_send_payload_response();
+    } else {
+        printf(
+            "Unknown SPI command %02x %02x %02x %02x\n",
+            spi_command_buffer[0],
+            spi_command_buffer[1],
+            spi_command_buffer[2],
+            spi_command_buffer[3]
+        );
+    }
+
+    spi_command_bytes = 0;
+    spi_collecting_command = false;
+}
+
 static void initialise_spi_stream(void) {
     if (spi_initialised) {
         return;
@@ -1061,39 +1227,6 @@ static void initialise_spi_stream(void) {
     channel_config_set_irq_quiet(&spi_dma_config, true);
     spi_dma_configured = true;
     spi_initialised = true;
-}
-
-static bool spi_stream_block(const uint8_t* data, size_t length) {
-    if (!spi_stream_enabled || length == 0) {
-        return false;
-    }
-
-    if (!spi_initialised) {
-        initialise_spi_stream();
-    }
-
-    size_t total_bytes = SPI_BLOCK_HEADER_BYTES + length;
-    if (total_bytes > sizeof(spi_dma_buffer)) {
-        spi_log_failure("SPI packet larger than DMA buffer", total_bytes);
-        return false;
-    }
-
-    spi_block_header_t header = {
-        .transaction_index = spi_transaction_index++,
-        .expected_bytes = (uint32_t)length,
-    };
-
-    memcpy(spi_dma_buffer, &header, SPI_BLOCK_HEADER_BYTES);
-    memcpy(spi_dma_buffer + SPI_BLOCK_HEADER_BYTES, data, length);
-
-    if (!spi_write_bytes(spi_dma_buffer, total_bytes)) {
-        spi_log_failure("Failed while sending SPI payload", 0);
-        return false;
-    }
-
-    spi_packets_sent++;
-    spi_bytes_sent += (uint32_t)total_bytes;
-    return true;
 }
 
 static bool initialise_trigger_wave_generator(void) {
@@ -1248,6 +1381,7 @@ int main(void) {
 #if ENABLE_WIFI_STREAMING
         wifi_queue_service();
 #endif
+        spi_service_stream();
 
         if (capture_count == 0) {
             tight_loop_contents();
@@ -1310,12 +1444,12 @@ int main(void) {
         }
 
         if (spi_stream_enabled) {
-    if (!spi_stream_block(payload_data, (size_t)bytes_to_send)) {
+            if (!spi_queue_block_for_spi(slot, payload_data, (size_t)bytes_to_send)) {
                 spi_failures++;
-            }
-            capture_slot_output_done(slot);
-            if (slot && slot->state == CAPTURE_SLOT_FREE) {
-                slot = NULL;
+                capture_slot_output_done(slot);
+                if (slot && slot->state == CAPTURE_SLOT_FREE) {
+                    slot = NULL;
+                }
             }
         }
 
@@ -1340,7 +1474,9 @@ int main(void) {
         }
 
         if (slot) {
-            capture_slot_output_done(slot);
+            if (slot->pending_outputs == 0) {
+                capture_slot_release(slot);
+            }
             slot = NULL;
         }
 
