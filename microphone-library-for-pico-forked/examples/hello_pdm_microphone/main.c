@@ -9,29 +9,33 @@
 #include "hardware/spi.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
+#include "hardware/dma.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
 #include "pico/pdm_microphone.h"
 #include "trigger_wave.pio.h"
 
+#define ENABLE_WIFI_STREAMING 0
+
+#if ENABLE_WIFI_STREAMING
 #include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/pbuf.h"
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
+#endif
 
 #include "tusb.h"
 
-// Example entry point: capture PDM audio and stream over USB CDC and/or UDP.
+// Example entry point: capture PDM audio and stream over USB CDC and/or SPI.
 
+#if ENABLE_WIFI_STREAMING
 #ifndef WIFI_SSID
-// #define WIFI_SSID "chack-2.4"
 #define WIFI_SSID "Routers of Rohan"
 #endif
 
 #ifndef WIFI_PASSWORD
-// #define WIFI_PASSWORD "redblueyellowgreen"
 #define WIFI_PASSWORD "ridersoftheolan"
 #endif
 
@@ -44,7 +48,6 @@
 #endif
 
 #ifndef WIFI_TARGET_IP
-// #define WIFI_TARGET_IP "192.168.1.190"
 #define WIFI_TARGET_IP "192.168.8.209"
 #endif
 
@@ -59,8 +62,8 @@ typedef enum {
 
 #ifndef WIFI_TRANSPORT_MODE
 #define WIFI_TRANSPORT_MODE WIFI_TRANSPORT_UDP
-// #define WIFI_TRANSPORT_MODE WIFI_TRANSPORT_TCP
 #endif
+#endif  // ENABLE_WIFI_STREAMING
 
 #ifndef USB_WAIT_TIMEOUT_MS
 #define USB_WAIT_TIMEOUT_MS 3000
@@ -85,12 +88,13 @@ typedef enum {
 #define SPI_STREAM_TX_PIN      11
 #define SPI_STREAM_RX_PIN      12
 #define SPI_STREAM_CS_PIN      13
-#define SPI_WRITE_TIMEOUT_US   100000
+#define SPI_WRITE_TIMEOUT_US   250000
 #define SPI_WRITE_BACKOFF_US   5
-#define SPI_STREAM_MAGIC       0x50444D31u  // 'PDM1' framing marker
 
+#if ENABLE_WIFI_STREAMING
 #define WIFI_QUEUE_CAPACITY      64
 #define WIFI_TCP_RETRY_MS        1000
+#endif
 
 #ifndef TRIGGER_WAVE_PIO
 #define TRIGGER_WAVE_PIO pio1
@@ -134,6 +138,15 @@ typedef struct {
     uint8_t pending_outputs;
 } capture_slot_t;
 
+typedef struct {
+    uint32_t transaction_index;
+    uint32_t expected_bytes;
+    uint32_t actual_bytes;
+} spi_block_header_t;
+
+#define SPI_BLOCK_HEADER_BYTES ((size_t)sizeof(spi_block_header_t))
+#define SPI_PACKET_MAX_BYTES   (SPI_BLOCK_HEADER_BYTES + PDM_BLOCK_PAYLOAD_BYTES)
+
 static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
 static volatile uint8_t capture_write_index = 0;
 static volatile uint8_t capture_read_index = 0;
@@ -153,12 +166,17 @@ static bool debug_dump_samples = false;
 static bool stream_binary_data = false;
 static bool serial_stream_enabled = false;
 static bool spi_stream_enabled = false;
+#if ENABLE_WIFI_STREAMING
 static bool wifi_stream_enabled = true;
+#else
+static bool wifi_stream_enabled = false;
+#endif
 
 static uint32_t debug_interval_ms = 1000;
 static uint32_t last_debug_ms = 0;
 static bool mic_running = false;
 
+#if ENABLE_WIFI_STREAMING
 static bool wifi_initialised = false;
 static bool wifi_ready = false;
 static wifi_transport_mode_t wifi_transport = WIFI_TRANSPORT_MODE;
@@ -184,6 +202,7 @@ static uint32_t wifi_bytes_sent = 0;
 static uint32_t wifi_send_failures = 0;
 static uint32_t wifi_alloc_failures = 0;
 static uint32_t wifi_queue_drops = 0;
+#endif
 
 static uint32_t serial_packets_sent = 0;
 static uint32_t serial_bytes_sent = 0;
@@ -194,6 +213,11 @@ static bool spi_initialised = false;
 static uint32_t spi_packets_sent = 0;
 static uint32_t spi_bytes_sent = 0;
 static uint32_t spi_failures = 0;
+static uint8_t spi_dma_buffer[SPI_PACKET_MAX_BYTES];
+static uint32_t spi_transaction_index = 0;
+static int spi_dma_channel = -1;
+static dma_channel_config spi_dma_config;
+static bool spi_dma_configured = false;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
@@ -210,6 +234,7 @@ static struct pdm_microphone_config config = {
 
 static void clear_stats(void);
 static void on_pdm_samples_ready(void);
+#if ENABLE_WIFI_STREAMING
 static bool initialise_wifi(void);
 static bool wifi_queue_push(const pdm_block_packet_t* packet, size_t length);
 static void wifi_queue_service(void);
@@ -218,6 +243,7 @@ static void wifi_tcp_close(void);
 static bool wifi_tcp_ready(void);
 static err_t wifi_tcp_connected_cb(void* arg, struct tcp_pcb* tpcb, err_t err);
 static void wifi_tcp_err_cb(void* arg, err_t err);
+#endif
 static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
@@ -262,7 +288,9 @@ static void reset_capture_state(void) {
 
     clear_stats();
     last_debug_ms = to_ms_since_boot(get_absolute_time());
+#if ENABLE_WIFI_STREAMING
     wifi_queue_clear();
+#endif
 }
 
 // Reconfigure the microphone library at runtime while preserving state trackers.
@@ -310,6 +338,7 @@ static bool restart_microphone(uint32_t new_rate) {
     return success;
 }
 
+#if ENABLE_WIFI_STREAMING
 static bool initialise_wifi(void) {
     if (wifi_initialised) {
         return wifi_ready;
@@ -381,6 +410,8 @@ cleanup:
     return success;
 }
 
+#endif  // ENABLE_WIFI_STREAMING
+
 static void on_pdm_samples_ready(void) {
     // Library callback from DMA IRQ context when a raw buffer has filled.
     uint8_t write_index = capture_write_index;
@@ -422,17 +453,15 @@ static void print_help(void) {
     printf("  5   - set PDM clock to 4.000 MHz\n");
     printf("  6   - set PDM clock to 4.800 MHz\n");
     printf("  r   - reinitialize microphone with current settings\n\n");
+#if ENABLE_WIFI_STREAMING
     printf("  w   - toggle Wi-Fi streaming (currently %s)\n", wifi_stream_enabled ? "ON" : "OFF");
+#endif
     printf("  t   - toggle UART streaming (currently %s)\n", serial_stream_enabled ? "ON" : "OFF");
     printf("  p   - toggle SPI streaming (currently %s)\n", spi_stream_enabled ? "ON" : "OFF");
     printf("  n   - print transport status information\n\n");
 }
 
 static void print_stats(void) {
-    const char* wifi_state = wifi_ready
-        ? (wifi_stream_enabled ? (wifi_transport == WIFI_TRANSPORT_TCP ? "tcp" : "udp") : "paused")
-        : "OFF";
-
     const char* serial_state = serial_stream_enabled
         ? (serial_initialised ? "ON" : "init")
         : "OFF";
@@ -441,10 +470,7 @@ static void print_stats(void) {
         ? (spi_initialised ? "ON" : "init")
         : "OFF";
 
-    printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz "
-           "wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu drop=%lu "
-           "spi=%s pkt=%lu bytes=%lu err=%lu "
-           "uart=%s pkt=%lu bytes=%lu err=%lu\n",
+    printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz ",
            (unsigned long)blocks_ready,
            (unsigned long)blocks_streamed,
            (unsigned long)blocks_discarded,
@@ -452,13 +478,23 @@ static void print_stats(void) {
            (unsigned long)bytes_sent,
            stream_binary_data ? "ON" : "OFF",
            debug_dump_samples ? "ON" : "OFF",
-           (unsigned long)config.sample_rate,
+           (unsigned long)config.sample_rate);
+#if ENABLE_WIFI_STREAMING
+    const char* wifi_state = wifi_ready
+        ? (wifi_stream_enabled ? (wifi_transport == WIFI_TRANSPORT_TCP ? "tcp" : "udp") : "paused")
+        : "OFF";
+    printf("wifi=%s pkt=%lu bytes=%lu err=%lu alloc_fail=%lu drop=%lu ",
            wifi_state,
            (unsigned long)wifi_packets_sent,
            (unsigned long)wifi_bytes_sent,
            (unsigned long)wifi_send_failures,
            (unsigned long)wifi_alloc_failures,
-           (unsigned long)wifi_queue_drops,
+           (unsigned long)wifi_queue_drops);
+#else
+    printf("wifi=DISABLED ");
+#endif
+    printf("spi=%s pkt=%lu bytes=%lu err=%lu "
+           "uart=%s pkt=%lu bytes=%lu err=%lu\n",
            spi_state,
            (unsigned long)spi_packets_sent,
            (unsigned long)spi_bytes_sent,
@@ -470,6 +506,7 @@ static void print_stats(void) {
 }
 
 static void print_transport_status(void) {
+#if ENABLE_WIFI_STREAMING
     printf("Wi-Fi streaming %s via %s\n",
            wifi_stream_enabled ? "ENABLED" : "DISABLED",
            wifi_transport == WIFI_TRANSPORT_TCP ? "TCP" : "UDP");
@@ -482,7 +519,9 @@ static void print_transport_status(void) {
     printf("  alloc fail:  %lu\n", (unsigned long)wifi_alloc_failures);
     printf("  queue depth: %u / %u\n", wifi_queue_count, WIFI_QUEUE_CAPACITY);
     printf("  queue drops: %lu\n", (unsigned long)wifi_queue_drops);
-
+#else
+    printf("Wi-Fi streaming DISABLED (compile-time)\n");
+#endif
     printf("SPI streaming %s\n", spi_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", spi_initialised ? "YES" : "NO");
     printf("  port/pins:   spi1 (SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
@@ -510,11 +549,13 @@ static void clear_stats(void) {
     bytes_sent = 0;
     restore_interrupts(status);
 
+#if ENABLE_WIFI_STREAMING
     wifi_packets_sent = 0;
     wifi_bytes_sent = 0;
     wifi_send_failures = 0;
     wifi_alloc_failures = 0;
     wifi_queue_drops = 0;
+#endif
 
     serial_packets_sent = 0;
     serial_bytes_sent = 0;
@@ -556,6 +597,7 @@ static void handle_console_input(void) {
                 clear_stats();
                 printf("Counters cleared\n");
                 break;
+#if ENABLE_WIFI_STREAMING
             case 'w':
                 wifi_stream_enabled = !wifi_stream_enabled;
                 printf("Wi-Fi streaming %s\n", wifi_stream_enabled ? "ENABLED" : "DISABLED");
@@ -568,6 +610,7 @@ static void handle_console_input(void) {
                     }
                 }
                 break;
+#endif
             case 't':
                 serial_stream_enabled = !serial_stream_enabled;
                 if (serial_stream_enabled && !serial_initialised) {
@@ -692,6 +735,7 @@ static void initialise_uart_stream(void) {
     serial_initialised = true;
 }
 
+#if ENABLE_WIFI_STREAMING
 static void wifi_tcp_close(void) {
     cyw43_arch_lwip_begin();
     if (wifi_tcp_pcb) {
@@ -900,6 +944,8 @@ static void wifi_queue_service(void) {
     }
 }
 
+#endif  // ENABLE_WIFI_STREAMING
+
 static bool serial_stream_block(const uint8_t* data, size_t length) {
     if (!serial_stream_enabled || length == 0) {
         return false;
@@ -950,33 +996,35 @@ static void spi_log_failure(const char* reason, size_t offset) {
 }
 
 static bool spi_write_bytes(const uint8_t* data, size_t length) {
-    size_t offset = 0;
-    absolute_time_t write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
-
-    while (offset < length) {
-        if (!spi_slave_selected()) {
-            spi_log_failure("CS released mid-transfer", offset);
-            return false;
-        }
-
-        if (spi_is_writable(SPI_STREAM_PORT)) {
-            spi_get_hw(SPI_STREAM_PORT)->dr = data[offset++];
-            spi_drain_rx_fifo();
-            write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
-            continue;
-        }
-
-        spi_drain_rx_fifo();
-        tight_loop_contents();
-
-        if (time_reached(write_deadline)) {
-            spi_log_failure("TX stalled waiting for FIFO space", offset);
-            return false;
-        }
-
-        sleep_us(SPI_WRITE_BACKOFF_US);
+    if (length == 0) {
+        return true;
     }
 
+    if (spi_dma_channel < 0 || !spi_dma_configured) {
+        spi_log_failure("DMA channel not initialised", 0);
+        return false;
+    }
+
+    dma_channel_configure(
+        spi_dma_channel,
+        &spi_dma_config,
+        &spi_get_hw(SPI_STREAM_PORT)->dr,
+        data,
+        length,
+        true
+    );
+
+    absolute_time_t deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
+    while (dma_channel_is_busy(spi_dma_channel)) {
+        if (time_reached(deadline)) {
+            dma_channel_abort(spi_dma_channel);
+            spi_log_failure("DMA timeout waiting for host clock", length);
+            return false;
+        }
+        tight_loop_contents();
+    }
+
+    spi_drain_rx_fifo();
     return true;
 }
 
@@ -1000,6 +1048,19 @@ static void initialise_spi_stream(void) {
     spi_set_format(SPI_STREAM_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
     spi_set_slave(SPI_STREAM_PORT, true);
     spi_drain_rx_fifo();
+    if (spi_dma_channel < 0) {
+        spi_dma_channel = dma_claim_unused_channel(true);
+    }
+    spi_dma_config = dma_channel_get_default_config(spi_dma_channel);
+    channel_config_set_transfer_data_size(&spi_dma_config, DMA_SIZE_8);
+    channel_config_set_read_increment(&spi_dma_config, true);
+    channel_config_set_write_increment(&spi_dma_config, false);
+    channel_config_set_dreq(
+        &spi_dma_config,
+        spi_get_index(SPI_STREAM_PORT) == 0 ? DREQ_SPI0_TX : DREQ_SPI1_TX
+    );
+    channel_config_set_irq_quiet(&spi_dma_config, true);
+    spi_dma_configured = true;
     spi_initialised = true;
 }
 
@@ -1012,32 +1073,28 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
         initialise_spi_stream();
     }
 
-    absolute_time_t select_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
-    while (!spi_slave_selected()) {
-        if (time_reached(select_deadline)) {
-            spi_log_failure("CS never asserted", 0);
-            return false;
-        }
-        tight_loop_contents();
-        sleep_us(SPI_WRITE_BACKOFF_US);
-    }
-
-    uint32_t magic = SPI_STREAM_MAGIC;
-    uint8_t magic_bytes[sizeof(magic)];
-    memcpy(magic_bytes, &magic, sizeof(magic_bytes));
-
-    if (!spi_write_bytes(magic_bytes, sizeof(magic_bytes))) {
-        spi_log_failure("Failed while sending magic", 0);
+    size_t total_bytes = SPI_BLOCK_HEADER_BYTES + length;
+    if (total_bytes > sizeof(spi_dma_buffer)) {
+        spi_log_failure("SPI packet larger than DMA buffer", total_bytes);
         return false;
     }
 
-    if (!spi_write_bytes(data, length)) {
-        spi_log_failure("Failed while sending payload", 0);
+    spi_block_header_t header = {
+        .transaction_index = spi_transaction_index++,
+        .expected_bytes = (uint32_t)length,
+        .actual_bytes = (uint32_t)length,
+    };
+
+    memcpy(spi_dma_buffer, &header, SPI_BLOCK_HEADER_BYTES);
+    memcpy(spi_dma_buffer + SPI_BLOCK_HEADER_BYTES, data, length);
+
+    if (!spi_write_bytes(spi_dma_buffer, total_bytes)) {
+        spi_log_failure("Failed while sending SPI payload", 0);
         return false;
     }
 
     spi_packets_sent++;
-    spi_bytes_sent += (uint32_t)(length + sizeof(magic_bytes));
+    spi_bytes_sent += (uint32_t)total_bytes;
     return true;
 }
 
@@ -1130,11 +1187,15 @@ int main(void) {
     stdio_init_all();
     setvbuf(stdout, NULL, _IONBF, 0);
 
+#if ENABLE_WIFI_STREAMING
     bool wifi_started = initialise_wifi();
     if (!wifi_started) {
         printf("Wi-Fi not available; streaming disabled.\n");
         wifi_stream_enabled = false;
     }
+#else
+    wifi_stream_enabled = false;
+#endif
 
     bool usb_connected = false;
     if (USB_WAIT_TIMEOUT_MS > 0) {
@@ -1186,7 +1247,9 @@ int main(void) {
     while (true) {
         tud_task();
         handle_console_input();
+#if ENABLE_WIFI_STREAMING
         wifi_queue_service();
+#endif
 
         if (capture_count == 0) {
             tight_loop_contents();
@@ -1234,11 +1297,14 @@ int main(void) {
         }
 
         const uint8_t* packet_data = (const uint8_t*)packet;
+        const uint8_t* payload_data = packet->payload;
 
+#if ENABLE_WIFI_STREAMING
         if (wifi_stream_enabled) {
             wifi_queue_push(packet, packet_bytes);
             wifi_queue_service();
         }
+#endif
 
         if (slot && slot->pending_outputs == 0) {
             capture_slot_release(slot);
@@ -1246,7 +1312,7 @@ int main(void) {
         }
 
         if (spi_stream_enabled) {
-            if (!spi_stream_block(packet_data, packet_bytes)) {
+    if (!spi_stream_block(payload_data, (size_t)bytes_to_send)) {
                 spi_failures++;
             }
             capture_slot_output_done(slot);

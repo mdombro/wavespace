@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC,
-Wi-Fi (UDP or TCP), or an SPI link driven by a Raspberry Pi master.
+Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC
+or an SPI link driven by a Raspberry Pi master.
 
 When talking to the device over USB this helper understands the interactive
 debug CLI that the firmware now exposes. It will automatically:
@@ -13,9 +13,8 @@ debug CLI that the firmware now exposes. It will automatically:
     * Optionally request a different PDM clock before capturing (via --clock).
     * Restore the previous CLI state when finished (unless --no-restore).
 
-In Wi-Fi mode the script simply listens for fixed-size UDP payloads from the
-Pico and writes them directly to the requested output file. Each block's
-metadata (block index, byte offset, end-of-block timestamp_us) is recorded in a CSV sidecar.
+Each block's metadata (block index, byte offset, end-of-block timestamp_us) is
+recorded in a CSV sidecar.
 """
 
 from __future__ import annotations
@@ -31,8 +30,6 @@ from pathlib import Path
 
 from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
-import socket
-
 try:
     import serial  # type: ignore
 except ImportError:  # pragma: no cover - dependency check only
@@ -47,13 +44,16 @@ except ImportError:  # pragma: no cover - dependency check only
 DEFAULT_BLOCK_BITS = 16384  # Two channels @ 8192 bits each by default
 DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # total payload bytes across all channels
 DEFAULT_TIMEOUT = 1.0
-DEFAULT_WIFI_PORT = 5000
 SPI_DEFAULT_DEVICE = "0.0"
-SPI_DEFAULT_SPEED_HZ = 8_000_000
+SPI_DEFAULT_SPEED_HZ = 3_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
+SPI_TRANSACTION_HEADER_STRUCT = struct.Struct("<III")
+SPI_TRANSACTION_HEADER_BYTES = SPI_TRANSACTION_HEADER_STRUCT.size
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
 SPI_STREAM_MAGIC = b"PDM1"
+SPI_STREAM_MAGIC_LE = SPI_STREAM_MAGIC[::-1]
+SPI_STREAM_MAGIC_LEN = len(SPI_STREAM_MAGIC)
 SPI_STREAM_MAGIC_LEN = len(SPI_STREAM_MAGIC)
 
 METADATA_STRUCT = struct.Struct(
@@ -589,107 +589,34 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
 
 
 
-class TcpStreamReader:
-    def __init__(self, conn: socket.socket, timeout: float) -> None:
-        self._conn = conn
-        self._conn.settimeout(None if timeout <= 0 else timeout)
+class SpiBlockReader:
+    """Read one full header+payload packet per transfer while reusing buffers for speed."""
 
-    def read(self, length: int) -> bytes:
-        buffer = bytearray()
-        while len(buffer) < length:
-            try:
-                chunk = self._conn.recv(length - len(buffer))
-            except socket.timeout as exc:
-                raise TimeoutError("Timed out waiting for data from the TCP stream") from exc
-            if not chunk:
-                raise TimeoutError("TCP connection closed by the Pico")
-            buffer.extend(chunk)
-        return bytes(buffer)
-
-
-class SpiStreamReader:
-    def __init__(self, device: "spidev.SpiDev", timeout: float) -> None:
+    def __init__(self, device: "spidev.SpiDev", packet_bytes: int, timeout: float) -> None:
         self._device = device
+        self._packet_bytes = packet_bytes
         self._timeout = timeout
+        self._supports_read = hasattr(device, "readbytes")
+        self._tx_template = [0] * packet_bytes if not self._supports_read else None
 
-    def read(self, length: int) -> bytes:
-        if length <= 0:
-            return b""
-        # Each xfer2() call asserts chip select for the duration of the transfer,
-        # so we must request a whole packet in one transaction to keep framing intact.
-        return bytes(self._device.xfer2([0] * length))
-
-
-class SpiPacketStream:
-    """Aggregate SPI transfers into framed packets using the per-block magic prefix."""
-
-    def __init__(self, reader: SpiStreamReader, payload_bytes: int, timeout: float) -> None:
-        self._reader = reader
-        self._payload_hint = payload_bytes
-        self._timeout = timeout
-        self._buffer = bytearray()
-        self._chunk_bytes = SPI_STREAM_MAGIC_LEN + METADATA_BYTES + max(1, payload_bytes)
-
-    def next_packet(self) -> Tuple[BlockMetadata, bytes]:
+    def read_packet(self) -> bytes:
         deadline = None if self._timeout <= 0 else time.monotonic() + self._timeout
         while True:
-            packet = self._try_extract_packet()
-            if packet is not None:
-                return packet
+            try:
+                if self._supports_read:
+                    data = self._device.readbytes(self._packet_bytes)
+                else:
+                    data = self._device.xfer2(self._tx_template)
+            except OSError as exc:
+                raise RuntimeError(f"SPI transfer failed: {exc}") from exc
+
+            if len(data) == self._packet_bytes:
+                return bytes(data)
+
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for data from the SPI stream")
-            self._buffer.extend(self._reader.read(self._chunk_bytes))
+                raise TimeoutError("Timed out waiting for a complete SPI packet from the Pico")
 
-    def _try_extract_packet(self) -> Optional[Tuple[BlockMetadata, bytes]]:
-        idx = self._buffer.find(SPI_STREAM_MAGIC)
-        if idx == -1:
-            # Retain only the tail so partial magic sequences survive to the next read.
-            keep = SPI_STREAM_MAGIC_LEN - 1
-            if keep > 0 and len(self._buffer) > keep:
-                del self._buffer[:-keep]
-            return None
-
-        if idx > 0:
-            del self._buffer[:idx]
-
-        if len(self._buffer) < SPI_STREAM_MAGIC_LEN + METADATA_BYTES:
-            return None
-
-        header_slice = self._buffer[
-            SPI_STREAM_MAGIC_LEN : SPI_STREAM_MAGIC_LEN + METADATA_BYTES
-        ]
-        (
-            block_index,
-            byte_offset,
-            timestamp_us,
-            bytes_per_channel,
-            channel_count,
-            trigger_index,
-            trigger_tail_high,
-            _,
-            _reserved2,
-        ) = METADATA_STRUCT.unpack(bytes(header_slice))
-
-        channels = max(1, channel_count)
-        payload_bytes = max(1, bytes_per_channel) * channels
-        total_len = SPI_STREAM_MAGIC_LEN + METADATA_BYTES + payload_bytes
-
-        if len(self._buffer) < total_len:
-            return None
-
-        packet_bytes = bytes(self._buffer[SPI_STREAM_MAGIC_LEN:total_len])
-
-        try:
-            metadata, payload_view = parse_block_packet(packet_bytes, self._payload_hint)
-        except ValueError:
-            # Drop this magic prefix and rescan.
-            del self._buffer[:SPI_STREAM_MAGIC_LEN]
-            return None
-
-        payload_bytes_out = bytes(payload_view)
-        del self._buffer[:total_len]
-        return metadata, payload_bytes_out
-
+            time.sleep(0.0002)
 
 def capture_stream_usb(
     port: str,
@@ -707,7 +634,6 @@ def capture_stream_usb(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = metadata_path_for(output_path)
-    packet_bytes = block_bytes + METADATA_BYTES
 
     serial_timeout = None if timeout <= 0 else timeout
     with (
@@ -806,226 +732,6 @@ def capture_stream_usb(
     )
 
 
-def capture_stream_wifi(
-    bind_host: str,
-    bind_port: int,
-    output_path: Path,
-    block_bytes: int,
-    blocks: Optional[int],
-    timeout: float,
-    *,
-    allow_host: Optional[str],
-    verbose: bool,
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path = metadata_path_for(output_path)
-    packet_bytes = block_bytes + METADATA_BYTES
-
-    with (
-        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock,
-        output_path.open("wb") as sink,
-        metadata_path.open("w", newline="") as metadata_file,
-    ):
-        metadata_writer = csv.writer(metadata_file)
-        metadata_writer.writerow(METADATA_HEADER)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_host, bind_port))
-        sock.settimeout(None if timeout <= 0 else timeout)
-
-        debug(f"[wifi] listening on {bind_host}:{bind_port}", verbose=verbose)
-        block_count = 0
-        dropped_blocks = 0
-        bytes_captured = 0
-        source_addr: Optional[Tuple[str, int]] = None
-        expected_block_index: Optional[int] = None
-        progress = ProgressReporter("wifi")
-
-        try:
-            while blocks is None or block_count < blocks:
-                try:
-                    data, addr = sock.recvfrom(65535)
-                except socket.timeout as exc:
-                    raise TimeoutError("Timed out waiting for UDP packets from the Pico") from exc
-
-                if allow_host and addr[0] != allow_host:
-                    debug(f"[wifi] ignoring packet from {addr[0]}:{addr[1]}", verbose=verbose)
-                    continue
-
-                if source_addr is None:
-                    source_addr = addr
-                    debug(f"[wifi] receiving from {addr[0]}:{addr[1]}", verbose=verbose)
-
-                if len(data) < METADATA_BYTES:
-                    debug("[wifi] packet shorter than metadata header; skipped", verbose=verbose)
-                    continue
-
-                try:
-                    metadata, payload = parse_block_packet(data, len(data) - METADATA_BYTES)
-                except ValueError as exc:
-                    debug(f"[wifi] malformed packet: {exc}", verbose=verbose)
-                    continue
-                if not metadata_is_plausible(metadata):
-                    debug(
-                        f"[wifi] discarded packet with incoherent metadata "
-                        f"(block_index={metadata.block_index}, byte_offset={metadata.byte_offset})",
-                        verbose=verbose,
-                    )
-                    continue
-
-                if expected_block_index is not None:
-                    if metadata.block_index < expected_block_index:
-                        debug(
-                            f"[wifi] non-monotonic block index {metadata.block_index} (expected {expected_block_index}), packet skipped",
-                            verbose=verbose,
-                        )
-                        continue
-                    if metadata.block_index > expected_block_index:
-                        dropped_blocks = emit_dropped_blocks(
-                            metadata_writer,
-                            expected_block_index,
-                            metadata.block_index,
-                            label="wifi",
-                            verbose=verbose,
-                        )
-                        progress.update(
-                            block_count,
-                            bytes_captured,
-                        )
-
-                expected_block_index = metadata.block_index + 1
-
-                sink.write(payload)
-                metadata_writer.writerow(
-                    [
-                        metadata.block_index,
-                        metadata.byte_offset,
-                        metadata.timestamp_us,
-                        metadata.payload_bytes_per_channel,
-                        metadata.channel_count,
-                        metadata.trigger_first_index,
-                        1 if metadata.trigger_tail_high else 0,
-                        0,
-                    ]
-                )
-                block_count += 1
-                bytes_captured += metadata.total_payload_bytes
-                progress.update(block_count, bytes_captured)
-
-        except KeyboardInterrupt:
-            debug("[wifi] capture interrupted by user", verbose=True)
-        finally:
-            sink.flush()
-            metadata_file.flush()
-
-    print(
-        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
-        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
-        file=sys.stderr,
-    )
-
-
-
-def capture_stream_wifi_tcp(
-    bind_host: str,
-    bind_port: int,
-    output_path: Path,
-    block_bytes: int,
-    blocks: Optional[int],
-    timeout: float,
-    *,
-    allow_host: Optional[str],
-    verbose: bool,
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path = metadata_path_for(output_path)
-    packet_bytes = block_bytes + METADATA_BYTES
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_host, bind_port))
-        sock.listen(1)
-        sock.settimeout(None if timeout <= 0 else timeout)
-        debug(f"[wifi-tcp] listening on {bind_host}:{bind_port}", verbose=verbose)
-
-        try:
-            conn, addr = sock.accept()
-        except socket.timeout as exc:
-            raise TimeoutError("Timed out waiting for TCP connection from the Pico") from exc
-
-        with conn:
-            client_host = addr[0]
-            if allow_host and client_host != allow_host:
-                raise RuntimeError(f"Unexpected TCP client {client_host}; expected {allow_host}.")
-
-            reader = TcpStreamReader(conn, timeout)
-            packet_source = PacketAligner(
-                read_chunk=reader.read,
-                packet_bytes=packet_bytes,
-                payload_bytes=block_bytes,
-                label="wifi-tcp",
-                verbose=verbose,
-            )
-            block_count = 0
-            dropped_blocks = 0
-            bytes_captured = 0
-            expected_block_index: Optional[int] = None
-            progress = ProgressReporter("wifi-tcp")
-
-            with output_path.open("wb") as sink, metadata_path.open("w", newline="") as metadata_file:
-                metadata_writer = csv.writer(metadata_file)
-                metadata_writer.writerow(METADATA_HEADER)
-
-                try:
-                    while blocks is None or block_count < blocks:
-                        payload_view, metadata = packet_source.next_packet()
-
-                        if expected_block_index is not None:
-                            if metadata.block_index < expected_block_index:
-                                debug(
-                                    f"[wifi-tcp] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
-                                    verbose=verbose,
-                                )
-                                continue
-                            if metadata.block_index > expected_block_index:
-                                dropped_blocks = emit_dropped_blocks(
-                                    metadata_writer,
-                                    expected_block_index,
-                                    metadata.block_index,
-                                    label="wifi-tcp",
-                                    verbose=verbose,
-                                )
-                                progress.update(block_count, bytes_captured)
-                        expected_block_index = metadata.block_index + 1
-
-                        sink.write(payload_view)
-                        metadata_writer.writerow(
-                            [
-                                metadata.block_index,
-                                metadata.byte_offset,
-                                metadata.timestamp_us,
-                                metadata.payload_bytes_per_channel,
-                                metadata.channel_count,
-                                metadata.trigger_first_index,
-                                1 if metadata.trigger_tail_high else 0,
-                                0,
-                            ]
-                        )
-                        block_count += 1
-                        bytes_captured += metadata.total_payload_bytes
-                        progress.update(block_count, bytes_captured)
-
-                except KeyboardInterrupt:
-                    debug("[wifi-tcp] capture interrupted by user", verbose=True)
-                finally:
-                    sink.flush()
-                    metadata_file.flush()
-
-    print(
-        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
-        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
-        file=sys.stderr,
-    )
-
 
 def capture_stream_spi(
     device_identifier: str,
@@ -1053,8 +759,6 @@ def capture_stream_spi(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = metadata_path_for(output_path)
-    packet_bytes = block_bytes + METADATA_BYTES
-
     cli_start_state: Optional[bool] = None
     spi_cli_toggled = False
     cli_timeout = None if timeout <= 0 else timeout
@@ -1089,65 +793,47 @@ def capture_stream_spi(
         spi.bits_per_word = 8
         debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
 
-        reader = SpiStreamReader(spi, timeout)
-        packet_stream = SpiPacketStream(reader, block_bytes, timeout)
+        reader = SpiBlockReader(
+            spi,
+            block_bytes + SPI_TRANSACTION_HEADER_BYTES,
+            timeout,
+        )
 
         block_count = 0
-        dropped_blocks = 0
         bytes_captured = 0
-        expected_block_index: Optional[int] = None
         progress = ProgressReporter("spi")
 
-        with output_path.open("wb") as sink, metadata_path.open("w", newline="") as metadata_file:
+        with (
+            output_path.open("wb") as sink,
+            metadata_path.open("w", newline="") as metadata_file,
+        ):
             metadata_writer = csv.writer(metadata_file)
-            metadata_writer.writerow(METADATA_HEADER)
+            metadata_writer.writerow(["transaction", "expected_bytes", "actual_bytes", "file_offset"])
+            file_offset = 0
 
             try:
                 while blocks is None or block_count < blocks:
-                    metadata, payload_bytes = packet_stream.next_packet()
-
-                    if not metadata_is_plausible(metadata):
-                        debug(
-                            f"[spi] received implausible block header "
-                            f"(block={metadata.block_index} offset={metadata.byte_offset} "
-                            f"bytes/ch={metadata.payload_bytes_per_channel} channels={metadata.channel_count})",
-                            verbose=verbose,
-                        )
+                    raw_packet = reader.read_packet()
+                    if len(raw_packet) < SPI_TRANSACTION_HEADER_BYTES:
+                        debug("[spi] packet shorter than header; skipping", verbose=verbose)
                         continue
 
-                    if expected_block_index is not None:
-                        if metadata.block_index < expected_block_index:
-                            debug(
-                                f"[spi] received out-of-order block {metadata.block_index} (expected {expected_block_index}), skipping",
-                                verbose=verbose,
-                            )
-                            continue
-                        if metadata.block_index > expected_block_index:
-                            dropped_blocks = emit_dropped_blocks(
-                                metadata_writer,
-                                expected_block_index,
-                                metadata.block_index,
-                                label="spi",
-                                verbose=verbose,
-                            )
-                            progress.update(block_count, bytes_captured)
-                    expected_block_index = metadata.block_index + 1
-
-                    sink.write(payload_bytes)
-                    metadata_writer.writerow(
-                        [
-                            metadata.block_index,
-                            metadata.byte_offset,
-                            metadata.timestamp_us,
-                            metadata.payload_bytes_per_channel,
-                            metadata.channel_count,
-                            metadata.trigger_first_index,
-                            1 if metadata.trigger_tail_high else 0,
-                            0,
-                        ]
+                    tx_index, expected_bytes, actual_bytes = SPI_TRANSACTION_HEADER_STRUCT.unpack(
+                        raw_packet[:SPI_TRANSACTION_HEADER_BYTES]
                     )
+                    payload = raw_packet[SPI_TRANSACTION_HEADER_BYTES:]
+
+                    expected = min(expected_bytes, len(payload))
+                    actual = min(actual_bytes, expected)
+
+                    current_offset = file_offset
+                    if actual > 0:
+                        sink.write(payload[:actual])
+                        file_offset += actual
+                        bytes_captured += actual
+
+                    metadata_writer.writerow([tx_index, expected_bytes, actual_bytes, current_offset])
                     block_count += 1
-                    bytes_captured += metadata.total_payload_bytes
                     progress.update(block_count, bytes_captured)
 
             except KeyboardInterrupt:
@@ -1172,13 +858,13 @@ def capture_stream_spi(
                 print(f"Warning: failed to restore SPI streaming state via CLI: {exc}", file=sys.stderr)
 
     print(
-        f"Captured {block_count} block(s) ({bytes_captured} payload bytes) to {output_path} "
-        f"(metadata -> {metadata_path}) Dropped {dropped_blocks} block(s).",
+        f"Captured {block_count} transaction(s) ({bytes_captured} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path}).",
         file=sys.stderr,
     )
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Capture raw PDM bitstream blocks (and their metadata) from the Pico over USB (CDC) or Wi-Fi (UDP/TCP)."
+        description="Capture raw PDM bitstream blocks (and their metadata) from the Pico over USB (CDC) or SPI."
     )
     parser.add_argument(
         "source",
@@ -1194,7 +880,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--transport",
-        choices=("usb", "wifi", "wifi-tcp", "spi"),
+        choices=("usb", "spi"),
         default="usb",
         help="Select the transport used by the Pico (default: usb).",
     )
@@ -1220,7 +906,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_TIMEOUT,
         help=(
             "I/O timeout in seconds (default: 1.0). Applies to serial reads for USB"
-            " and to socket operations for Wi-Fi transports."
+            " and to spidev transfers for SPI captures."
         ),
     )
     parser.add_argument(
@@ -1247,21 +933,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="(USB transports) Do not restore the previous CLI state after capture (binary streaming will remain enabled).",
     )
     parser.add_argument(
-        "--wifi-bind",
-        default="0.0.0.0",
-        help="Address to bind for Wi-Fi capture sockets (default: 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--wifi-port",
-        type=int,
-        default=DEFAULT_WIFI_PORT,
-        help=f"Port to listen on for Wi-Fi captures (default: {DEFAULT_WIFI_PORT}).",
-    )
-    parser.add_argument(
-        "--wifi-allow",
-        help="Restrict Wi-Fi capture to packets from a specific source IPv4 address.",
-    )
-    parser.add_argument(
         "--spi-device",
         default=SPI_DEFAULT_DEVICE,
         help="(SPI transport) Bus and device in <bus>.<device> form or /dev/spidevX.Y (default: 0.0).",
@@ -1270,14 +941,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--spi-speed-hz",
         type=int,
         default=SPI_DEFAULT_SPEED_HZ,
-        help=f"(SPI transport) SPI clock frequency in Hz (max {SPI_MAX_SPEED_HZ}).",
+        help=(
+            "(SPI transport) SPI clock frequency in Hz (max "
+            f"{SPI_MAX_SPEED_HZ}); default {SPI_DEFAULT_SPEED_HZ} (matches firmware's recommended clock)."
+        ),
     )
     parser.add_argument(
         "--spi-mode",
         type=int,
         choices=(0, 1, 2, 3),
-        default=0,
-        help="(SPI transport) SPI mode (CPOL/CPHA).",
+        default=3,
+        help="(SPI transport) SPI mode (CPOL/CPHA). Default 3 for compatibility with Pico SPI streaming.",
     )
     parser.add_argument(
         "--spi-cli-port",
@@ -1342,30 +1016,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except RuntimeError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
-        elif args.transport == "wifi-tcp":
-            if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
-                print(
-                    "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.",
-                    file=sys.stderr,
-                )
-
-            try:
-                capture_stream_wifi_tcp(
-                    args.wifi_bind,
-                    args.wifi_port,
-                    Path(args.output),
-                    args.block_bytes,
-                    args.blocks,
-                    args.timeout,
-                    allow_host=args.wifi_allow,
-                    verbose=args.verbose,
-                )
-            except TimeoutError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
-            except OSError as exc:
-                print(f"Socket error: {exc}", file=sys.stderr)
-                return 1
         elif args.transport == "spi":
             if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
                 print(
@@ -1392,30 +1042,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
             except (OSError, ValueError, RuntimeError) as exc:
                 print(f"SPI error: {exc}", file=sys.stderr)
-                return 1
-        else:
-            if args.clock is not None or args.keep_stats or args.keep_dumps or args.no_restore:
-                print(
-                    "Warning: --clock/--keep-stats/--keep-dumps/--no-restore are ignored for Wi-Fi captures.",
-                    file=sys.stderr,
-                )
-
-            try:
-                capture_stream_wifi(
-                    args.wifi_bind,
-                    args.wifi_port,
-                    Path(args.output),
-                    args.block_bytes,
-                    args.blocks,
-                    args.timeout,
-                    allow_host=args.wifi_allow,
-                    verbose=args.verbose,
-                )
-            except TimeoutError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
-            except OSError as exc:
-                print(f"Socket error: {exc}", file=sys.stderr)
                 return 1
     except KeyboardInterrupt:
         print("Capture cancelled by user", file=sys.stderr)
