@@ -85,7 +85,7 @@ typedef enum {
 #define SPI_STREAM_TX_PIN      11
 #define SPI_STREAM_RX_PIN      12
 #define SPI_STREAM_CS_PIN      13
-#define SPI_WRITE_TIMEOUT_US   5000
+#define SPI_WRITE_TIMEOUT_US   100000
 #define SPI_WRITE_BACKOFF_US   5
 #define SPI_STREAM_MAGIC       0x50444D31u  // 'PDM1' framing marker
 
@@ -943,12 +943,19 @@ static bool spi_slave_selected(void) {
     return gpio_get(SPI_STREAM_CS_PIN) == 0;
 }
 
+static void spi_log_failure(const char* reason, size_t offset) {
+    int cs = spi_slave_selected() ? 1 : 0;
+    int writable = spi_is_writable(SPI_STREAM_PORT) ? 1 : 0;
+    printf("SPI fail: %s (offset=%zu cs=%d writable=%d)\n", reason, offset, cs, writable);
+}
+
 static bool spi_write_bytes(const uint8_t* data, size_t length) {
     size_t offset = 0;
     absolute_time_t write_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
 
     while (offset < length) {
         if (!spi_slave_selected()) {
+            spi_log_failure("CS released mid-transfer", offset);
             return false;
         }
 
@@ -963,6 +970,7 @@ static bool spi_write_bytes(const uint8_t* data, size_t length) {
         tight_loop_contents();
 
         if (time_reached(write_deadline)) {
+            spi_log_failure("TX stalled waiting for FIFO space", offset);
             return false;
         }
 
@@ -989,7 +997,7 @@ static void initialise_spi_stream(void) {
 
     // baudrate argument is ignored when running in slave mode.
     spi_init(SPI_STREAM_PORT, 1000 * 1000);
-    spi_set_format(SPI_STREAM_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_format(SPI_STREAM_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
     spi_set_slave(SPI_STREAM_PORT, true);
     spi_drain_rx_fifo();
     spi_initialised = true;
@@ -1007,6 +1015,7 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
     absolute_time_t select_deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
     while (!spi_slave_selected()) {
         if (time_reached(select_deadline)) {
+            spi_log_failure("CS never asserted", 0);
             return false;
         }
         tight_loop_contents();
@@ -1018,10 +1027,12 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
     memcpy(magic_bytes, &magic, sizeof(magic_bytes));
 
     if (!spi_write_bytes(magic_bytes, sizeof(magic_bytes))) {
+        spi_log_failure("Failed while sending magic", 0);
         return false;
     }
 
     if (!spi_write_bytes(data, length)) {
+        spi_log_failure("Failed while sending payload", 0);
         return false;
     }
 
