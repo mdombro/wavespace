@@ -47,8 +47,9 @@ DEFAULT_TIMEOUT = 1.0
 SPI_DEFAULT_DEVICE = "0.0"
 SPI_DEFAULT_SPEED_HZ = 3_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
-SPI_TRANSACTION_HEADER_STRUCT = struct.Struct("<III")
+SPI_TRANSACTION_HEADER_STRUCT = struct.Struct("<II")
 SPI_TRANSACTION_HEADER_BYTES = SPI_TRANSACTION_HEADER_STRUCT.size
+SPI_TRANSACTION_CAPTURE_PAD_BYTES = 50
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
 SPI_STREAM_MAGIC = b"PDM1"
@@ -795,7 +796,7 @@ def capture_stream_spi(
 
         reader = SpiBlockReader(
             spi,
-            block_bytes + SPI_TRANSACTION_HEADER_BYTES,
+            block_bytes + SPI_TRANSACTION_HEADER_BYTES + SPI_TRANSACTION_CAPTURE_PAD_BYTES,
             timeout,
         )
 
@@ -818,13 +819,12 @@ def capture_stream_spi(
                         debug("[spi] packet shorter than header; skipping", verbose=verbose)
                         continue
 
-                    tx_index, expected_bytes, actual_bytes = SPI_TRANSACTION_HEADER_STRUCT.unpack(
+                    tx_index, expected_bytes = SPI_TRANSACTION_HEADER_STRUCT.unpack(
                         raw_packet[:SPI_TRANSACTION_HEADER_BYTES]
                     )
                     payload = raw_packet[SPI_TRANSACTION_HEADER_BYTES:]
 
-                    expected = min(expected_bytes, len(payload))
-                    actual = min(actual_bytes, expected)
+                    actual = min(expected_bytes, len(payload))
 
                     current_offset = file_offset
                     if actual > 0:
@@ -832,7 +832,7 @@ def capture_stream_spi(
                         file_offset += actual
                         bytes_captured += actual
 
-                    metadata_writer.writerow([tx_index, expected_bytes, actual_bytes, current_offset])
+                    metadata_writer.writerow([tx_index, expected_bytes, actual, current_offset])
                     block_count += 1
                     progress.update(block_count, bytes_captured)
 

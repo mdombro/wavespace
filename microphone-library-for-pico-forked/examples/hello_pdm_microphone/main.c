@@ -141,7 +141,6 @@ typedef struct {
 typedef struct {
     uint32_t transaction_index;
     uint32_t expected_bytes;
-    uint32_t actual_bytes;
 } spi_block_header_t;
 
 #define SPI_BLOCK_HEADER_BYTES ((size_t)sizeof(spi_block_header_t))
@@ -1082,7 +1081,6 @@ static bool spi_stream_block(const uint8_t* data, size_t length) {
     spi_block_header_t header = {
         .transaction_index = spi_transaction_index++,
         .expected_bytes = (uint32_t)length,
-        .actual_bytes = (uint32_t)length,
     };
 
     memcpy(spi_dma_buffer, &header, SPI_BLOCK_HEADER_BYTES);
