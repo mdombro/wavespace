@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    frame_bytes = frame_bytes * 123; // making the single shot transaction size much larger. Requires the bigger spidev buffer
+    frame_bytes = frame_bytes * 40; // making the single shot transaction size much larger. Requires the bigger spidev buffer
 
     if (!device_path || speed_hz == 0 || frame_bytes == 0) {
         usage(argv[0]);
