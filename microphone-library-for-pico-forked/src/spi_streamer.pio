@@ -1,0 +1,53 @@
+/*
+ * SPI slave streamer for high-speed PDM transfers.
+ *
+ * This program watches chip-select (CS) and waits for clock edges on SCK.
+ * Data is shifted out on falling edges (SPI mode 3) so that it is stable
+ * before the master samples on the subsequent rising edge.
+ */
+
+.program spi_streamer
+.wrap_target
+wait_cs_low:
+    jmp pin wait_cs_low    ; Spin until CS is asserted (active-low).
+bitloop:
+    wait 0 pin 0           ; Wait for SCK to fall (idle high in mode 3).
+    out pins, 1            ; Present the next bit on MISO.
+    wait 1 pin 0           ; Hold the bit stable until SCK rises.
+    jmp pin wait_cs_low    ; Abort the frame if CS deasserts mid-byte.
+    jmp bitloop
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+
+static inline void spi_streamer_program_init(
+    PIO pio,
+    uint sm,
+    uint offset,
+    uint clk_pin,
+    uint miso_pin,
+    uint cs_pin
+) {
+    pio_sm_config c = spi_streamer_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, clk_pin);
+    sm_config_set_jmp_pin(&c, cs_pin);
+    sm_config_set_out_pins(&c, miso_pin, 1);
+    sm_config_set_set_pins(&c, miso_pin, 1);
+    sm_config_set_clkdiv(&c, 1.0f);
+    sm_config_set_out_shift(&c, false, true, 8);  // MSB-first, autopull on 8 bits.
+
+    pio_sm_set_consecutive_pindirs(pio, sm, miso_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, clk_pin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, cs_pin, 1, false);
+
+    pio_gpio_init(pio, clk_pin);
+    pio_gpio_init(pio, miso_pin);
+    pio_gpio_init(pio, cs_pin);
+    gpio_pull_up(cs_pin);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

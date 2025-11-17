@@ -28,19 +28,17 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import BinaryIO, Callable, Iterable, List, Optional, Sequence, Set, Tuple
+import os
 import queue
+import shutil
+import subprocess
 import threading
 
 try:
     import serial  # type: ignore
 except ImportError:  # pragma: no cover - dependency check only
     serial = None  # type: ignore
-
-try:
-    import spidev  # type: ignore
-except ImportError:  # pragma: no cover - dependency check only
-    spidev = None  # type: ignore
 
 
 DEFAULT_BLOCK_BITS = 16384  # Two channels @ 8192 bits each by default
@@ -154,6 +152,25 @@ class SpiFrame:
 
 def metadata_path_for(data_path: Path) -> Path:
     return data_path.with_name(data_path.name + ".metadata.csv")
+
+
+def resolve_spi_helper(explicit_path: Optional[str] = None) -> str:
+    candidates = [explicit_path]
+    script_dir = Path(__file__).resolve().parent
+    candidates.append(str(script_dir / "spi_capture_helper"))
+    candidates.append(shutil.which("spi_capture_helper"))
+
+    for path in candidates:
+        if not path:
+            continue
+        helper = Path(path)
+        if helper.exists() and os.access(helper, os.X_OK):
+            return str(helper)
+
+    raise RuntimeError(
+        "spi_capture_helper binary not found. Compile data-capture/spi_capture_helper.c "
+        "with `gcc -O2 -o spi_capture_helper data-capture/spi_capture_helper.c` and rerun."
+    )
 
 
 def parse_spi_device_identifier(identifier: str) -> Tuple[int, int]:
@@ -617,36 +634,6 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
             raise TimeoutError("Timed out waiting for data from the device")
         buffer.extend(chunk)
     return bytes(buffer)
-
-
-def spi_read_bytes(device: "spidev.SpiDev", count: int) -> bytes:
-    try:
-        if hasattr(device, "readbytes"):
-            #t0 = time.perf_counter()
-            data = device.readbytes(count)
-            #t1 = time.perf_counter()
-            #print((t1-t0)*1e6)
-        else:
-            data = device.xfer2([0] * count)
-    except OSError as exc:  # pragma: no cover - hardware errors are runtime concerns
-        raise RuntimeError(f"SPI transfer failed: {exc}") from exc
-
-    if len(data) != count:
-        raise RuntimeError(f"Received {len(data)} byte(s) from SPI, expected {count}.")
-
-    return bytes(data)
-
-
-def spi_read_exact(device: "spidev.SpiDev", count: int) -> bytes:
-    buffer = bytearray()
-    while len(buffer) < count:
-        chunk = spi_read_bytes(device, count - len(buffer))
-        if not chunk:
-            raise RuntimeError("SPI read returned no data")
-        buffer.extend(chunk)
-    return bytes(buffer)
-
-
 def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
     crc = initial & 0xFFFF
     for value in data:
@@ -659,18 +646,28 @@ def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
     return crc
 
 
-class SpiReaderThread(threading.Thread):
-    """Continuously read SPI bytes and push fixed-size frames into a queue."""
+def read_exact_stream(stream: BinaryIO, length: int) -> bytes:
+    buffer = bytearray()
+    while len(buffer) < length:
+        chunk = stream.read(length - len(buffer))
+        if not chunk:
+            raise EOFError("stream closed unexpectedly")
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+class PipeFrameReader(threading.Thread):
+    """Continuously read fixed-size frames from a pipe/stream."""
 
     def __init__(
         self,
-        device: "spidev.SpiDev",
+        stream: BinaryIO,
         frame_bytes: int,
         output_queue: "queue.Queue[bytes]",
         stop_event: threading.Event,
     ) -> None:
         super().__init__(daemon=True)
-        self._device = device
+        self._stream = stream
         self._frame_bytes = frame_bytes
         self._queue = output_queue
         self._stop_event = stop_event
@@ -679,7 +676,7 @@ class SpiReaderThread(threading.Thread):
     def run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                frame = spi_read_exact(self._device, self._frame_bytes)
+                frame = read_exact_stream(self._stream, self._frame_bytes)
                 self._queue.put(frame)
         except BaseException as exc:  # pragma: no cover - background thread error path
             self.error = exc
@@ -862,9 +859,8 @@ def capture_stream_spi(
     cli_show_stats: bool,
     restore_cli_spi: bool,
     verbose: bool,
+
 ) -> None:
-    if spidev is None:
-        raise RuntimeError("spidev module not available. Install with `pip install spidev` on the Raspberry Pi host.")
 
     bus, dev = parse_spi_device_identifier(device_identifier or SPI_DEFAULT_DEVICE)
     if speed_hz <= 0:
@@ -897,31 +893,42 @@ def capture_stream_spi(
                 verbose=verbose,
             )
 
-    spi = spidev.SpiDev()
+    helper_path = resolve_spi_helper()
+    device_path = f"/dev/spidev{bus}.{dev}"
+    helper_cmd = [
+        helper_path,
+        "--device",
+        device_path,
+        "--speed",
+        str(spi_speed),
+        "--mode",
+        str(mode),
+        "--frame-bytes",
+        str(SPI_FRAME_BYTES),
+    ]
+    debug(f"[spi] launching helper: {' '.join(helper_cmd)}", verbose=verbose)
+    helper_proc = subprocess.Popen(
+        helper_cmd,
+        stdout=subprocess.PIPE,
+        stderr=None,
+    )
+    if helper_proc.stdout is None:
+        helper_proc.terminate()
+        raise RuntimeError("Failed to capture SPI helper stdout")
+
+    block_count = 0
+    bytes_captured = 0
+    progress = ProgressReporter("spi")
+
+    frame_queue: "queue.Queue[bytes]" = queue.Queue()
+    stop_event = threading.Event()
+    reader = PipeFrameReader(helper_proc.stdout, SPI_FRAME_BYTES, frame_queue, stop_event)
+    reader.start()
+    expected_bit_index: Optional[int] = None
+    dropped_frames = 0
+    gap_bits_total = 0
+
     try:
-        spi.open(bus, dev)
-        spi.max_speed_hz = spi_speed
-        spi.mode = mode
-        try:
-            spi.lsbfirst = False  # Ensure MSB-first transfers when supported.
-        except AttributeError:
-            pass
-        spi.bits_per_word = 8
-        debug(f"[spi] opened /dev/spidev{bus}.{dev} @ {spi.max_speed_hz} Hz (mode {mode})", verbose=verbose)
-
-        block_count = 0
-        bytes_captured = 0
-        progress = ProgressReporter("spi")
-        transaction_index = 0
-
-        frame_queue: "queue.Queue[bytes]" = queue.Queue()
-        stop_event = threading.Event()
-        reader = SpiReaderThread(spi, SPI_FRAME_BYTES, frame_queue, stop_event)
-        reader.start()
-        expected_bit_index: Optional[int] = None
-        dropped_frames = 0
-        gap_bits_total = 0
-
         with (
             output_path.open("wb") as sink,
             metadata_path.open("w", newline="") as metadata_file,
@@ -1002,7 +1009,7 @@ def capture_stream_spi(
                     if frame.start_bit_index > expected_bit_index:
                         gap_bits = frame.start_bit_index - expected_bit_index
                         gap_bits_total += gap_bits
-                        metadata_writer.writerow(
+                        metadata_buffer.append(
                             [
                                 "gap",
                                 "",
@@ -1021,6 +1028,9 @@ def capture_stream_spi(
                                 "missing_bits",
                             ]
                         )
+                        if len(metadata_buffer) >= SPI_METADATA_FLUSH_INTERVAL:
+                            metadata_writer.writerows(metadata_buffer)
+                            metadata_buffer.clear()
                         expected_bit_index = frame.start_bit_index
 
                     elif frame.start_bit_index < expected_bit_index and verbose:
@@ -1076,7 +1086,15 @@ def capture_stream_spi(
                 stop_event.set()
                 reader.join(timeout=1.0)
     finally:
-        spi.close()
+        stop_event.set()
+        if helper_proc.stdout:
+            helper_proc.stdout.close()
+        if helper_proc.poll() is None:
+            helper_proc.terminate()
+            try:
+                helper_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                helper_proc.kill()
         if cli_port and cli_show_stats:
             dump_cli_status_via_port(
                 cli_port,
@@ -1141,7 +1159,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_TIMEOUT,
         help=(
             "I/O timeout in seconds (default: 1.0). Applies to serial reads for USB"
-            " and to spidev transfers for SPI captures."
+            " and to the SPI helper process for SPI captures."
         ),
     )
     parser.add_argument(
