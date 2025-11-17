@@ -57,7 +57,7 @@ SPI_FRAME_BYTES = SPI_HEADER_BYTES + SPI_STREAM_PAYLOAD_BYTES + SPI_CRC_BYTES
 SPI_MAX_FRAME_PAYLOAD = 1 << 16
 SPI_FLAGS_OVERFLOW = 0x01
 SPI_FLAGS_UNDERRUN = 0x02
-SPI_METADATA_FLUSH_INTERVAL = 64
+SPI_METADATA_FLUSH_INTERVAL = 256
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
 
@@ -157,6 +157,7 @@ def metadata_path_for(data_path: Path) -> Path:
 def resolve_spi_helper(explicit_path: Optional[str] = None) -> str:
     candidates = [explicit_path]
     script_dir = Path(__file__).resolve().parent
+    candidates.append(str(script_dir / "spi_helper_wrapper.sh"))
     candidates.append(str(script_dir / "spi_capture_helper"))
     candidates.append(shutil.which("spi_capture_helper"))
 
@@ -955,6 +956,8 @@ def capture_stream_spi(
             )
 
             metadata_buffer: List[List[object]] = []
+            payload_buffer = bytearray()
+            payload_flush_bytes = SPI_FRAME_BYTES * 32
 
             try:
                 frame_timeout = timeout if timeout > 0 else None
@@ -967,6 +970,8 @@ def capture_stream_spi(
                     except queue.Empty:
                         raise TimeoutError("Timed out waiting for SPI frames")
                     pending.extend(raw_chunk)
+                    frame: Optional[SpiFrame] = None
+                    host_timestamp_us = 0
 
                     while True:
                         sync_index = pending.find(SPI_SYNC_WORD)
@@ -1012,6 +1017,11 @@ def capture_stream_spi(
                                 metadata_writer.writerows(metadata_buffer)
                                 metadata_buffer.clear()
                             continue
+                        break
+
+                    if frame is None:
+                        continue
+
                     if frame.version != 0 and verbose:
                         debug(f"[spi] unexpected frame version {frame.version}", verbose=True)
 
@@ -1057,10 +1067,14 @@ def capture_stream_spi(
                             verbose=True,
                         )
 
-                    file_offset = sink.tell() if frame.crc_ok and frame.payload_bytes > 0 else -1
+                    file_offset = -1
                     if frame.crc_ok and frame.payload_bytes > 0:
-                        sink.write(frame.payload)
+                        file_offset = len(payload_buffer) + sink.tell()
+                        payload_buffer.extend(frame.payload)
                         bytes_captured += frame.payload_bytes
+                        if len(payload_buffer) >= payload_flush_bytes:
+                            sink.write(payload_buffer)
+                            payload_buffer.clear()
                     else:
                         dropped_frames += 1
                         note = "crc_fail"
@@ -1099,6 +1113,9 @@ def capture_stream_spi(
                 if metadata_buffer:
                     metadata_writer.writerows(metadata_buffer)
                     metadata_buffer.clear()
+                if payload_buffer:
+                    sink.write(payload_buffer)
+                    payload_buffer.clear()
                 sink.flush()
                 metadata_file.flush()
                 stop_event.set()

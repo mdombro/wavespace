@@ -10,7 +10,8 @@
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "Usage: %s --device /dev/spidevX.Y --speed <Hz> --mode <0-3> --frame-bytes <N>\n",
+            "Usage: %s --device /dev/spidevX.Y --speed <Hz> --mode <0-3> --frame-bytes <N> "
+            "[--frames COUNT] [--output FILE]\n",
             prog);
 }
 
@@ -28,9 +29,11 @@ static void write_all(int fd, const uint8_t* data, size_t length) {
 
 int main(int argc, char** argv) {
     const char* device_path = NULL;
+    const char* output_path = NULL;
     uint32_t speed_hz = 0;
     uint8_t mode = SPI_MODE_3;
     size_t frame_bytes = 0;
+    long frames_to_capture = -1;  // negative => infinite
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) {
@@ -41,6 +44,10 @@ int main(int argc, char** argv) {
             mode = (uint8_t)strtoul(argv[++i], NULL, 0);
         } else if (!strcmp(argv[i], "--frame-bytes") && i + 1 < argc) {
             frame_bytes = (size_t)strtoul(argv[++i], NULL, 0);
+        } else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
+            frames_to_capture = strtol(argv[++i], NULL, 0);
+        } else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+            output_path = argv[++i];
         } else {
             usage(argv[0]);
             return EXIT_FAILURE;
@@ -81,7 +88,17 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    while (1) {
+    int out_fd = STDOUT_FILENO;
+    if (output_path) {
+        out_fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out_fd < 0) {
+            perror("open output");
+            return EXIT_FAILURE;
+        }
+    }
+
+    long frames_sent = 0;
+    while (frames_to_capture < 0 || frames_sent < frames_to_capture) {
         struct spi_ioc_transfer transfer = {
             .tx_buf = (unsigned long)tx_buffer,
             .rx_buf = (unsigned long)rx_buffer,
@@ -97,7 +114,8 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        write_all(STDOUT_FILENO, rx_buffer, frame_bytes);
+        write_all(out_fd, rx_buffer, frame_bytes);
+        frames_sent++;
     }
 
     return EXIT_SUCCESS;
