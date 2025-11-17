@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    frame_bytes = frame_bytes * 123; // making the single shot transaction size much larger. Requires the bigger spidev buffer
+
     if (!device_path || speed_hz == 0 || frame_bytes == 0) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -98,12 +100,11 @@ int main(int argc, char** argv) {
     }
 
     long frames_sent = 0;
-    size_t byte_transfer = frame_bytes * 123;
     while (frames_to_capture < 0 || frames_sent < frames_to_capture) {
         struct spi_ioc_transfer transfer = {
             .tx_buf = (unsigned long)tx_buffer,
             .rx_buf = (unsigned long)rx_buffer,
-            .len = byte_transfer,
+            .len = frame_bytes,
             .speed_hz = speed_hz,
             .bits_per_word = bits_per_word,
             .cs_change = 0,
@@ -115,7 +116,7 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        write_all(out_fd, rx_buffer, byte_transfer);
+        write_all(out_fd, rx_buffer, frame_bytes);
         frames_sent++;
     }
 
