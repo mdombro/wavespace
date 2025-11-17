@@ -12,6 +12,12 @@ And for bitstream capture it doesn't need to have that many options passed in
 To run the capture, process, visualize loop, run the scripts in this order:
 Re-run capture_raw_pdm.py → stream_filter_pdm.py → make_sample_points.py and launch pyvista-viz.py against the regenerated point_*.npz files. The visualization still sees one scalar stream, but it’s now the sum of both microphones (see _process_chunk in stream_filter if you want to change how the channels are combined).
 
+./spi_helper_wrapper.sh --device /dev/spidev0.0 --speed 30000000 --mode 3 \
+    --frame-bytes 530 --frames 20000 --output raw_frames.bin
+
+gcc -O2 -Wall -o data-capture/spi_capture_helper data-capture/spi_capture_helper.c
+
+
 ## Developer Environment Setup
 
 ### Python workspace

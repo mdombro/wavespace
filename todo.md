@@ -10,7 +10,8 @@ We are less worried about how long after gantry signal fires to pico starting a 
 - Path planning to map indices to positions
 
 
-
+4096 bytes
+Buffer size limits By default, spidev can handle up to 4096 bytes in a single transfer. You can increase this limit to a maximum of 65536 bytes by appending spidev. bufsiz=65536 to the single line of parameters in /boot/firmware/cmdline. txt .
 
 
 Optimizations:
