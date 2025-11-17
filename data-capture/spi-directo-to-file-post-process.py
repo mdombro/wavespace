@@ -73,53 +73,90 @@ def process_dump(raw_path, output_path):
             "file_offset","host_timestamp_us","gap_bits","notes"
         ])
 
+        buffer = bytearray()
+        eof = False
+        sync_len = len(SPI_SYNC_WORD)
         while True:
-            frame_bytes = raw.read(SPI_FRAME_BYTES)
-            if not frame_bytes:
-                break
-            if len(frame_bytes) < SPI_FRAME_BYTES:
-                print("Warning: trailing partial frame ignored", file=sys.stderr)
-                break
+            if not eof and len(buffer) < SPI_FRAME_BYTES:
+                chunk = raw.read(SPI_FRAME_BYTES * 4)
+                if chunk:
+                    buffer.extend(chunk)
+                else:
+                    eof = True
 
-            try:
-                frame = parse_frame(frame_bytes)
-            except ValueError as exc:
-                writer.writerow(["gap", block_index, expected_bit_index or -1,
-                                 SPI_PAYLOAD_BYTES * 8, SPI_PAYLOAD_BYTES, "0x00", 0,
-                                 "0x00",0,0,0,-1,0,SPI_PAYLOAD_BYTES*8,f"parse_error:{exc}"])
-                continue
+            made_progress = False
+            while len(buffer) >= SPI_FRAME_BYTES:
+                made_progress = True
+                frame_bytes = bytes(buffer[:SPI_FRAME_BYTES])
 
-            if not frame["crc_ok"]:
-                writer.writerow(["gap", block_index, expected_bit_index or -1,
-                                 SPI_PAYLOAD_BYTES * 8, SPI_PAYLOAD_BYTES,
-                                 f"0x{frame['channel_mask']:02X}", bin(frame["channel_mask"]).count("1"),
-                                 f"0x{frame['flags']:02X}",
-                                 1 if frame["flags"] & SPI_FLAGS_OVERFLOW else 0,
-                                 1 if frame["flags"] & SPI_FLAGS_UNDERRUN else 0,
-                                 0, -1, 0, SPI_PAYLOAD_BYTES * 8, "crc_fail"])
+                try:
+                    frame = parse_frame(frame_bytes)
+                except ValueError as exc:
+                    writer.writerow([
+                        "gap", block_index,
+                        expected_bit_index if expected_bit_index is not None else -1,
+                        SPI_PAYLOAD_BYTES * 8, SPI_PAYLOAD_BYTES, "0x00", 0,
+                        "0x00", 0, 0, 0, -1, 0, SPI_PAYLOAD_BYTES * 8,
+                        f"parse_error:{exc}"
+                    ])
+
+                    next_sync = buffer.find(SPI_SYNC_WORD, 1)
+                    if next_sync > 0:
+                        del buffer[:next_sync]
+                        continue
+
+                    keep = min(len(buffer), sync_len - 1)
+                    if keep:
+                        buffer = buffer[-keep:]
+                    else:
+                        buffer.clear()
+                    break
+
+                del buffer[:SPI_FRAME_BYTES]
+
+                if not frame["crc_ok"]:
+                    writer.writerow([
+                        "gap", block_index,
+                        expected_bit_index if expected_bit_index is not None else -1,
+                        SPI_PAYLOAD_BYTES * 8, SPI_PAYLOAD_BYTES,
+                        f"0x{frame['channel_mask']:02X}", bin(frame["channel_mask"]).count("1"),
+                        f"0x{frame['flags']:02X}",
+                        1 if frame["flags"] & SPI_FLAGS_OVERFLOW else 0,
+                        1 if frame["flags"] & SPI_FLAGS_UNDERRUN else 0,
+                        0, -1, 0, SPI_PAYLOAD_BYTES * 8, "crc_fail"
+                    ])
+                    block_index += 1
+                    continue
+
+                if expected_bit_index is not None and frame["start_bit_index"] > expected_bit_index:
+                    gap_bits = frame["start_bit_index"] - expected_bit_index
+                    gap_bits_total += gap_bits
+                    writer.writerow([
+                        "gap", block_index, expected_bit_index, gap_bits, gap_bits // 8,
+                        "0x00", 0, "0x00", 0, 0, 0, -1, 0, gap_bits, "missing_bits"
+                    ])
+
+                expected_bit_index = frame["start_bit_index"] + SPI_PAYLOAD_BYTES * 8
+                sink.write(frame["payload"])
+                bytes_captured += SPI_PAYLOAD_BYTES
+
+                channel_count = bin(frame["channel_mask"]).count("1")
+                writer.writerow([
+                    "frame", block_index, frame["start_bit_index"], SPI_PAYLOAD_BYTES * 8,
+                    SPI_PAYLOAD_BYTES, f"0x{frame['channel_mask']:02X}", channel_count,
+                    f"0x{frame['flags']:02X}",
+                    1 if frame["flags"] & SPI_FLAGS_OVERFLOW else 0,
+                    1 if frame["flags"] & SPI_FLAGS_UNDERRUN else 0,
+                    1, bytes_captured - SPI_PAYLOAD_BYTES, 0, 0, ""
+                ])
                 block_index += 1
+
+            if eof:
+                if buffer:
+                    print("Warning: trailing partial frame ignored", file=sys.stderr)
+                break
+            if not made_progress:
                 continue
-
-            if expected_bit_index is not None and frame["start_bit_index"] > expected_bit_index:
-                gap_bits = frame["start_bit_index"] - expected_bit_index
-                gap_bits_total += gap_bits
-                writer.writerow(["gap", block_index, expected_bit_index, gap_bits, gap_bits // 8,
-                                 "0x00",0,"0x00",0,0,0,-1,0,gap_bits,"missing_bits"])
-
-            expected_bit_index = frame["start_bit_index"] + SPI_PAYLOAD_BYTES * 8
-            sink.write(frame["payload"])
-            bytes_captured += SPI_PAYLOAD_BYTES
-
-            channel_count = bin(frame["channel_mask"]).count("1")
-            writer.writerow([
-                "frame", block_index, frame["start_bit_index"], SPI_PAYLOAD_BYTES * 8,
-                SPI_PAYLOAD_BYTES, f"0x{frame['channel_mask']:02X}", channel_count,
-                f"0x{frame['flags']:02X}",
-                1 if frame["flags"] & SPI_FLAGS_OVERFLOW else 0,
-                1 if frame["flags"] & SPI_FLAGS_UNDERRUN else 0,
-                1, bytes_captured - SPI_PAYLOAD_BYTES, 0, 0, ""
-            ])
-            block_index += 1
 
     print(f"Processed {block_index} frames ({bytes_captured} bytes). Gaps: {gap_bits_total} bits.")
 

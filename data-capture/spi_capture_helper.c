@@ -83,8 +83,9 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    uint8_t* tx_buffer = calloc(frame_bytes, sizeof(uint8_t));
-    uint8_t* rx_buffer = malloc(frame_bytes);
+    const size_t transfer_bytes = frame_bytes;
+    uint8_t* tx_buffer = calloc(transfer_bytes, sizeof(uint8_t));
+    uint8_t* rx_buffer = malloc(transfer_bytes);
     if (!tx_buffer || !rx_buffer) {
         fprintf(stderr, "Failed to allocate SPI buffers\n");
         return EXIT_FAILURE;
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
         struct spi_ioc_transfer transfer = {
             .tx_buf = (unsigned long)tx_buffer,
             .rx_buf = (unsigned long)rx_buffer,
-            .len = frame_bytes,
+            .len = transfer_bytes,
             .speed_hz = speed_hz,
             .bits_per_word = bits_per_word,
             .cs_change = 0,
@@ -116,7 +117,15 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        write_all(out_fd, rx_buffer, frame_bytes);
+        if (ret != (int)transfer_bytes) {
+            fprintf(stderr,
+                    "short SPI transfer: requested %zu bytes, received %d bytes\n",
+                    transfer_bytes,
+                    ret);
+            return EXIT_FAILURE;
+        }
+
+        write_all(out_fd, rx_buffer, transfer_bytes);
         frames_sent++;
     }
 
