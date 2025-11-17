@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
         struct spi_ioc_transfer transfer = {
             .tx_buf = (unsigned long)tx_buffer,
             .rx_buf = (unsigned long)rx_buffer,
-            .len = frame_bytes,
+            .len = frame_bytes * 16,
             .speed_hz = speed_hz,
             .bits_per_word = bits_per_word,
             .cs_change = 0,

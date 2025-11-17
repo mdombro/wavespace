@@ -958,42 +958,60 @@ def capture_stream_spi(
 
             try:
                 frame_timeout = timeout if timeout > 0 else None
+                pending = bytearray()
                 while blocks is None or block_count < blocks:
                     if reader.error:
                         raise RuntimeError(f"SPI reader thread failed: {reader.error}")
                     try:
-                        raw_frame = frame_queue.get(timeout=frame_timeout)
+                        raw_chunk = frame_queue.get(timeout=frame_timeout)
                     except queue.Empty:
                         raise TimeoutError("Timed out waiting for SPI frames")
-                    host_timestamp_us = int(time.time() * 1_000_000)
-                    try:
-                        frame = parse_spi_frame_bytes(raw_frame, verbose=verbose)
-                    except ValueError as exc:
-                        dropped_frames += 1
-                        gap_bits_total += SPI_STREAM_PAYLOAD_BYTES * 8
-                        metadata_buffer.append(
-                            [
-                                "gap",
-                                "",
-                                expected_bit_index if expected_bit_index is not None else -1,
-                                SPI_STREAM_PAYLOAD_BYTES * 8,
-                                SPI_STREAM_PAYLOAD_BYTES,
-                                "0x00",
-                                0,
-                                "0x00",
-                                0,
-                                0,
-                                0,
-                                -1,
-                                host_timestamp_us,
-                                SPI_STREAM_PAYLOAD_BYTES * 8,
-                                f"parse_error:{exc}",
-                            ]
-                        )
-                        if len(metadata_buffer) >= SPI_METADATA_FLUSH_INTERVAL:
-                            metadata_writer.writerows(metadata_buffer)
-                            metadata_buffer.clear()
-                        continue
+                    pending.extend(raw_chunk)
+
+                    while True:
+                        sync_index = pending.find(SPI_SYNC_WORD)
+                        if sync_index < 0:
+                            # Keep only the last byte so we can catch a split sync word.
+                            if len(pending) > 1:
+                                del pending[:-1]
+                            break
+                        if sync_index > 0:
+                            del pending[:sync_index]
+                        if len(pending) < SPI_FRAME_BYTES:
+                            break
+
+                        frame_bytes = bytes(pending[:SPI_FRAME_BYTES])
+                        del pending[:SPI_FRAME_BYTES]
+                        host_timestamp_us = int(time.time() * 1_000_000)
+
+                        try:
+                            frame = parse_spi_frame_bytes(frame_bytes, verbose=verbose)
+                        except ValueError as exc:
+                            dropped_frames += 1
+                            gap_bits_total += SPI_STREAM_PAYLOAD_BYTES * 8
+                            metadata_buffer.append(
+                                [
+                                    "gap",
+                                    "",
+                                    expected_bit_index if expected_bit_index is not None else -1,
+                                    SPI_STREAM_PAYLOAD_BYTES * 8,
+                                    SPI_STREAM_PAYLOAD_BYTES,
+                                    "0x00",
+                                    0,
+                                    "0x00",
+                                    0,
+                                    0,
+                                    0,
+                                    -1,
+                                    host_timestamp_us,
+                                    SPI_STREAM_PAYLOAD_BYTES * 8,
+                                    f"parse_error:{exc}",
+                                ]
+                            )
+                            if len(metadata_buffer) >= SPI_METADATA_FLUSH_INTERVAL:
+                                metadata_writer.writerows(metadata_buffer)
+                                metadata_buffer.clear()
+                            continue
                     if frame.version != 0 and verbose:
                         debug(f"[spi] unexpected frame version {frame.version}", verbose=True)
 
