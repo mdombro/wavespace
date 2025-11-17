@@ -6,14 +6,13 @@
 
 #include "hardware/sync.h"
 #include "hardware/uart.h"
-#include "hardware/spi.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
-#include "hardware/dma.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/cyw43_arch.h"
 #include "pico/pdm_microphone.h"
+#include "pico/spi_streamer.h"
 #include "trigger_wave.pio.h"
 
 #define ENABLE_WIFI_STREAMING 0
@@ -83,13 +82,13 @@ typedef enum {
 #define SERIAL_WRITE_SPIN_MAX  500000
 #define SERIAL_WRITE_BACKOFF_US 5
 
-#define SPI_STREAM_PORT        spi1
+#define SPI_STREAM_PIO         pio1
+#define SPI_STREAM_STATE_MACHINE 0
 #define SPI_STREAM_SCK_PIN     10
-#define SPI_STREAM_TX_PIN      11
-#define SPI_STREAM_RX_PIN      12
+#define SPI_STREAM_TX_PIN      11  // MISO from Pico perspective.
+#define SPI_STREAM_RX_PIN      12  // MOSI (unused but reserved).
 #define SPI_STREAM_CS_PIN      13
-#define SPI_WRITE_TIMEOUT_US   250000
-#define SPI_WRITE_BACKOFF_US   5
+#define SPI_STREAM_PAYLOAD_BYTES 512
 
 #if ENABLE_WIFI_STREAMING
 #define WIFI_QUEUE_CAPACITY      64
@@ -137,9 +136,6 @@ typedef struct {
     capture_slot_state_t state;
     uint8_t pending_outputs;
 } capture_slot_t;
-
-#define SPI_READY_BYTES       ((size_t)sizeof(uint32_t))
-#define SPI_MAX_PAYLOAD_BYTES (PDM_BLOCK_PAYLOAD_BYTES * CAPTURE_RING_DEPTH)
 
 static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
 static volatile uint8_t capture_write_index = 0;
@@ -204,14 +200,8 @@ static uint32_t serial_failures = 0;
 
 static bool serial_initialised = false;
 static bool spi_initialised = false;
-static uint32_t spi_packets_sent = 0;
-static uint32_t spi_bytes_sent = 0;
 static uint32_t spi_failures = 0;
-static uint8_t spi_dma_buffer[SPI_MAX_PAYLOAD_BYTES];
-static uint8_t spi_ready_buffer[SPI_READY_BYTES];
-static int spi_dma_channel = -1;
-static dma_channel_config spi_dma_config;
-static bool spi_dma_configured = false;
+static spi_streamer_t spi_streamer_ctx;
 
 static struct pdm_microphone_config config = {
     .gpio_data = 2,
@@ -241,9 +231,6 @@ static void wifi_tcp_err_cb(void* arg, err_t err);
 static void initialise_uart_stream(void);
 static bool serial_stream_block(const uint8_t* data, size_t length);
 static void initialise_spi_stream(void);
-static bool spi_stream_block(const uint8_t* data, size_t length);
-static bool spi_slave_selected(void);
-static bool spi_write_bytes(const uint8_t* data, size_t length);
 static bool initialise_trigger_wave_generator(void);
 
 static inline void capture_slot_release(capture_slot_t* slot) {
@@ -267,21 +254,6 @@ static inline void capture_slot_output_done(capture_slot_t* slot) {
     }
 }
 
-static inline bool spi_exclusive_mode(void) {
-    if (!spi_stream_enabled) {
-        return false;
-    }
-    if (serial_stream_enabled || stream_binary_data) {
-        return false;
-    }
-#if ENABLE_WIFI_STREAMING
-    if (wifi_stream_enabled) {
-        return false;
-    }
-#endif
-    return true;
-}
-
 // Clear producer/consumer flags so the next DMA callback restarts cleanly.
 static void reset_capture_state(void) {
     uint32_t status = save_and_disable_interrupts();
@@ -300,6 +272,9 @@ static void reset_capture_state(void) {
 #if ENABLE_WIFI_STREAMING
     wifi_queue_clear();
 #endif
+    if (spi_initialised) {
+        spi_streamer_reset(&spi_streamer_ctx);
+    }
 }
 
 // Reconfigure the microphone library at runtime while preserving state trackers.
@@ -336,6 +311,10 @@ static bool restart_microphone(uint32_t new_rate) {
         success = false;
     } else {
         mic_running = true;
+        if (spi_initialised) {
+            spi_streamer_reset(&spi_streamer_ctx);
+            spi_streamer_set_bit_index(&spi_streamer_ctx, 0);
+        }
     }
 
     reset_capture_state();
@@ -478,6 +457,10 @@ static void print_stats(void) {
     const char* spi_state = spi_stream_enabled
         ? (spi_initialised ? "ON" : "init")
         : "OFF";
+    struct spi_streamer_stats spi_stats = {0};
+    if (spi_initialised) {
+        spi_stats = spi_streamer_get_stats(&spi_streamer_ctx);
+    }
 
     printf("Stats: ready=%lu streamed=%lu discarded=%lu overruns=%lu bytes=%lu stream=%s dump=%s pdm_clk=%luHz ",
            (unsigned long)blocks_ready,
@@ -502,12 +485,13 @@ static void print_stats(void) {
 #else
     printf("wifi=DISABLED ");
 #endif
-    printf("spi=%s pkt=%lu bytes=%lu err=%lu "
+    printf("spi=%s frames=%lu bytes=%llu drop=%lu err=%lu "
            "uart=%s pkt=%lu bytes=%lu err=%lu\n",
            spi_state,
-           (unsigned long)spi_packets_sent,
-           (unsigned long)spi_bytes_sent,
-           (unsigned long)spi_failures,
+           (unsigned long)spi_stats.frames_sent,
+           (unsigned long long)spi_stats.bytes_transmitted,
+           (unsigned long)spi_stats.frames_discarded,
+           (unsigned long)(spi_failures + spi_stats.underruns),
            serial_state,
            (unsigned long)serial_packets_sent,
            (unsigned long)serial_bytes_sent,
@@ -531,16 +515,29 @@ static void print_transport_status(void) {
 #else
     printf("Wi-Fi streaming DISABLED (compile-time)\n");
 #endif
+    struct spi_streamer_stats spi_stats = {0};
+    if (spi_initialised) {
+        spi_stats = spi_streamer_get_stats(&spi_streamer_ctx);
+    }
     printf("SPI streaming %s\n", spi_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", spi_initialised ? "YES" : "NO");
-    printf("  port/pins:   spi1 (SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
+    printf("  backend:     PIO%d SM%d (Mode 3, payload=%u bytes)\n",
+           SPI_STREAM_PIO == pio0 ? 0 : 1,
+           SPI_STREAM_STATE_MACHINE,
+           SPI_STREAM_PAYLOAD_BYTES);
+    printf("  pins:        SCK=GP%d TX=GP%d RX=GP%d CS=GP%d\n",
            SPI_STREAM_SCK_PIN,
            SPI_STREAM_TX_PIN,
            SPI_STREAM_RX_PIN,
            SPI_STREAM_CS_PIN);
-    printf("  packets:     %lu\n", (unsigned long)spi_packets_sent);
-    printf("  bytes:       %lu\n", (unsigned long)spi_bytes_sent);
-    printf("  failures:    %lu\n", (unsigned long)spi_failures);
+    printf("  frames:      %lu sent / %lu dropped\n",
+           (unsigned long)spi_stats.frames_sent,
+           (unsigned long)spi_stats.frames_discarded);
+    printf("  bytes:       %llu transmitted\n",
+           (unsigned long long)spi_stats.bytes_transmitted);
+    printf("  underruns:   %lu (failures=%lu)\n",
+           (unsigned long)spi_stats.underruns,
+           (unsigned long)spi_failures);
 
     printf("UART streaming %s\n", serial_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", serial_initialised ? "YES" : "NO");
@@ -569,9 +566,10 @@ static void clear_stats(void) {
     serial_packets_sent = 0;
     serial_bytes_sent = 0;
     serial_failures = 0;
-    spi_packets_sent = 0;
-    spi_bytes_sent = 0;
     spi_failures = 0;
+    if (spi_initialised) {
+        spi_streamer_clear_stats(&spi_streamer_ctx);
+    }
 }
 
 // Poll the USB CDC RX path for single-character debug commands.
@@ -632,11 +630,19 @@ static void handle_console_input(void) {
                 break;
             case 'p':
                 spi_stream_enabled = !spi_stream_enabled;
-                if (spi_stream_enabled && !spi_initialised) {
-                    initialise_spi_stream();
+                if (spi_stream_enabled) {
+                    if (!spi_initialised) {
+                        initialise_spi_stream();
+                    } else {
+                        spi_streamer_set_enabled(&spi_streamer_ctx, true);
+                    }
+                } else if (spi_initialised) {
+                    spi_streamer_set_enabled(&spi_streamer_ctx, false);
                 }
-                printf("SPI streaming %s (spi1 slave on SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
+                printf("SPI streaming %s (PIO%d SM%d, SCK=GP%d TX=GP%d RX=GP%d CS=GP%d)\n",
                        spi_stream_enabled ? "ENABLED" : "DISABLED",
+                       SPI_STREAM_PIO == pio0 ? 0 : 1,
+                       SPI_STREAM_STATE_MACHINE,
                        SPI_STREAM_SCK_PIN,
                        SPI_STREAM_TX_PIN,
                        SPI_STREAM_RX_PIN,
@@ -987,193 +993,29 @@ static bool serial_stream_block(const uint8_t* data, size_t length) {
     return true;
 }
 
-static void spi_drain_rx_fifo(void) {
-    while (spi_is_readable(SPI_STREAM_PORT)) {
-        (void)spi_get_hw(SPI_STREAM_PORT)->dr;
-    }
-}
-
-static bool spi_slave_selected(void) {
-    // CS is active-low; if it's high the Pi isn't clocking data out.
-    return gpio_get(SPI_STREAM_CS_PIN) == 0;
-}
-
-static void spi_log_failure(const char* reason, size_t offset) {
-    int cs = spi_slave_selected() ? 1 : 0;
-    int writable = spi_is_writable(SPI_STREAM_PORT) ? 1 : 0;
-    printf("SPI fail: %s (offset=%zu cs=%d writable=%d)\n", reason, offset, cs, writable);
-}
-
-static bool spi_write_bytes(const uint8_t* data, size_t length) {
-    if (length == 0) {
-        return true;
-    }
-
-    if (spi_dma_channel < 0 || !spi_dma_configured) {
-        spi_log_failure("DMA channel not initialised", 0);
-        return false;
-    }
-
-    dma_channel_configure(
-        spi_dma_channel,
-        &spi_dma_config,
-        &spi_get_hw(SPI_STREAM_PORT)->dr,
-        data,
-        length,
-        true
-    );
-
-    absolute_time_t deadline = make_timeout_time_us(SPI_WRITE_TIMEOUT_US);
-    while (dma_channel_is_busy(spi_dma_channel)) {
-        if (time_reached(deadline)) {
-            dma_channel_abort(spi_dma_channel);
-            spi_log_failure("DMA timeout waiting for host clock", length);
-            return false;
-        }
-        tight_loop_contents();
-    }
-
-    spi_drain_rx_fifo();
-    return true;
-}
-
 static void initialise_spi_stream(void) {
     if (spi_initialised) {
         return;
     }
+    struct spi_streamer_config stream_cfg = {
+        .pio = SPI_STREAM_PIO,
+        .sm = SPI_STREAM_STATE_MACHINE,
+        .gpio_sck = SPI_STREAM_SCK_PIN,
+        .gpio_mosi = SPI_STREAM_RX_PIN,
+        .gpio_miso = SPI_STREAM_TX_PIN,
+        .gpio_cs = SPI_STREAM_CS_PIN,
+        .payload_bytes = SPI_STREAM_PAYLOAD_BYTES,
+        .channel_count = config.channels,
+        .channel_mask = 0,
+    };
 
-    gpio_init(SPI_STREAM_SCK_PIN);
-    gpio_set_function(SPI_STREAM_SCK_PIN, GPIO_FUNC_SPI);
-    gpio_init(SPI_STREAM_TX_PIN);
-    gpio_set_function(SPI_STREAM_TX_PIN, GPIO_FUNC_SPI);
-    gpio_init(SPI_STREAM_RX_PIN);
-    gpio_set_function(SPI_STREAM_RX_PIN, GPIO_FUNC_SPI);
-    gpio_init(SPI_STREAM_CS_PIN);
-    gpio_set_function(SPI_STREAM_CS_PIN, GPIO_FUNC_SPI);
-    gpio_pull_up(SPI_STREAM_CS_PIN);
-
-    // baudrate argument is ignored when running in slave mode.
-    spi_init(SPI_STREAM_PORT, 1000 * 1000);
-    spi_set_format(SPI_STREAM_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
-    spi_set_slave(SPI_STREAM_PORT, true);
-    spi_drain_rx_fifo();
-    if (spi_dma_channel < 0) {
-        spi_dma_channel = dma_claim_unused_channel(true);
+    if (!spi_streamer_init(&spi_streamer_ctx, &stream_cfg)) {
+        printf("Failed to initialise SPI streamer\n");
+        return;
     }
-    spi_dma_config = dma_channel_get_default_config(spi_dma_channel);
-    channel_config_set_transfer_data_size(&spi_dma_config, DMA_SIZE_8);
-    channel_config_set_read_increment(&spi_dma_config, true);
-    channel_config_set_write_increment(&spi_dma_config, false);
-    channel_config_set_dreq(
-        &spi_dma_config,
-        spi_get_index(SPI_STREAM_PORT) == 0 ? DREQ_SPI0_TX : DREQ_SPI1_TX
-    );
-    channel_config_set_irq_quiet(&spi_dma_config, true);
-    spi_dma_configured = true;
+
+    spi_streamer_set_enabled(&spi_streamer_ctx, spi_stream_enabled);
     spi_initialised = true;
-}
-
-static bool spi_stream_block(const uint8_t* data, size_t length) {
-    if (!spi_stream_enabled || length == 0) {
-        return false;
-    }
-
-    if (!spi_initialised) {
-        initialise_spi_stream();
-    }
-
-    capture_slot_t* extra_slots[CAPTURE_RING_DEPTH];
-    uint16_t extra_lengths[CAPTURE_RING_DEPTH];
-    size_t extra_count = 0;
-    size_t total_bytes = length;
-    bool extras_claimed = false;
-    uint8_t original_read_index = 0;
-    uint8_t original_capture_count = 0;
-
-    if (spi_exclusive_mode()) {
-        uint32_t status = save_and_disable_interrupts();
-        uint8_t index = capture_read_index;
-        uint8_t count = capture_count;
-        original_read_index = capture_read_index;
-        original_capture_count = capture_count;
-        while (count > 0 && extra_count < CAPTURE_RING_DEPTH) {
-            capture_slot_t* candidate = &capture_ring[index];
-            if (candidate->state != CAPTURE_SLOT_READY || candidate->length == 0) {
-                break;
-            }
-            if ((total_bytes + candidate->length) > sizeof(spi_dma_buffer)) {
-                break;
-            }
-            candidate->state = CAPTURE_SLOT_SENDING;
-            candidate->pending_outputs = 1;
-            extra_slots[extra_count] = candidate;
-            extra_lengths[extra_count] = candidate->length;
-            total_bytes += candidate->length;
-            index = (uint8_t)((index + 1) % CAPTURE_RING_DEPTH);
-            extra_count++;
-            count--;
-        }
-        if (extra_count > 0) {
-            capture_read_index = index;
-            capture_count = count;
-            extras_claimed = true;
-        }
-        restore_interrupts(status);
-    }
-
-    bool success = false;
-    size_t extras_sent = 0;
-
-    if (total_bytes > sizeof(spi_dma_buffer)) {
-        spi_log_failure("SPI payload larger than DMA buffer", total_bytes);
-        goto cleanup;
-    }
-
-    size_t offset = 0;
-    memcpy(spi_dma_buffer + offset, data, length);
-    offset += length;
-
-    for (size_t i = 0; i < extra_count; i++) {
-        memcpy(spi_dma_buffer + offset, extra_slots[i]->packet.payload, extra_lengths[i]);
-        offset += extra_lengths[i];
-    }
-
-    uint32_t ready_bytes = (uint32_t)total_bytes;
-    memcpy(spi_ready_buffer, &ready_bytes, SPI_READY_BYTES);
-
-    if (!spi_write_bytes(spi_ready_buffer, SPI_READY_BYTES)) {
-        spi_log_failure("Failed while sending SPI ready length", 0);
-        goto cleanup;
-    }
-
-    if (!spi_write_bytes(spi_dma_buffer, total_bytes)) {
-        spi_log_failure("Failed while sending SPI payload", 0);
-        goto cleanup;
-    }
-
-    for (size_t i = 0; i < extra_count; i++) {
-        capture_slot_output_done(extra_slots[i]);
-        extras_sent++;
-    }
-
-    spi_packets_sent++;
-    spi_bytes_sent += (uint32_t)(total_bytes + SPI_READY_BYTES);
-    success = true;
-
-cleanup:
-    if (!success) {
-        for (size_t i = extras_sent; i < extra_count; i++) {
-            extra_slots[i]->state = CAPTURE_SLOT_READY;
-            extra_slots[i]->pending_outputs = 0;
-        }
-        if (extras_claimed) {
-            uint32_t status = save_and_disable_interrupts();
-            capture_read_index = original_read_index;
-            capture_count = original_capture_count;
-            restore_interrupts(status);
-        }
-    }
-    return success;
 }
 
 static bool initialise_trigger_wave_generator(void) {
@@ -1328,6 +1170,9 @@ int main(void) {
 #if ENABLE_WIFI_STREAMING
         wifi_queue_service();
 #endif
+        if (spi_initialised) {
+            spi_streamer_task(&spi_streamer_ctx);
+        }
 
         if (capture_count == 0) {
             tight_loop_contents();
@@ -1390,7 +1235,10 @@ int main(void) {
         }
 
         if (spi_stream_enabled) {
-    if (!spi_stream_block(payload_data, (size_t)bytes_to_send)) {
+            if (!spi_initialised) {
+                initialise_spi_stream();
+            }
+            if (!spi_initialised || !spi_streamer_push_block(&spi_streamer_ctx, payload_data, (size_t)bytes_to_send)) {
                 spi_failures++;
             }
             capture_slot_output_done(slot);

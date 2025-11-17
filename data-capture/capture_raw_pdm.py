@@ -2,7 +2,7 @@
 
 """
 Capture raw PDM bitstream blocks (plus metadata) from the Pico over USB CDC
-or an SPI link driven by a Raspberry Pi master.
+or the high-speed framed SPI stream driven by a Raspberry Pi master.
 
 When talking to the device over USB this helper understands the interactive
 debug CLI that the firmware now exposes. It will automatically:
@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
+import queue
+import threading
 
 try:
     import serial  # type: ignore
@@ -45,11 +47,19 @@ DEFAULT_BLOCK_BITS = 16384  # Two channels @ 8192 bits each by default
 DEFAULT_BLOCK_BYTES = DEFAULT_BLOCK_BITS // 8  # total payload bytes across all channels
 DEFAULT_TIMEOUT = 1.0
 SPI_DEFAULT_DEVICE = "0.0"
-SPI_DEFAULT_SPEED_HZ = 3_000_000
+SPI_DEFAULT_SPEED_HZ = 20_000_000
 SPI_MAX_SPEED_HZ = 62_000_000
-SPI_READY_STRUCT = struct.Struct("<I")
-SPI_READY_BYTES = SPI_READY_STRUCT.size
-SPI_READY_MULTIPLIER = 16
+SPI_SYNC_WORD = b"\xA5\x5A"
+SPI_HEADER_STRUCT = struct.Struct("<2B B B Q B B H")
+SPI_HEADER_BYTES = SPI_HEADER_STRUCT.size
+SPI_HEADER_PAYLOAD_LEN = SPI_HEADER_BYTES - 2  # bytes covered by header_length field
+SPI_CRC_BYTES = 2
+SPI_STREAM_PAYLOAD_BYTES = 512
+SPI_FRAME_BYTES = SPI_HEADER_BYTES + SPI_STREAM_PAYLOAD_BYTES + SPI_CRC_BYTES
+SPI_MAX_FRAME_PAYLOAD = 1 << 16
+SPI_FLAGS_OVERFLOW = 0x01
+SPI_FLAGS_UNDERRUN = 0x02
+SPI_METADATA_FLUSH_INTERVAL = 64
 CLI_READ_WINDOW = 1.0
 MAX_CHANNELS_PLAUSIBLE = 8
 
@@ -115,6 +125,31 @@ class BlockMetadata:
     @property
     def total_payload_bytes(self) -> int:
         return self.payload_bytes_per_channel * max(1, self.channel_count)
+
+
+@dataclass
+class SpiFrame:
+    """Represents a framed SPI payload emitted by the Pico streamer."""
+    version: int
+    header_length: int
+    start_bit_index: int
+    flags: int
+    channel_mask: int
+    payload: bytes
+    crc_ok: bool
+
+    @property
+    def payload_bytes(self) -> int:
+        return len(self.payload)
+
+    @property
+    def payload_bits(self) -> int:
+        return self.payload_bytes * 8
+
+    @property
+    def channel_count(self) -> int:
+        count = bin(self.channel_mask).count("1")
+        return count if count > 0 else 1
 
 
 def metadata_path_for(data_path: Path) -> Path:
@@ -584,12 +619,13 @@ def read_exact(device: serial.Serial, length: int) -> bytes:
     return bytes(buffer)
 
 
-
-
 def spi_read_bytes(device: "spidev.SpiDev", count: int) -> bytes:
     try:
         if hasattr(device, "readbytes"):
+            #t0 = time.perf_counter()
             data = device.readbytes(count)
+            #t1 = time.perf_counter()
+            #print((t1-t0)*1e6)
         else:
             data = device.xfer2([0] * count)
     except OSError as exc:  # pragma: no cover - hardware errors are runtime concerns
@@ -601,37 +637,101 @@ def spi_read_bytes(device: "spidev.SpiDev", count: int) -> bytes:
     return bytes(data)
 
 
-def spi_read_ready_bytes(
-    device: "spidev.SpiDev",
-    timeout: float,
-    max_ready_bytes: int,
-    *,
-    verbose: bool,
-) -> int:
-    deadline = None if timeout <= 0 else time.monotonic() + timeout
-    max_ready_bytes = max(1, max_ready_bytes)
-    while True:
-        ready_raw = spi_read_bytes(device, SPI_READY_BYTES)
-        ready_bytes = SPI_READY_STRUCT.unpack(ready_raw)[0]
-        if 0 < ready_bytes <= max_ready_bytes:
-            return ready_bytes
-
-        if ready_bytes > max_ready_bytes:
-            debug(
-                f"[spi] ignoring implausible ready-byte count {ready_bytes} (max {max_ready_bytes})",
-                verbose=verbose,
-            )
-
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for SPI ready bytes from the Pico")
-
-        time.sleep(0.0002)
+def spi_read_exact(device: "spidev.SpiDev", count: int) -> bytes:
+    buffer = bytearray()
+    while len(buffer) < count:
+        chunk = spi_read_bytes(device, count - len(buffer))
+        if not chunk:
+            raise RuntimeError("SPI read returned no data")
+        buffer.extend(chunk)
+    return bytes(buffer)
 
 
-def spi_read_payload(device: "spidev.SpiDev", length: int) -> bytes:
-    if length <= 0:
-        return b""
-    return spi_read_bytes(device, length)
+def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
+    crc = initial & 0xFFFF
+    for value in data:
+        crc ^= value << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+class SpiReaderThread(threading.Thread):
+    """Continuously read SPI bytes and push fixed-size frames into a queue."""
+
+    def __init__(
+        self,
+        device: "spidev.SpiDev",
+        frame_bytes: int,
+        output_queue: "queue.Queue[bytes]",
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self._device = device
+        self._frame_bytes = frame_bytes
+        self._queue = output_queue
+        self._stop_event = stop_event
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                frame = spi_read_exact(self._device, self._frame_bytes)
+                self._queue.put(frame)
+        except BaseException as exc:  # pragma: no cover - background thread error path
+            self.error = exc
+            self._stop_event.set()
+
+
+def parse_spi_frame_bytes(buffer: bytes, *, verbose: bool) -> SpiFrame:
+    if len(buffer) < SPI_HEADER_BYTES + SPI_CRC_BYTES:
+        raise ValueError("SPI frame shorter than minimum header size")
+
+    (
+        sync0,
+        sync1,
+        version,
+        header_len,
+        start_bit_index,
+        flags,
+        channel_mask,
+        payload_len,
+    ) = SPI_HEADER_STRUCT.unpack_from(buffer, 0)
+
+    if sync0 != SPI_SYNC_WORD[0] or sync1 != SPI_SYNC_WORD[1]:
+        raise ValueError("SPI sync word mismatch")
+
+    if header_len != SPI_HEADER_PAYLOAD_LEN and verbose:
+        debug(
+            f"[spi] unexpected header length {header_len} (expected {SPI_HEADER_PAYLOAD_LEN})",
+            verbose=True,
+        )
+
+    if payload_len < 0 or payload_len > SPI_MAX_FRAME_PAYLOAD:
+        raise ValueError(f"Invalid payload length {payload_len}")
+
+    expected_len = SPI_HEADER_BYTES + payload_len + SPI_CRC_BYTES
+    if len(buffer) != expected_len:
+        raise ValueError(f"SPI frame length mismatch (expected {expected_len}, got {len(buffer)})")
+
+    payload = buffer[SPI_HEADER_BYTES:SPI_HEADER_BYTES + payload_len]
+    crc_expected = struct.unpack_from("<H", buffer, SPI_HEADER_BYTES + payload_len)[0]
+    crc_region_len = header_len + payload_len
+    crc_region = buffer[2:2 + crc_region_len]
+    crc_actual = crc16_ccitt(crc_region)
+
+    return SpiFrame(
+        version=version,
+        header_length=header_len,
+        start_bit_index=start_bit_index,
+        flags=flags,
+        channel_mask=channel_mask,
+        payload=payload,
+        crc_ok=(crc_actual == crc_expected),
+    )
 
 
 def capture_stream_usb(
@@ -814,43 +914,167 @@ def capture_stream_spi(
         progress = ProgressReporter("spi")
         transaction_index = 0
 
+        frame_queue: "queue.Queue[bytes]" = queue.Queue()
+        stop_event = threading.Event()
+        reader = SpiReaderThread(spi, SPI_FRAME_BYTES, frame_queue, stop_event)
+        reader.start()
+        expected_bit_index: Optional[int] = None
+        dropped_frames = 0
+        gap_bits_total = 0
+
         with (
             output_path.open("wb") as sink,
             metadata_path.open("w", newline="") as metadata_file,
         ):
             metadata_writer = csv.writer(metadata_file)
-            metadata_writer.writerow(["transaction", "ready_bytes", "actual_bytes", "file_offset", "timestamp_us"])
-            file_offset = 0
+            metadata_writer.writerow(
+                [
+                    "record_type",
+                    "sequence",
+                    "start_bit_index",
+                    "payload_bits",
+                    "payload_bytes",
+                    "channel_mask",
+                    "channel_count",
+                    "flags",
+                    "overflow",
+                    "underrun",
+                    "crc_ok",
+                    "file_offset",
+                    "host_timestamp_us",
+                    "gap_bits",
+                    "notes",
+                ]
+            )
+
+            metadata_buffer: List[List[object]] = []
 
             try:
-                max_ready_bytes = max(block_bytes, block_bytes * SPI_READY_MULTIPLIER)
+                frame_timeout = timeout if timeout > 0 else None
                 while blocks is None or block_count < blocks:
-                    ready_bytes = spi_read_ready_bytes(
-                        spi,
-                        timeout,
-                        max_ready_bytes,
-                        verbose=verbose,
+                    if reader.error:
+                        raise RuntimeError(f"SPI reader thread failed: {reader.error}")
+                    try:
+                        raw_frame = frame_queue.get(timeout=frame_timeout)
+                    except queue.Empty:
+                        raise TimeoutError("Timed out waiting for SPI frames")
+                    host_timestamp_us = int(time.time() * 1_000_000)
+                    try:
+                        frame = parse_spi_frame_bytes(raw_frame, verbose=verbose)
+                    except ValueError as exc:
+                        dropped_frames += 1
+                        gap_bits_total += SPI_STREAM_PAYLOAD_BYTES * 8
+                        metadata_buffer.append(
+                            [
+                                "gap",
+                                "",
+                                expected_bit_index if expected_bit_index is not None else -1,
+                                SPI_STREAM_PAYLOAD_BYTES * 8,
+                                SPI_STREAM_PAYLOAD_BYTES,
+                                "0x00",
+                                0,
+                                "0x00",
+                                0,
+                                0,
+                                0,
+                                -1,
+                                host_timestamp_us,
+                                SPI_STREAM_PAYLOAD_BYTES * 8,
+                                f"parse_error:{exc}",
+                            ]
+                        )
+                        if len(metadata_buffer) >= SPI_METADATA_FLUSH_INTERVAL:
+                            metadata_writer.writerows(metadata_buffer)
+                            metadata_buffer.clear()
+                        continue
+                    if frame.version != 0 and verbose:
+                        debug(f"[spi] unexpected frame version {frame.version}", verbose=True)
+
+                    payload_bits = frame.payload_bits
+                    channel_count = max(1, frame.channel_count)
+                    overflow_flag = 1 if (frame.flags & SPI_FLAGS_OVERFLOW) else 0
+                    underrun_flag = 1 if (frame.flags & SPI_FLAGS_UNDERRUN) else 0
+                    note = ""
+
+                    if expected_bit_index is None:
+                        expected_bit_index = frame.start_bit_index
+
+                    if frame.start_bit_index > expected_bit_index:
+                        gap_bits = frame.start_bit_index - expected_bit_index
+                        gap_bits_total += gap_bits
+                        metadata_writer.writerow(
+                            [
+                                "gap",
+                                "",
+                                expected_bit_index,
+                                gap_bits,
+                                gap_bits // 8,
+                                "0x00",
+                                0,
+                                "0x00",
+                                0,
+                                0,
+                                0,
+                                -1,
+                                host_timestamp_us,
+                                gap_bits,
+                                "missing_bits",
+                            ]
+                        )
+                        expected_bit_index = frame.start_bit_index
+
+                    elif frame.start_bit_index < expected_bit_index and verbose:
+                        debug(
+                            f"[spi] non-monotonic bit index: got {frame.start_bit_index}, expected {expected_bit_index}",
+                            verbose=True,
+                        )
+
+                    file_offset = sink.tell() if frame.crc_ok and frame.payload_bytes > 0 else -1
+                    if frame.crc_ok and frame.payload_bytes > 0:
+                        sink.write(frame.payload)
+                        bytes_captured += frame.payload_bytes
+                    else:
+                        dropped_frames += 1
+                        note = "crc_fail"
+
+                    metadata_buffer.append(
+                        [
+                            "frame",
+                            block_count,
+                            frame.start_bit_index,
+                            payload_bits,
+                            frame.payload_bytes,
+                            f"0x{frame.channel_mask:02X}",
+                            channel_count,
+                            f"0x{frame.flags:02X}",
+                            overflow_flag,
+                            underrun_flag,
+                            1 if frame.crc_ok else 0,
+                            file_offset,
+                            host_timestamp_us,
+                            0,
+                            note,
+                        ]
                     )
-                    timestamp_us = int(time.time() * 1_000_000)
-                    payload = spi_read_payload(spi, ready_bytes)
-                    actual = len(payload)
-                    current_offset = file_offset
 
-                    if actual > 0:
-                        sink.write(payload)
-                        file_offset += actual
-                        bytes_captured += actual
+                    if len(metadata_buffer) >= SPI_METADATA_FLUSH_INTERVAL:
+                        metadata_writer.writerows(metadata_buffer)
+                        metadata_buffer.clear()
 
-                    metadata_writer.writerow([transaction_index, ready_bytes, actual, current_offset, timestamp_us])
                     block_count += 1
-                    transaction_index += 1
+                    expected_bit_index = frame.start_bit_index + payload_bits
                     progress.update(block_count, bytes_captured)
 
             except KeyboardInterrupt:
                 debug("[spi] capture interrupted by user", verbose=True)
             finally:
+                if metadata_buffer:
+                    metadata_writer.writerows(metadata_buffer)
+                    metadata_buffer.clear()
                 sink.flush()
                 metadata_file.flush()
+                stop_event.set()
+                reader.join(timeout=1.0)
     finally:
         spi.close()
         if cli_port and cli_show_stats:
@@ -868,8 +1092,8 @@ def capture_stream_spi(
                 print(f"Warning: failed to restore SPI streaming state via CLI: {exc}", file=sys.stderr)
 
     print(
-        f"Captured {block_count} transaction(s) ({bytes_captured} payload bytes) to {output_path} "
-        f"(metadata -> {metadata_path}).",
+        f"Captured {block_count} frame(s) ({bytes_captured} payload bytes) to {output_path} "
+        f"(metadata -> {metadata_path}). Dropped/corrupted frames: {dropped_frames}, gap bits: {gap_bits_total}.",
         file=sys.stderr,
     )
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -901,7 +1125,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_BLOCK_BYTES,
         help=(
             "Number of payload bytes per block before metadata (default: "
-            f"{DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits)."
+            f"{DEFAULT_BLOCK_BYTES}, matching {DEFAULT_BLOCK_BITS} PDM bits). "
+            "For SPI captures this only influences the streaming chunk size."
         ),
     )
     parser.add_argument(
