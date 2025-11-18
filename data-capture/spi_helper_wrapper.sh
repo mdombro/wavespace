@@ -22,7 +22,25 @@ RT_PRIO="${SPI_HELPER_RT_PRIO:-80}"
 # Nice adjustment (negative values raise priority).
 NICE_LEVEL="${SPI_HELPER_NICE:- -10}"
 
-exec taskset --cpu-list "${CPU_LIST}" \
+start_time=$(date +%s.%N)
+
+set +e
+taskset --cpu-list "${CPU_LIST}" \
     chrt --fifo "${RT_PRIO}" \
     nice -n "${NICE_LEVEL}" \
     "${HELPER}" "$@"
+status=$?
+set -e
+
+end_time=$(date +%s.%N)
+elapsed=$(python3 - <<'PY' "$start_time" "$end_time"
+import sys
+start = float(sys.argv[1])
+end = float(sys.argv[2])
+print(f"{end - start:.3f}")
+PY
+)
+
+printf 'spi_capture_helper runtime: %s seconds\n' "$elapsed" >&2
+
+exit $status
