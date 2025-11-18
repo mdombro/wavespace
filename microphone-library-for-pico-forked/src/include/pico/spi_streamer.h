@@ -48,6 +48,9 @@ struct spi_streamer_stats {
     uint64_t bytes_enqueued;
     uint64_t bytes_transmitted;
     uint64_t last_frame_start_bit;
+    uint64_t task_interval_total_us;
+    uint32_t task_interval_samples;
+    uint32_t task_interval_last_us;
 };
 
 struct spi_streamer_frame {
@@ -74,6 +77,7 @@ typedef struct spi_streamer {
     size_t partial_bytes;
     uint64_t partial_start_bit_index;
     uint64_t bit_index;
+    uint64_t last_task_time_us;
     struct spi_streamer_stats stats;
 } spi_streamer_t;
 

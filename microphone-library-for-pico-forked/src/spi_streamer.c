@@ -4,6 +4,7 @@
 
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
+#include "pico/time.h"
 #include "spi_streamer.pio.h"
 
 #define SPI_STREAMER_HEADER_BYTES  (sizeof(struct spi_streamer_frame_header))
@@ -82,6 +83,7 @@ static void spi_streamer_reset_state(spi_streamer_t* ctx) {
     ctx->partial_start_bit_index = ctx->bit_index;
     ctx->sticky_flags = 0;
     ctx->abort_pending = false;
+    ctx->last_task_time_us = 0;
 
     pio_sm_set_enabled(ctx->config.pio, ctx->config.sm, false);
     pio_sm_clear_fifos(ctx->config.pio, ctx->config.sm);
@@ -370,6 +372,7 @@ void spi_streamer_clear_stats(spi_streamer_t* ctx) {
         return;
     }
     memset(&ctx->stats, 0, sizeof(ctx->stats));
+    ctx->last_task_time_us = 0;
 }
 
 struct spi_streamer_stats spi_streamer_get_stats(const spi_streamer_t* ctx) {

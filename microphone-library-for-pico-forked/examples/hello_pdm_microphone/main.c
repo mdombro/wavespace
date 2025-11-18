@@ -485,13 +485,23 @@ static void print_stats(void) {
 #else
     printf("wifi=DISABLED ");
 #endif
-    printf("spi=%s frames=%lu bytes=%llu drop=%lu err=%lu "
+    uint32_t spi_task_avg_us = spi_stats.task_interval_samples
+        ? (uint32_t)(spi_stats.task_interval_total_us / spi_stats.task_interval_samples)
+        : 0u;
+
+    printf("spi=%s built=%lu sent=%lu drop=%lu overflow=%lu underrun=%lu last_bit=%llu bytes=%llu "
+           "task_last=%luus task_avg=%luus "
            "uart=%s pkt=%lu bytes=%lu err=%lu\n",
            spi_state,
+           (unsigned long)spi_stats.frames_built,
            (unsigned long)spi_stats.frames_sent,
-           (unsigned long long)spi_stats.bytes_transmitted,
            (unsigned long)spi_stats.frames_discarded,
-           (unsigned long)(spi_failures + spi_stats.underruns),
+           (unsigned long)spi_stats.queue_overflows,
+           (unsigned long)spi_stats.underruns,
+           (unsigned long long)spi_stats.last_frame_start_bit,
+           (unsigned long long)spi_stats.bytes_transmitted,
+           (unsigned long)spi_stats.task_interval_last_us,
+           (unsigned long)spi_task_avg_us,
            serial_state,
            (unsigned long)serial_packets_sent,
            (unsigned long)serial_bytes_sent,
@@ -530,14 +540,27 @@ static void print_transport_status(void) {
            SPI_STREAM_TX_PIN,
            SPI_STREAM_RX_PIN,
            SPI_STREAM_CS_PIN);
-    printf("  frames:      %lu sent / %lu dropped\n",
+    printf("  frames:      %lu built / %lu sent / %lu dropped\n",
+           (unsigned long)spi_stats.frames_built,
            (unsigned long)spi_stats.frames_sent,
            (unsigned long)spi_stats.frames_discarded);
-    printf("  bytes:       %llu transmitted\n",
+    printf("  queue:       %lu overflow events\n",
+           (unsigned long)spi_stats.queue_overflows);
+    printf("  bytes:       %llu enqueued / %llu transmitted\n",
+           (unsigned long long)spi_stats.bytes_enqueued,
            (unsigned long long)spi_stats.bytes_transmitted);
     printf("  underruns:   %lu (failures=%lu)\n",
            (unsigned long)spi_stats.underruns,
            (unsigned long)spi_failures);
+    uint32_t spi_task_avg_us = spi_stats.task_interval_samples
+        ? (uint32_t)(spi_stats.task_interval_total_us / spi_stats.task_interval_samples)
+        : 0u;
+    printf("  task loop:   last=%lu us avg=%lu us (%lu samples)\n",
+           (unsigned long)spi_stats.task_interval_last_us,
+           (unsigned long)spi_task_avg_us,
+           (unsigned long)spi_stats.task_interval_samples);
+    printf("  last frame:  start_bit=%llu\n",
+           (unsigned long long)spi_stats.last_frame_start_bit);
 
     printf("UART streaming %s\n", serial_stream_enabled ? "ENABLED" : "DISABLED");
     printf("  initialised: %s\n", serial_initialised ? "YES" : "NO");
