@@ -83,6 +83,8 @@ static void spi_streamer_reset_state(spi_streamer_t* ctx) {
     ctx->partial_start_bit_index = ctx->bit_index;
     ctx->sticky_flags = 0;
     ctx->abort_pending = false;
+    ctx->build_frame_index = -1;
+    ctx->dropping_frame = false;
     ctx->last_task_time_us = 0;
 
     pio_sm_set_enabled(ctx->config.pio, ctx->config.sm, false);
@@ -92,15 +94,12 @@ static void spi_streamer_reset_state(spi_streamer_t* ctx) {
     pio_sm_set_enabled(ctx->config.pio, ctx->config.sm, true);
 }
 
-static bool spi_streamer_queue_frame(spi_streamer_t* ctx) {
-    if (ctx->frame_count >= SPI_STREAMER_FRAME_QUEUE_DEPTH) {
-        ctx->stats.frames_discarded++;
-        ctx->stats.queue_overflows++;
-        ctx->sticky_flags |= SPI_STREAMER_FLAG_OVERFLOW;
+static bool spi_streamer_finalize_frame(spi_streamer_t* ctx) {
+    if (ctx->build_frame_index < 0) {
         return false;
     }
 
-    struct spi_streamer_frame* frame = &ctx->queue[ctx->frame_write_index];
+    struct spi_streamer_frame* frame = &ctx->queue[ctx->build_frame_index];
     struct spi_streamer_frame_header header = {
         .sync0 = SPI_STREAMER_SYNC_WORD0,
         .sync1 = SPI_STREAMER_SYNC_WORD1,
@@ -115,7 +114,6 @@ static bool spi_streamer_queue_frame(spi_streamer_t* ctx) {
     ctx->sticky_flags = 0;
 
     memcpy(frame->buffer, &header, sizeof(header));
-    memcpy(frame->buffer + sizeof(header), ctx->partial_payload, ctx->config.payload_bytes);
 
     size_t crc_region_len = (SPI_STREAMER_HEADER_BYTES - 2u) + ctx->config.payload_bytes;
     uint16_t crc = spi_streamer_crc16(frame->buffer + 2u, crc_region_len);
@@ -129,7 +127,7 @@ static bool spi_streamer_queue_frame(spi_streamer_t* ctx) {
     ctx->stats.frames_built++;
     ctx->stats.bytes_enqueued += frame->length;
     ctx->stats.last_frame_start_bit = header.start_bit_index;
-
+    ctx->build_frame_index = -1;
     return true;
 }
 
@@ -150,6 +148,7 @@ bool spi_streamer_init(spi_streamer_t* ctx, const struct spi_streamer_config* co
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->config = *config;
+    ctx->build_frame_index = -1;
     if (ctx->config.payload_bytes == 0 || ctx->config.payload_bytes > SPI_STREAMER_MAX_PAYLOAD_BYTES) {
         ctx->config.payload_bytes = SPI_STREAMER_MAX_PAYLOAD_BYTES;
     }
@@ -281,23 +280,43 @@ bool spi_streamer_push_block(spi_streamer_t* ctx, const uint8_t* data, size_t le
     while (offset < length) {
         if (ctx->partial_bytes == 0) {
             ctx->partial_start_bit_index = ctx->bit_index;
+            ctx->dropping_frame = false;
+            ctx->build_frame_index = -1;
+            if (ctx->frame_count < SPI_STREAMER_FRAME_QUEUE_DEPTH) {
+                ctx->build_frame_index = ctx->frame_write_index;
+            } else {
+                ctx->dropping_frame = true;
+                ctx->stats.queue_overflows++;
+                ctx->sticky_flags |= SPI_STREAMER_FLAG_OVERFLOW;
+                success = false;
+            }
         }
 
         size_t remaining = length - offset;
         size_t room = ctx->config.payload_bytes - ctx->partial_bytes;
         size_t chunk = remaining < room ? remaining : room;
 
-        memcpy(ctx->partial_payload + ctx->partial_bytes, data + offset, chunk);
+        if (!ctx->dropping_frame && ctx->build_frame_index >= 0) {
+            struct spi_streamer_frame* frame = &ctx->queue[ctx->build_frame_index];
+            uint8_t* payload_base = frame->buffer + SPI_STREAMER_HEADER_BYTES;
+            memcpy(payload_base + ctx->partial_bytes, data + offset, chunk);
+        }
 
         ctx->partial_bytes += chunk;
         ctx->bit_index += (uint64_t)chunk * 8u;
         offset += chunk;
 
         if (ctx->partial_bytes == ctx->config.payload_bytes) {
-            if (!spi_streamer_queue_frame(ctx)) {
-                success = false;
+            if (!ctx->dropping_frame && ctx->build_frame_index >= 0) {
+                if (!spi_streamer_finalize_frame(ctx)) {
+                    success = false;
+                }
+            } else {
+                ctx->stats.frames_discarded++;
             }
             ctx->partial_bytes = 0;
+            ctx->build_frame_index = -1;
+            ctx->dropping_frame = false;
         }
     }
 

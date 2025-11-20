@@ -73,10 +73,11 @@ typedef struct spi_streamer {
     bool enabled;
     volatile bool abort_pending;
     uint8_t sticky_flags;
-    uint8_t partial_payload[SPI_STREAMER_MAX_PAYLOAD_BYTES];
     size_t partial_bytes;
     uint64_t partial_start_bit_index;
     uint64_t bit_index;
+    int build_frame_index;
+    bool dropping_frame;
     uint64_t last_task_time_us;
     struct spi_streamer_stats stats;
 } spi_streamer_t;

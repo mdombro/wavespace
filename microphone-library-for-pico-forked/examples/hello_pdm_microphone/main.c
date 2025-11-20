@@ -132,16 +132,44 @@ typedef enum {
 
 typedef struct {
     pdm_block_packet_t packet;
+    const uint8_t* dma_payload;
+    uint8_t buffer_handle;
     uint16_t length;
     capture_slot_state_t state;
     uint8_t pending_outputs;
+    bool has_copy;
 } capture_slot_t;
 
 static capture_slot_t capture_ring[CAPTURE_RING_DEPTH];
 static volatile uint8_t capture_write_index = 0;
 static volatile uint8_t capture_read_index = 0;
 static volatile uint8_t capture_count = 0;
-static pdm_block_packet_t discard_packet;
+
+static inline const uint8_t* capture_slot_payload_ptr(const capture_slot_t* slot) {
+    if (!slot) {
+        return NULL;
+    }
+    return slot->dma_payload ? slot->dma_payload : slot->packet.payload;
+}
+
+static inline void capture_slot_release_dma(capture_slot_t* slot) {
+    if (!slot || !slot->dma_payload) {
+        return;
+    }
+    pdm_microphone_release_buffer(slot->buffer_handle);
+    slot->dma_payload = NULL;
+}
+
+static inline void capture_slot_ensure_copy(capture_slot_t* slot) {
+    if (!slot || slot->has_copy) {
+        return;
+    }
+    if (slot->length > 0 && slot->dma_payload) {
+        memcpy(slot->packet.payload, slot->dma_payload, slot->length);
+    }
+    slot->has_copy = true;
+    capture_slot_release_dma(slot);
+}
 
 // Debug/telemetry counters surfaced through the CLI stats.
 static volatile uint32_t blocks_ready = 0;
@@ -237,9 +265,12 @@ static inline void capture_slot_release(capture_slot_t* slot) {
     if (!slot) {
         return;
     }
+    capture_slot_release_dma(slot);
+    slot->buffer_handle = 0;
     slot->length = 0;
     slot->state = CAPTURE_SLOT_FREE;
     slot->pending_outputs = 0;
+    slot->has_copy = false;
 }
 
 static inline void capture_slot_output_done(capture_slot_t* slot) {
@@ -261,9 +292,7 @@ static void reset_capture_state(void) {
     capture_read_index = 0;
     capture_count = 0;
     for (int i = 0; i < CAPTURE_RING_DEPTH; i++) {
-        capture_ring[i].length = 0;
-        capture_ring[i].state = CAPTURE_SLOT_FREE;
-        capture_ring[i].pending_outputs = 0;
+        capture_slot_release(&capture_ring[i]);
     }
     restore_interrupts(status);
 
@@ -405,24 +434,25 @@ static void on_pdm_samples_ready(void) {
     uint8_t write_index = capture_write_index;
     capture_slot_t* slot = &capture_ring[write_index];
     bool slot_available = (slot->state == CAPTURE_SLOT_FREE);
-    pdm_block_packet_t* target_packet = slot_available ? &slot->packet : &discard_packet;
-    int read = pdm_microphone_read_with_metadata(
-        target_packet->payload,
-        PDM_BLOCK_PAYLOAD_BYTES,
-        &target_packet->metadata
-    );
+    struct pdm_acquired_buffer buffer = {0};
+    if (!pdm_microphone_acquire_buffer(&buffer)) {
+        return;
+    }
 
-    if (read > 0) {
-        if (slot_available) {
-            slot->length = (uint16_t)read;
-            slot->state = CAPTURE_SLOT_READY;
-            slot->pending_outputs = 0;
-            capture_write_index = (uint8_t)((capture_write_index + 1) % CAPTURE_RING_DEPTH);
-            capture_count++;
-            blocks_ready++;
-        } else {
-            blocks_discarded++;
-        }
+    if (slot_available) {
+        slot->packet.metadata = *buffer.metadata;
+        slot->length = (uint16_t)buffer.length;
+        slot->dma_payload = buffer.data;
+        slot->buffer_handle = buffer.buffer_index;
+        slot->has_copy = false;
+        slot->state = CAPTURE_SLOT_READY;
+        slot->pending_outputs = 0;
+        capture_write_index = (uint8_t)((capture_write_index + 1) % CAPTURE_RING_DEPTH);
+        capture_count++;
+        blocks_ready++;
+    } else {
+        pdm_microphone_release_buffer(buffer.buffer_index);
+        blocks_discarded++;
     }
 }
 
@@ -1215,10 +1245,14 @@ int main(void) {
                 slot->state = CAPTURE_SLOT_SENDING;
                 bytes_to_send = slot->length;
                 packet = &slot->packet;
-                packet_bytes = sizeof(packet->metadata) + (size_t)bytes_to_send;
                 capture_read_index = (uint8_t)((capture_read_index + 1) % CAPTURE_RING_DEPTH);
                 capture_count--;
                 uint8_t pending = 0;
+#if ENABLE_WIFI_STREAMING
+                if (wifi_stream_enabled) {
+                    pending++;
+                }
+#endif
                 if (spi_stream_enabled) {
                     pending++;
                 }
@@ -1233,7 +1267,7 @@ int main(void) {
         }
         restore_interrupts(status);
 
-        if (packet == NULL || bytes_to_send <= 0) {
+        if (!slot || bytes_to_send <= 0) {
             overruns++;
             continue;
         }
@@ -1242,27 +1276,23 @@ int main(void) {
             dump_block_summary(packet, (size_t)bytes_to_send);
         }
 
-        const uint8_t* packet_data = (const uint8_t*)packet;
-        const uint8_t* payload_data = packet->payload;
+        packet_bytes = sizeof(slot->packet.metadata) + (size_t)bytes_to_send;
+        const uint8_t* packet_data = (const uint8_t*)&slot->packet;
 
-#if ENABLE_WIFI_STREAMING
-        if (wifi_stream_enabled) {
-            wifi_queue_push(packet, packet_bytes);
-            wifi_queue_service();
-        }
-#endif
-
-        if (slot && slot->pending_outputs == 0) {
-            capture_slot_release(slot);
-            slot = NULL;
-        }
-
-        if (spi_stream_enabled) {
+        if (spi_stream_enabled && slot) {
             if (!spi_initialised) {
                 initialise_spi_stream();
             }
-            if (!spi_initialised || !spi_streamer_push_block(&spi_streamer_ctx, payload_data, (size_t)bytes_to_send)) {
+            const uint8_t* spi_data = capture_slot_payload_ptr(slot);
+            if (!spi_data) {
+                capture_slot_ensure_copy(slot);
+                spi_data = capture_slot_payload_ptr(slot);
+            }
+            if (!spi_initialised || !spi_streamer_push_block(&spi_streamer_ctx, spi_data, (size_t)bytes_to_send)) {
                 spi_failures++;
+            }
+            if (slot->pending_outputs == 1 && slot->dma_payload) {
+                capture_slot_release_dma(slot);
             }
             capture_slot_output_done(slot);
             if (slot && slot->state == CAPTURE_SLOT_FREE) {
@@ -1270,7 +1300,20 @@ int main(void) {
             }
         }
 
-        if (serial_stream_enabled) {
+#if ENABLE_WIFI_STREAMING
+        if (wifi_stream_enabled && slot) {
+            capture_slot_ensure_copy(slot);
+            wifi_queue_push(&slot->packet, packet_bytes);
+            wifi_queue_service();
+            capture_slot_output_done(slot);
+            if (slot && slot->state == CAPTURE_SLOT_FREE) {
+                slot = NULL;
+            }
+        }
+#endif
+
+        if (serial_stream_enabled && slot) {
+            capture_slot_ensure_copy(slot);
             if (!serial_stream_block(packet_data, packet_bytes)) {
                 serial_failures++;
             }
@@ -1280,7 +1323,8 @@ int main(void) {
             }
         }
 
-        if (stream_binary_data) {
+        if (stream_binary_data && slot) {
+            capture_slot_ensure_copy(slot);
             usb_write_blocking(packet_data, packet_bytes);
             bytes_sent += (uint32_t)bytes_to_send;
             blocks_streamed++;
@@ -1290,8 +1334,8 @@ int main(void) {
             }
         }
 
-        if (slot) {
-            capture_slot_output_done(slot);
+        if (slot && slot->pending_outputs == 0) {
+            capture_slot_release(slot);
             slot = NULL;
         }
 

@@ -49,6 +49,13 @@ struct pdm_block_metadata {
     uint32_t trigger_reserved;         // Reserved/padding for alignment.
 };
 
+struct pdm_acquired_buffer {
+    const uint8_t* data;
+    size_t length;
+    const struct pdm_block_metadata* metadata;
+    uint8_t buffer_index;
+};
+
 // Initialise the library and underlying PIO + DMA resources.
 int pdm_microphone_init(const struct pdm_microphone_config* config);
 // Release any memory or DMA channels claimed during initialisation.
@@ -61,6 +68,11 @@ void pdm_microphone_stop();
 
 // Register a callback that fires each time a buffer becomes ready to read.
 void pdm_microphone_set_samples_ready_handler(pdm_samples_ready_handler_t handler);
+
+// Obtain a pointer to the next filled buffer without copying it.
+bool pdm_microphone_acquire_buffer(struct pdm_acquired_buffer* out);
+// Release a previously acquired buffer so it may be reused by the DMA engine.
+void pdm_microphone_release_buffer(uint8_t buffer_index);
 
 // Copy the next raw buffer into caller-provided memory; returns bytes copied.
 int pdm_microphone_read(uint8_t* buffer, size_t max_bytes);
