@@ -1,0 +1,107 @@
+; File: pdm_pdm_capture.pio
+
+.define TRIGGER_PIN 5
+.define TRIGGER_DEBOUNCE_LOOPS 31  ; number of high samples before capture
+
+.program pdm_clock
+.side_set 1 opt       ; 1-bit sideset for clock (optional each instruction)
+
+; Generates a continuous clock:
+;   low for one instruction, high for one instruction.
+; Effective bit rate:
+;   bit_rate = (PIO clock) / (2 * clkdiv)
+
+.wrap_target
+    nop        side 0   ; clock low
+    nop        side 1   ; clock high
+.wrap
+
+
+.program pdm_trigger_capture
+; Capture program:
+; - CPU pushes capture length in 32-bit words via TX FIFO
+; - Waits for trigger rising edge (GPIO defined by TRIGGER_PIN)
+; - Captures that many words from a PDM data pin (configured via IN base pin)
+; - Each word is 32 bits
+
+; Assumes:
+;   - IN base pin is the PDM data pin (configured per-state-machine).
+
+.wrap_target
+    pull   block           ; OSR = word count (N)
+    mov    x, osr          ; X = N words to capture
+
+wait_for_low:
+    wait   0 gpio TRIGGER_PIN        ; ensure trigger pin is low first
+wait_for_high:
+    wait   1 gpio TRIGGER_PIN        ; wait for rising edge on trigger
+    set    y, TRIGGER_DEBOUNCE_LOOPS
+
+debounce_loop:
+    jmp    pin debounce_still_high
+    jmp    wait_for_low              ; fell low again -> bounce
+debounce_still_high:
+    jmp    y-- debounce_loop
+
+capture_loop:
+    jmp    x-- capture_word
+    jmp    capture_done    ; no words requested
+
+capture_word:
+    set    y, 31           ; 32 bits per word
+
+bitloop:
+    nop                    ; align with clock low half
+    in     pins, 1         ; sample PDM data (GPIO 2, index 0)
+    jmp    y-- bitloop
+
+    push   block           ; push 32-bit word ISR -> RX FIFO
+    jmp    capture_loop    ; capture next word if any remain
+
+capture_done:
+    nop                    ; placeholder before wrapping
+.wrap
+
+
+.program trigger_wave
+.side_set 1 opt
+
+; Expectation: CPU pushes duration (loop count) once at init.
+; Program waits for trigger pin (configured via in_base) to go low->high.
+; On rising edge, output pin (sideset) toggles for the requested number of loops.
+
+pull   block
+mov    y, osr
+
+.wrap_target
+wait   0 pin 0
+wait   1 pin 0
+mov    x, y
+loop:
+    nop side 1
+    nop side 0
+    jmp x-- loop
+.wrap
+
+% c-sdk {
+
+static inline void trigger_wave_program_init(PIO pio, uint sm, uint offset,
+                                             float clk_div, uint trigger_pin,
+                                             uint output_pin)
+{
+    pio_sm_set_consecutive_pindirs(pio, sm, trigger_pin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, output_pin, 1, true);
+
+    pio_sm_config c = trigger_wave_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, trigger_pin);
+    sm_config_set_sideset_pins(&c, output_pin);
+
+    pio_gpio_init(pio, trigger_pin);
+    gpio_pull_down(trigger_pin);
+    pio_gpio_init(pio, output_pin);
+
+    sm_config_set_clkdiv(&c, clk_div);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}
