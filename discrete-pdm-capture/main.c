@@ -20,8 +20,8 @@
 
 #define SPEAKER_OUTPUT_PIN  6   // Speaker drive GPIO (PIO sideset)
 #define SPEAKER_TRIGGER_PIN PDM_TRIGGER_PIN
-#define SPEAKER_TONE_HZ     100000u    // Speaker tone frequency
-#define SPEAKER_DURATION_MS 5u     // Speaker tone duration per trigger
+#define SPEAKER_TONE_HZ     90000u    // Speaker tone frequency
+#define SPEAKER_DURATION_MS 1u     // Speaker tone duration per trigger
 
 static const uint g_data_pins[MIC_COUNT] = { PDM_DATA_PIN_0, PDM_DATA_PIN_1 };
 
