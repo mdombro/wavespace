@@ -45,6 +45,16 @@ def design_fir(fs_in: float, fc: float) -> np.ndarray:
     return h.astype(np.float64)
 
 
+def design_highpass(fs_in: float, fc: float) -> np.ndarray:
+    if fc <= 0:
+        raise ValueError("High-pass cutoff must be positive.")
+    lowpass = design_fir(fs_in, fc)
+    highpass = -lowpass
+    mid = len(highpass) // 2
+    highpass[mid] += 1.0
+    return highpass.astype(np.float64)
+
+
 class StreamingFilter:
     def __init__(self, taps: np.ndarray, decimation: int) -> None:
         self.taps = taps
@@ -219,12 +229,16 @@ def process_capture(
     bitorder: str,
     map_pm1: bool,
     combine_method: str,
+    highpass_taps: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     filtered: List[np.ndarray] = []
     for ch in sorted(spec.channels, key=lambda c: c.channel_index):
         bits = read_channel_bits(ch, bitorder=bitorder)
         filtered.append(filter_channel(bits, taps=taps, decimation=decimation, map_pm1=map_pm1))
-    return combine_channels(filtered, method=combine_method)
+    combined = combine_channels(filtered, method=combine_method)
+    if highpass_taps is not None and combined.size:
+        combined = StreamingFilter(highpass_taps, decimation=1).process(combined)
+    return combined
 
 
 # ----------------------------------- CLI -----------------------------------
@@ -253,6 +267,8 @@ def parse_args() -> argparse.Namespace:
                         help="Interpret each byte as LSB-first (default: MSB-first).")
     parser.add_argument("--keep-bits", dest="map_pm1", action="store_false",
                         help="Keep bits in {0,1} (default maps to {-1,+1}).")
+    parser.add_argument("--highpass-cutoff", type=float, default=20_000,
+                        help="High-pass cutoff in Hz applied after decimation. Set ≤ 0 to disable.")
     parser.set_defaults(bit_msbfirst=True, map_pm1=True)
     parser.add_argument(
         "--combine",
@@ -283,6 +299,13 @@ def main() -> int:
         decimation = max(1, int(np.floor(args.sample_rate / fs_target)))
     fs_out = args.sample_rate / decimation
     bitorder = "big" if args.bit_msbfirst else "little"
+    highpass_cutoff = args.highpass_cutoff if args.highpass_cutoff and args.highpass_cutoff > 0 else None
+    highpass_taps: Optional[np.ndarray] = None
+    if highpass_cutoff is not None:
+        nyquist = fs_out / 2.0
+        if highpass_cutoff >= nyquist:
+            raise SystemExit(f"High-pass cutoff ({highpass_cutoff} Hz) must be below Nyquist ({nyquist} Hz).")
+        highpass_taps = design_highpass(fs_out, highpass_cutoff)
 
     requested_indices: Optional[Iterable[int]] = None
     if args.indices:
@@ -309,6 +332,7 @@ def main() -> int:
             bitorder=bitorder,
             map_pm1=args.map_pm1,
             combine_method=args.combine,
+            highpass_taps=highpass_taps,
         )
         if combined.size == 0:
             print(f"Skipping capture {spec.index}: empty filtered output.")
@@ -327,6 +351,8 @@ def main() -> int:
             cutoff=np.float64(args.cutoff),
             decimation=np.int32(decimation),
             taps=taps.astype(np.float64),
+            highpass_cutoff=np.float64(highpass_cutoff or 0.0),
+            highpass_taps=(highpass_taps.astype(np.float64) if highpass_taps is not None else np.array([], dtype=np.float64)),
         )
         processed += 1
 
