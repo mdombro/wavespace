@@ -9,6 +9,8 @@ Designed for RAMPS 1.4 board running Marlin firmware.
 import serial
 import time
 import argparse
+import json
+import csv
 
 
 class MeasurementGrid:
@@ -17,6 +19,10 @@ class MeasurementGrid:
         self.port = port
         self.baudrate = baudrate
         self.serial_conn = None
+        self.current_position = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self.m42_count = 0
+        self.m42_events = []
+        self.planned_m42_events = []
     
     def connect(self):
         """Establish serial connection."""
@@ -47,6 +53,14 @@ class MeasurementGrid:
         """Send G-code command and wait for ok response."""
         if not self.serial_conn or not self.serial_conn.is_open:
             return
+        
+        normalized_command = command.split(';', 1)[0].strip()
+
+        # Keep internal position tracking in sync with commanded moves
+        self._update_current_position(normalized_command)
+
+        # Record pin positions whenever an M42 command is issued
+        self._record_m42_event(normalized_command)
 
         print(f"Sending: {command}")
         self.serial_conn.write(f"{command}\n".encode('utf-8'))
@@ -63,6 +77,151 @@ class MeasurementGrid:
                     break
 
         time.sleep(0.1)  # Small delay between commands
+
+    def _update_current_position(self, command: str):
+        """Update tracked XYZ position based on absolute G0/G1 commands."""
+        if not command.startswith(('G0', 'G1')):
+            return
+
+        tokens = command.split()
+        updates = {}
+        for token in tokens:
+            if not token:
+                continue
+            axis = token[0].lower()
+            if axis in ('x', 'y', 'z'):
+                try:
+                    updates[axis] = float(token[1:])
+                except ValueError:
+                    continue
+
+        if updates:
+            self.current_position.update(updates)
+
+    def _record_m42_event(self, command: str):
+        """
+        Track each M42 command with the gantry position.
+
+        Returns the recorded event dict when an M42 is found, otherwise None.
+        """
+        if 'M42' not in command.upper():
+            return None
+
+        self.m42_count += 1
+        event = {
+            'index': self.m42_count,
+            'command': command,
+            'position': dict(self.current_position)
+        }
+        self.m42_events.append(event)
+
+        pos = event['position']
+        print(
+            f"  M42 #{event['index']:03d} logged at "
+            f"X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+        )
+        return event
+
+    def _precompute_m42_plan(self, x_points, y_points, z_points, spacing, start_x, start_y, start_z):
+        """
+        Pre-compute the expected gantry position for each M42 command.
+
+        Includes the initial pin reset plus a HIGH/LOW pair for every
+        measurement point.
+        """
+        plan = []
+        idx = 0
+
+        # Initial pin reset before any movement
+        idx += 1
+        plan.append({
+            'index': idx,
+            'state': 'LOW (init)',
+            'position': {'x': start_x, 'y': start_y, 'z': start_z}
+        })
+
+        for z_idx in range(z_points):
+            z = start_z + z_idx * spacing
+            for y_idx in range(y_points):
+                y = start_y + y_idx * spacing
+                for x_idx in range(x_points):
+                    x = start_x + x_idx * spacing
+                    idx += 1
+                    plan.append({
+                        'index': idx,
+                        'state': 'HIGH',
+                        'position': {'x': x, 'y': y, 'z': z}
+                    })
+                    idx += 1
+                    plan.append({
+                        'index': idx,
+                        'state': 'LOW',
+                        'position': {'x': x, 'y': y, 'z': z}
+                    })
+        return plan
+
+    def _preview_m42_plan(self, max_entries: int = 6):
+        """Print a short preview of the planned M42 positions."""
+        if not self.planned_m42_events:
+            return
+
+        print("Planned M42 sequence (index, state, position):")
+        preview = self.planned_m42_events[:max_entries]
+        for event in preview:
+            pos = event['position']
+            print(
+                f"  #{event['index']:03d} {event['state']:<9} "
+                f"X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+            )
+        remaining = len(self.planned_m42_events) - len(preview)
+        if remaining > 0:
+            print(f"  ... {remaining} more M42 commands scheduled")
+
+    def report_m42_events(self):
+        """Print a complete log of where each M42 command was sent."""
+        if not self.m42_events:
+            return
+
+        print("\n=== M42 Command Log ===")
+        for event in self.m42_events:
+            pos = event['position']
+            print(
+                f"#{event['index']:03d} {event['command']:<15} "
+                f"@ X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+            )
+
+    def save_m42_events(self, json_path: str = None, csv_path: str = None):
+        """Persist the M42 log to JSON and/or CSV."""
+        if not self.m42_events:
+            print("No M42 events to save.")
+            return
+
+        if json_path:
+            try:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.m42_events, f, indent=2)
+                print(f"M42 events saved to JSON: {json_path}")
+            except OSError as exc:
+                print(f"Failed to save JSON log to {json_path}: {exc}")
+
+        if csv_path:
+            fieldnames = ['index', 'command', 'x', 'y', 'z']
+            try:
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for event in self.m42_events:
+                        pos = event['position']
+                        writer.writerow({
+                            'index': event['index'],
+                            'command': event['command'],
+                            'x': pos['x'],
+                            'y': pos['y'],
+                            'z': pos['z'],
+                        })
+                print(f"M42 events saved to CSV: {csv_path}")
+            except OSError as exc:
+                print(f"Failed to save CSV log to {csv_path}: {exc}")
     
     def initialize(self, feedrate: float = 1000):
         """Initialize the machine."""
@@ -93,7 +252,9 @@ class MeasurementGrid:
         feedrate: float = 1000,
         start_x: float = 0,
         start_y: float = 0,
-        start_z: float = 0
+        start_z: float = 0,
+        m42_json_path: str = None,
+        m42_csv_path: str = None
     ):
         """
         Execute 3D measurement grid with lead-in approach.
@@ -108,6 +269,8 @@ class MeasurementGrid:
             pin: Digital pin number to control (default: 4)
             feedrate: Movement speed (mm/min)
             start_x, start_y, start_z: Starting position (mm)
+            m42_json_path: Optional path to save M42 log as JSON
+            m42_csv_path: Optional path to save M42 log as CSV
         """
         print("=== Measurement Grid Parameters ===")
         print(f"Grid size: {x_size} x {y_size} x {z_size} mm")
@@ -126,6 +289,22 @@ class MeasurementGrid:
         
         print(f"Grid points: {x_points} x {y_points} x {z_points} = {total_points} measurements")
         print("=" * 50)
+
+        # Reset tracking for this run
+        self.current_position = {'x': start_x, 'y': start_y, 'z': start_z}
+        self.m42_count = 0
+        self.m42_events = []
+        self.planned_m42_events = self._precompute_m42_plan(
+            x_points=x_points,
+            y_points=y_points,
+            z_points=z_points,
+            spacing=spacing,
+            start_x=start_x,
+            start_y=start_y,
+            start_z=start_z
+        )
+        print(f"Planned M42 commands (including initial reset): {len(self.planned_m42_events)}")
+        self._preview_m42_plan()
         
         if not self.connect():
             return
@@ -177,6 +356,7 @@ class MeasurementGrid:
             self.send_gcode("G1 X0 Y0 Z0")
             self.send_gcode("M400")  # Wait for move to complete
             print("Returned to zero")
+            self.report_m42_events()
 
         except KeyboardInterrupt:
             print("Measurement interrupted by user")
@@ -188,6 +368,11 @@ class MeasurementGrid:
             traceback.print_exc()
         
         finally:
+            # Persist log even if there was an error or interrupt
+            self.save_m42_events(
+                json_path=m42_json_path,
+                csv_path=m42_csv_path
+            )
             self.disconnect()
 
 
@@ -233,6 +418,10 @@ Example:
                         help='Starting Y position in mm (default: 0)')
     parser.add_argument('--start-z', type=float, default=0,
                         help='Starting Z position in mm (default: 0)')
+    parser.add_argument('--m42-json-log', type=str, default=None,
+                        help='Path to save M42 events as JSON (optional)')
+    parser.add_argument('--m42-csv-log', type=str, default=None,
+                        help='Path to save M42 events as CSV (optional)')
     
     args = parser.parse_args()
     
@@ -257,7 +446,9 @@ Example:
         feedrate=args.feedrate,
         start_x=args.start_x,
         start_y=args.start_y,
-        start_z=args.start_z
+        start_z=args.start_z,
+        m42_json_path=args.m42_json_log,
+        m42_csv_path=args.m42_csv_log
     )
 
 

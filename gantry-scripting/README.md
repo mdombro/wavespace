@@ -32,6 +32,15 @@ python3 measurement_grid.py /dev/ttyUSB0 \
     --pin 4 --feedrate 1000
 ```
 
+Optional logging of every `M42` command with gantry position:
+
+```bash
+python3 measurement_grid.py /dev/ttyUSB0 \
+    ...your existing args... \
+    --m42-json-log m42_log.json \
+    --m42-csv-log m42_log.csv
+```
+
 ### send_gcode.py
 
 Simple utility for sending custom G-code commands directly to the gantry. Useful for manual testing, calibration, and debugging.
