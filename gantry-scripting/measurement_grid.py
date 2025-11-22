@@ -88,7 +88,7 @@ class MeasurementGrid:
         for token in tokens:
             if not token:
                 continue
-            axis = token[0].lower()
+            axis = token[0].upper()
             if axis in ('X', 'Y', 'Z'):
                 try:
                     updates[axis] = float(token[1:])
