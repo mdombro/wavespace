@@ -19,7 +19,7 @@ class MeasurementGrid:
         self.port = port
         self.baudrate = baudrate
         self.serial_conn = None
-        self.current_position = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self.current_position = {'X': 0.0, 'Y': 0.0, 'Z': 0.0}
         self.m42_count = 0
         self.m42_events = []
         self.planned_m42_events = []
@@ -89,7 +89,7 @@ class MeasurementGrid:
             if not token:
                 continue
             axis = token[0].lower()
-            if axis in ('x', 'y', 'z'):
+            if axis in ('X', 'Y', 'Z'):
                 try:
                     updates[axis] = float(token[1:])
                 except ValueError:
@@ -118,7 +118,7 @@ class MeasurementGrid:
         pos = event['position']
         print(
             f"  M42 #{event['index']:03d} logged at "
-            f"X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+            f"X{pos['X']:.3f} Y{pos['Y']:.3f} Z{pos['Z']:.3f}"
         )
         return event
 
@@ -137,7 +137,7 @@ class MeasurementGrid:
         plan.append({
             'index': idx,
             'state': 'LOW (init)',
-            'position': {'x': start_x, 'y': start_y, 'z': start_z}
+            'position': {'X': start_x, 'Y': start_y, 'Z': start_z}
         })
 
         for z_idx in range(z_points):
@@ -150,13 +150,13 @@ class MeasurementGrid:
                     plan.append({
                         'index': idx,
                         'state': 'HIGH',
-                        'position': {'x': x, 'y': y, 'z': z}
+                        'position': {'X': x, 'Y': y, 'Z': z}
                     })
                     idx += 1
                     plan.append({
                         'index': idx,
                         'state': 'LOW',
-                        'position': {'x': x, 'y': y, 'z': z}
+                        'position': {'X': x, 'Y': y, 'Z': z}
                     })
         return plan
 
@@ -171,7 +171,7 @@ class MeasurementGrid:
             pos = event['position']
             print(
                 f"  #{event['index']:03d} {event['state']:<9} "
-                f"X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+                f"X{pos['X']:.3f} Y{pos['Y']:.3f} Z{pos['Z']:.3f}"
             )
         remaining = len(self.planned_m42_events) - len(preview)
         if remaining > 0:
@@ -187,7 +187,7 @@ class MeasurementGrid:
             pos = event['position']
             print(
                 f"#{event['index']:03d} {event['command']:<15} "
-                f"@ X{pos['x']:.3f} Y{pos['y']:.3f} Z{pos['z']:.3f}"
+                f"@ X{pos['X']:.3f} Y{pos['Y']:.3f} Z{pos['Z']:.3f}"
             )
 
     def save_m42_events(self, json_path: str = None, csv_path: str = None):
@@ -215,9 +215,9 @@ class MeasurementGrid:
                         writer.writerow({
                             'index': event['index'],
                             'command': event['command'],
-                            'x': pos['x'],
-                            'y': pos['y'],
-                            'z': pos['z'],
+                            'X': pos['X'],
+                            'Y': pos['Y'],
+                            'Z': pos['Z'],
                         })
                 print(f"M42 events saved to CSV: {csv_path}")
             except OSError as exc:
@@ -291,7 +291,7 @@ class MeasurementGrid:
         print("=" * 50)
 
         # Reset tracking for this run
-        self.current_position = {'x': start_x, 'y': start_y, 'z': start_z}
+        self.current_position = {'X': start_x, 'Y': start_y, 'Z': start_z}
         self.m42_count = 0
         self.m42_events = []
         self.planned_m42_events = self._precompute_m42_plan(
