@@ -107,12 +107,12 @@ class MeasurementGrid:
         if 'M42' not in command.upper():
             return None
 
-        self.m42_count += 1
         event = {
             'index': self.m42_count,
             'command': command,
             'position': dict(self.current_position)
         }
+        self.m42_count += 1
         self.m42_events.append(event)
 
         pos = event['position']
@@ -205,7 +205,7 @@ class MeasurementGrid:
                 print(f"Failed to save JSON log to {json_path}: {exc}")
 
         if csv_path:
-            fieldnames = ['index', 'command', 'x', 'y', 'z']
+            fieldnames = ['index', 'command', 'X', 'Y', 'Z']
             try:
                 with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
