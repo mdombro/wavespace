@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import re
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -53,6 +54,77 @@ def design_highpass(fs_in: float, fc: float) -> np.ndarray:
     mid = len(highpass) // 2
     highpass[mid] += 1.0
     return highpass.astype(np.float64)
+
+
+def compute_freq_response(taps: np.ndarray, fs: float, n_fft: int = 8192) -> tuple[np.ndarray, np.ndarray]:
+    """Return (freqs, |H(f)|) for the provided taps."""
+    if taps.size == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    # Zero-pad to next power-of-two for a smooth curve; 4x taps length minimum.
+    min_len = max(n_fft, int(2 ** np.ceil(np.log2(max(16, taps.size * 4)))))
+    resp = np.fft.rfft(taps, min_len)
+    freqs = np.fft.rfftfreq(min_len, d=1.0 / fs)
+    mags = np.abs(resp)
+    return freqs.astype(np.float64), mags.astype(np.float64)
+
+
+def plot_filter_response(
+    lp_freqs: np.ndarray,
+    lp_mag: np.ndarray,
+    hp_freqs: np.ndarray,
+    hp_mag: np.ndarray,
+    fs_in: float,
+    fs_out: float,
+    save_path: Optional[Path],
+    show: bool,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    def db(mag: np.ndarray) -> np.ndarray:
+        return 20.0 * np.log10(np.maximum(mag, 1e-12))
+
+    plt.figure(figsize=(8, 4.5))
+    if lp_freqs.size:
+        plt.plot(lp_freqs / 1e3, db(lp_mag), label=f"Low-pass (fs_in={fs_in/1e6:.2f} MHz)")
+    if hp_freqs.size:
+        plt.plot(hp_freqs / 1e3, db(hp_mag), label=f"High-pass (fs_out={fs_out/1e3:.1f} kHz)")
+    plt.xlabel("Frequency (kHz)")
+    plt.ylabel("Magnitude (dB)")
+    plt.title("Filter magnitude response")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Wrote filter response plot to {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+def write_wav(path: Path, data: np.ndarray, sample_rate: float, normalize: bool, headroom_db: float) -> None:
+    """Save mono float data to 16-bit PCM WAV with optional peak normalization."""
+    if data.size == 0:
+        return
+    sr_int = max(1, int(round(sample_rate)))
+    peak = float(np.max(np.abs(data)))
+    if peak < 1e-12:
+        scaled = np.zeros_like(data, dtype=np.int16)
+    else:
+        if normalize:
+            target_peak = (10.0 ** (-headroom_db / 20.0)) * 32767.0
+            gain = target_peak / peak
+        else:
+            gain = 1.0
+        scaled = np.clip(data * gain, -32768.0, 32767.0).astype(np.int16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit PCM
+        wf.setframerate(sr_int)
+        wf.writeframes(scaled.tobytes())
 
 
 class StreamingFilter:
@@ -264,12 +336,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-mult", type=float, default=2.5,
                         help="Multiplier for auto decimation (fs_out ≈ target_mult * cutoff). Default: %(default)s.")
     parser.add_argument("--lsb-first", dest="bit_msbfirst", action="store_false",
-                        help="Interpret each byte as LSB-first (default: MSB-first).")
+                        help="Interpret each byte as LSB-first (default).")
+    parser.add_argument("--msb-first", dest="bit_msbfirst", action="store_true",
+                        help="Interpret each byte as MSB-first.")
     parser.add_argument("--keep-bits", dest="map_pm1", action="store_false",
                         help="Keep bits in {0,1} (default maps to {-1,+1}).")
     parser.add_argument("--highpass-cutoff", type=float, default=20_000,
                         help="High-pass cutoff in Hz applied after decimation. Set ≤ 0 to disable.")
-    parser.set_defaults(bit_msbfirst=True, map_pm1=True)
+    parser.add_argument("--plot-filter", action="store_true",
+                        help="Display filter magnitude response.")
+    parser.add_argument("--plot-filter-file", type=Path,
+                        help="Optional path to save filter response plot (e.g., plot.png).")
+    parser.add_argument("--write-wav", action="store_true",
+                        help="Also write 16-bit mono WAV files for each capture.")
+    parser.add_argument("--wav-subdir", type=Path, default=Path("wav"),
+                        help="Subdirectory under output dir for WAV files (default: %(default)s).")
+    parser.add_argument("--wav-headroom-db", type=float, default=0.5,
+                        help="Headroom (dB below full scale) when normalizing WAVs (default: %(default)s dB).")
+    parser.add_argument("--wav-no-normalize", action="store_true",
+                        help="Disable WAV peak normalization (use raw scale).")
+    parser.set_defaults(bit_msbfirst=False, map_pm1=True)
     parser.add_argument(
         "--combine",
         choices=["sum", "mean", "first"],
@@ -306,6 +392,8 @@ def main() -> int:
         if highpass_cutoff >= nyquist:
             raise SystemExit(f"High-pass cutoff ({highpass_cutoff} Hz) must be below Nyquist ({nyquist} Hz).")
         highpass_taps = design_highpass(fs_out, highpass_cutoff)
+    lp_freqs, lp_mag = compute_freq_response(taps, fs=args.sample_rate)
+    hp_freqs, hp_mag = compute_freq_response(highpass_taps, fs=fs_out) if highpass_taps is not None else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
 
     requested_indices: Optional[Iterable[int]] = None
     if args.indices:
@@ -316,6 +404,39 @@ def main() -> int:
         raise SystemExit(f"No capture_*.json files found under {captures_dir}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    wav_output_dir: Optional[Path] = None
+    if args.write_wav:
+        wav_output_dir = args.wav_subdir if args.wav_subdir.is_absolute() else args.output_dir / args.wav_subdir
+        wav_output_dir.mkdir(parents=True, exist_ok=True)
+    wav_normalize = not args.wav_no_normalize
+    np.savez(
+        args.output_dir / "filter_response.npz",
+        freq_lowpass=lp_freqs,
+        mag_lowpass=lp_mag,
+        freq_highpass=hp_freqs,
+        mag_highpass=hp_mag,
+        fs_in=np.float64(args.sample_rate),
+        fs_out=np.float64(fs_out),
+        cutoff=np.float64(args.cutoff),
+        highpass_cutoff=np.float64(highpass_cutoff or 0.0),
+        decimation=np.int32(decimation),
+        taps_lowpass=taps.astype(np.float64),
+        taps_highpass=(highpass_taps.astype(np.float64) if highpass_taps is not None else np.array([], dtype=np.float64)),
+    )
+    if args.plot_filter or args.plot_filter_file:
+        try:
+            plot_filter_response(
+                lp_freqs=lp_freqs,
+                lp_mag=lp_mag,
+                hp_freqs=hp_freqs,
+                hp_mag=hp_mag,
+                fs_in=args.sample_rate,
+                fs_out=fs_out,
+                save_path=args.plot_filter_file,
+                show=args.plot_filter,
+            )
+        except ModuleNotFoundError:
+            print("matplotlib not installed; skipping filter plot.")
 
     processed = 0
     for spec in captures:
@@ -354,6 +475,15 @@ def main() -> int:
             highpass_cutoff=np.float64(highpass_cutoff or 0.0),
             highpass_taps=(highpass_taps.astype(np.float64) if highpass_taps is not None else np.array([], dtype=np.float64)),
         )
+        if wav_output_dir is not None:
+            wav_path = wav_output_dir / f"{out_path.stem}.wav"
+            write_wav(
+                wav_path,
+                combined,
+                sample_rate=fs_out,
+                normalize=wav_normalize,
+                headroom_db=args.wav_headroom_db,
+            )
         processed += 1
 
     print(
