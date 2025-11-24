@@ -11,6 +11,7 @@ import time
 import argparse
 import json
 import csv
+import re
 
 
 class MeasurementGrid:
@@ -107,10 +108,14 @@ class MeasurementGrid:
         if 'M42' not in command.upper():
             return None
 
+        strength = self._extract_m42_strength(command)
+        if strength is None or strength != 255:
+            return None
+
         event = {
             'index': self.m42_count,
             'command': command,
-            'position': dict(self.current_position)
+            'position': self._position_snapshot()
         }
         self.m42_count += 1
         self.m42_events.append(event)
@@ -121,6 +126,36 @@ class MeasurementGrid:
             f"X{pos['X']:.3f} Y{pos['Y']:.3f} Z{pos['Z']:.3f}"
         )
         return event
+
+    def _extract_m42_strength(self, command: str) -> int | None:
+        """Parse the S value from an M42 command."""
+        match = re.search(r"[Ss](-?\d+)", command)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    def _position_snapshot(self) -> dict:
+        """Return a normalized copy of the current XYZ position."""
+        return {
+            'X': float(self.current_position.get('X', 0.0)),
+            'Y': float(self.current_position.get('Y', 0.0)),
+            'Z': float(self.current_position.get('Z', 0.0)),
+        }
+
+    def _set_current_position(self, **kwargs):
+        """Update tracked position using explicit coordinate overrides."""
+        updates = {}
+        for axis, value in kwargs.items():
+            if value is None:
+                continue
+            axis_key = axis.upper()
+            if axis_key in ('X', 'Y', 'Z'):
+                updates[axis_key] = float(value)
+        if updates:
+            self.current_position.update(updates)
 
     def _precompute_m42_plan(self, x_points, y_points, z_points, spacing, start_x, start_y, start_z):
         """
@@ -211,7 +246,11 @@ class MeasurementGrid:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
                     for event in self.m42_events:
-                        pos = event['position']
+                        pos = {
+                            'X': event['position'].get('X', event['position'].get('x', 0.0)),
+                            'Y': event['position'].get('Y', event['position'].get('y', 0.0)),
+                            'Z': event['position'].get('Z', event['position'].get('z', 0.0)),
+                        }
                         writer.writerow({
                             'index': event['index'],
                             'command': event['command'],
@@ -331,6 +370,7 @@ class MeasurementGrid:
                     print(f"Lead-in to X={lead_x:.2f}")
                     self.send_gcode(f"G1 X{lead_x:.3f} Y{y:.3f} Z{z:.3f}")
                     self.send_gcode("M400")  # Wait for move to complete
+                    self._set_current_position(X=lead_x, Y=y, Z=z)
                     
                     # Iterate through X points in this row
                     for x_idx in range(x_points):
@@ -341,6 +381,7 @@ class MeasurementGrid:
                         print(f"Point {point_count}/{total_points}: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
                         self.send_gcode(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f}")
                         self.send_gcode("M400")  # Wait for move to complete
+                        self._set_current_position(X=x, Y=y, Z=z)
                         
                         # Trigger measurement
                         print(f"  Measuring (pin {pin} HIGH for {reading_time}s)...")
@@ -355,6 +396,7 @@ class MeasurementGrid:
             print("Returning to zero position...")
             self.send_gcode("G1 X0 Y0 Z0")
             self.send_gcode("M400")  # Wait for move to complete
+            self._set_current_position(X=0.0, Y=0.0, Z=0.0)
             print("Returned to zero")
             self.report_m42_events()
 

@@ -1,3 +1,10 @@
+from the measurement_grid script, make it so only the m42 ... s255 commands are logged. Do not need rows for the M42 ... s0 commands
+
+also double check the number of bytes/samples captured per trigger, the validity of the captured samples and operation of the mics, the filtering ranges and that it looks correct
+
+
+
+
 We are less worried about how long after gantry signal fires to pico starting a measurement - the travel speed is low and absolute positioning sample to sample is not a huge requriement. Even latching the position trigger to a timestamp is less interesting, its kinda whenever the pico gets to doing it. What is more critical is the time of the pulse being sent out and the relevant samples being captured and marked for retrieval
 
 - Make the PDM reader dual channel - can probably mess with the pin mappings? 
