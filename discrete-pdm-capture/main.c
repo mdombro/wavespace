@@ -22,6 +22,7 @@
 #define SPEAKER_TRIGGER_PIN PDM_TRIGGER_PIN
 #define SPEAKER_TONE_HZ     90000u    // Speaker tone frequency
 #define SPEAKER_DURATION_MS 1u     // Speaker tone duration per trigger
+#define SPEAKER_DELAY_US    0u     // Delay before tone starts (microseconds)
 
 static const uint g_data_pins[MIC_COUNT] = { PDM_DATA_PIN_0, PDM_DATA_PIN_1 };
 
@@ -64,6 +65,7 @@ static uint32_t          g_capture_index = 0;
 static uint32_t          g_capture_ms    = CAPTURE_MS_DEFAULT;
 static uint32_t          g_capture_words = 0;
 static uint32_t          g_speaker_cycles = 0;
+static uint32_t          g_speaker_delay_cycles = 0;
 
 // Capture buffers (max size per mic)
 static uint32_t g_capture_buf[MIC_COUNT][MAX_CAPTURE_WORDS];
@@ -192,7 +194,15 @@ static void speaker_pio_init(void)
         g_speaker_cycles = 1;
     }
 
-    // Provide loop count to PIO before enabling.
+    uint64_t delay_ticks =
+        (uint64_t)SPEAKER_TONE_HZ * 2u * (uint64_t)SPEAKER_DELAY_US / 1000000u;
+    if (delay_ticks > 0xFFFFFFFFu) {
+        delay_ticks = 0xFFFFFFFFu;
+    }
+    g_speaker_delay_cycles = (uint32_t)delay_ticks;
+
+    // Provide delay + loop count to PIO before enabling.
+    pio_sm_put_blocking(g_pio, g_sm_speaker, g_speaker_delay_cycles);
     pio_sm_put_blocking(g_pio, g_sm_speaker, g_speaker_cycles);
 }
 

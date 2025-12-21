@@ -66,21 +66,31 @@ capture_done:
 .program trigger_wave
 .side_set 1 opt
 
-; Expectation: CPU pushes duration (loop count) once at init.
+; Expectation: CPU pushes delay loop count, then duration (loop count) once at init.
 ; Program waits for trigger pin (configured via in_base) to go low->high.
-; On rising edge, output pin (sideset) toggles for the requested number of loops.
+; On rising edge, output pin (sideset) stays low for the delay loop count, then
+; toggles for the requested number of loops.
 
+pull   block
+mov    isr, osr
 pull   block
 mov    y, osr
 
 .wrap_target
-wait   0 pin 0
-wait   1 pin 0
-mov    x, y
+wait   0 pin 0 side 0
+wait   1 pin 0 side 0
+mov    x, isr side 0
+jmp    !x delay_done side 0
+delay_loop:
+    jmp x-- delay_loop side 0
+delay_done:
+mov    x, y side 0
+jmp    !x tone_done side 0
 loop:
     nop side 1
     nop side 0
     jmp x-- loop
+tone_done:
 .wrap
 
 % c-sdk {
