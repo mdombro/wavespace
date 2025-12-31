@@ -1,7 +1,7 @@
 ; File: pdm_pdm_capture.pio
 
 .define TRIGGER_PIN 5
-.define TRIGGER_DEBOUNCE_LOOPS 31  ; number of high samples before capture
+.define CLK_PIN     4
 
 .program pdm_clock
 .side_set 1 opt       ; 1-bit sideset for clock (optional each instruction)
@@ -18,48 +18,40 @@
 
 
 .program pdm_trigger_capture
+.side_set 1 opt       ; optional sideset used as debug pin
 ; Capture program:
-; - CPU pushes capture length in 32-bit words via TX FIFO
+; - CPU pushes (bit_count - 1) via TX FIFO
 ; - Waits for trigger rising edge (GPIO defined by TRIGGER_PIN)
-; - Captures that many words from a PDM data pin (configured via IN base pin)
-; - Each word is 32 bits
+; - Captures that many bits from a PDM data pin (configured via IN base pin)
+; - ISR pushes every 32 bits via push iffull
 
 ; Assumes:
 ;   - IN base pin is the PDM data pin (configured per-state-machine).
 
 .wrap_target
-    pull   block           ; OSR = word count (N)
-    mov    x, osr          ; X = N words to capture
+    pull   block   side 0   ; OSR = (bit_count - 1), debug low while idle
+    mov    x, osr          ; X = remaining bits
 
 wait_for_low:
-    wait   0 gpio TRIGGER_PIN        ; ensure trigger pin is low first
+    wait   0 gpio TRIGGER_PIN side 0        ; ensure trigger pin is low first
 wait_for_high:
     wait   1 gpio TRIGGER_PIN        ; wait for rising edge on trigger
-    set    y, TRIGGER_DEBOUNCE_LOOPS
-
-debounce_loop:
-    jmp    pin debounce_still_high
-    jmp    wait_for_low              ; fell low again -> bounce
-debounce_still_high:
-    jmp    y-- debounce_loop
+    wait   0 gpio CLK_PIN            ; sync to clock low
+    nop            side 1            ; drive debug pin high once triggered
 
 capture_loop:
-    jmp    x-- capture_word
-    jmp    capture_done    ; no words requested
+    in     pins, 1         ; sample PDM data on clock low
+    push   iffull noblock  ; push 32-bit word when ISR fills, no gaps
+    jmp    x-- continue_bits
+    jmp    capture_done
 
-capture_word:
-    set    y, 31           ; 32 bits per word
-
-bitloop:
-    nop                    ; align with clock low half
-    in     pins, 1         ; sample PDM data (GPIO 2, index 0)
-    jmp    y-- bitloop
-
-    push   block           ; push 32-bit word ISR -> RX FIFO
-    jmp    capture_loop    ; capture next word if any remain
+continue_bits:
+    wait   1 gpio CLK_PIN  ; wait for clock high
+    wait   0 gpio CLK_PIN  ; wait for next falling edge
+    jmp    capture_loop
 
 capture_done:
-    nop                    ; placeholder before wrapping
+    nop        side 0       ; drive debug pin low at end of capture
 .wrap
 
 
