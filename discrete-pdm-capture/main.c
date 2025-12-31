@@ -23,10 +23,14 @@
 #define SPEAKER_TONE_HZ     90000u    // Speaker tone frequency
 #define SPEAKER_DURATION_MS 1u     // Speaker tone duration per trigger
 
+#define CAPTURE_DEBUG_PIN   7   // shared debug probe pin
+
+#define TRIGGER_IDLE_SETTLE_US 2000u
+
 static const uint g_data_pins[MIC_COUNT] = { PDM_DATA_PIN_0, PDM_DATA_PIN_1 };
 
 // --------- PDM timing / capture parameters ---------
-#define PDM_BITRATE         5000000u       // 4 MHz PDM bit clock
+#define PDM_BITRATE         3250000u       // 4 MHz PDM bit clock
 
 #define CAPTURE_MS_DEFAULT  15u            // default capture window
 #define CAPTURE_MS_MAX      30u            // maximum allowed capture length
@@ -64,9 +68,23 @@ static uint32_t          g_capture_index = 0;
 static uint32_t          g_capture_ms    = CAPTURE_MS_DEFAULT;
 static uint32_t          g_capture_words = 0;
 static uint32_t          g_speaker_cycles = 0;
+static uint32_t          g_capture_bits_minus1 = 0;
 
 // Capture buffers (max size per mic)
 static uint32_t g_capture_buf[MIC_COUNT][MAX_CAPTURE_WORDS];
+
+static void wait_for_trigger_idle(void)
+{
+    while (true) {
+        while (gpio_get(PDM_TRIGGER_PIN)) {
+            tight_loop_contents();
+        }
+        sleep_us(TRIGGER_IDLE_SETTLE_US);
+        if (!gpio_get(PDM_TRIGGER_PIN)) {
+            return;
+        }
+    }
+}
 
 // --------- DMA IRQ handler ---------
 void __isr dma_irq_handler(void) {
@@ -104,6 +122,12 @@ static void update_capture_params(uint32_t new_ms) {
     if (g_capture_words > MAX_CAPTURE_WORDS) {
         g_capture_words = MAX_CAPTURE_WORDS;
     }
+    if (g_capture_words == 0) {
+        g_capture_words = 1;
+    }
+
+    uint64_t total_bits = (uint64_t)g_capture_words * 32u;
+    g_capture_bits_minus1 = (uint32_t)(total_bits - 1u);
 }
 
 // --------- USB send function ---------
@@ -151,24 +175,33 @@ static void pdm_capture_pio_init(PIO pio,
                                  uint sm,
                                  uint offset,
                                  uint data_pin,
-                                 uint trigger_pin)
+                                 uint trigger_pin,
+                                 bool drive_debug_pin)
 {
     pio_sm_config c = pdm_trigger_capture_program_get_default_config(offset);
 
     // IN base pin is data_pin for this mic; jmp pin is the shared trigger.
     sm_config_set_in_pins(&c, data_pin);
     sm_config_set_jmp_pin(&c, trigger_pin);
+    sm_config_set_sideset_pins(&c, CAPTURE_DEBUG_PIN);
 
     // Shift configuration: shift right, no autopush, threshold 32 bits
     sm_config_set_in_shift(&c, true, false, 32);
 
-    // Same clock divider as clock SM so timing stays in phase
+    // Capture loop executes 3 instructions per bit while the clock SM
+    // toggles every 2 instructions, so run ~1.5x faster to stay aligned.
     float clkdiv = (float)clock_get_hz(clk_sys) / (float)(PDM_BITRATE * 2u);
+    clkdiv *= (1.0f / 10.0f);
     sm_config_set_clkdiv(&c, clkdiv);
 
     // Map GPIOs to PIO (just function multiplexer, not direction)
     pio_gpio_init(pio, data_pin);      // GPIO 2
     pio_gpio_init(pio, trigger_pin);   // GPIO 4
+
+    if (drive_debug_pin) {
+        pio_gpio_init(pio, CAPTURE_DEBUG_PIN);
+        pio_sm_set_consecutive_pindirs(pio, sm, CAPTURE_DEBUG_PIN, 1, true);
+    }
 
     // DO NOT set directions here (GPIOs default to input, which we want for data/trigger)
     // This avoids messing with GPIO 3, which is driven as output by the clock SM.
@@ -262,7 +295,8 @@ int main() {
     pdm_clock_pio_init(g_pio, g_sm_clk, g_offset_clk, PDM_CLK_PIN);
     for (size_t ch = 0; ch < MIC_COUNT; ++ch) {
         pdm_capture_pio_init(g_pio, g_sm_cap[ch], g_offset_cap,
-                             g_data_pins[ch], PDM_TRIGGER_PIN);
+                             g_data_pins[ch], PDM_TRIGGER_PIN,
+                             ch == 0);
     }
     speaker_pio_init();
 
@@ -281,6 +315,8 @@ int main() {
 
     // Main loop: arm capture, wait for trigger, send over USB CDC
     while (true) {
+        wait_for_trigger_idle();
+
         for (size_t ch = 0; ch < MIC_COUNT; ++ch) {
             g_capture_done[ch] = false;
         }
@@ -301,7 +337,7 @@ int main() {
 
         // Tell each capture SM how many 32-bit words to capture
         for (size_t ch = 0; ch < MIC_COUNT; ++ch) {
-            pio_sm_put_blocking(g_pio, g_sm_cap[ch], g_capture_words);
+            pio_sm_put_blocking(g_pio, g_sm_cap[ch], g_capture_bits_minus1);
         }
 
         // PIO now:
