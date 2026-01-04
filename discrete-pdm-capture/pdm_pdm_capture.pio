@@ -41,6 +41,7 @@ wait_for_high:
 
 capture_loop:
     ; there should  be a delay here for the datasheets spec of delay between clock low and valid data on the mic
+    nop [2]
     in     pins, 1         ; sample PDM data on clock low
     push   iffull noblock  ; push 32-bit word when ISR fills, no gaps
     jmp    x-- continue_bits
@@ -84,6 +85,7 @@ loop:
     nop side 0
     jmp x-- loop
 tone_done:
+nop side 0   ; why did this compile before??
 .wrap
 
 % c-sdk {
