@@ -37,6 +37,13 @@ Wide-area Acoustic Vector-field Estimation for Spatial Probing & Array Calibrati
 ## Capturing Raw PDM over USB
 Run the `capture-listener.py` file while the pico is plugged into the host capture device. This script will capture and save the PDM data to disk for later processing
 
+## Running the Gantry Move and Event Capture Script
+Execute some form of the following command to run the gantry and also export the positions of captures to a csv <br>
+Note that pin 16 is what is being used on the stepper controller board.
+```bash
+python gantry-scripting/measurement_grid.py /dev/ttyUSB0 --x-size 10 --y-size 10 --z-size 10 --spacing 5 --lead-in 2 --reading-time 1 --pin 16 --feedrate 500 --m42-csv-log events.csv
+```
+
 ## Parsing the Bit Stream (`post-process-pdm.py`)
 1. The capture script will create a folder `pdm_captures` which contains a `.json` file and a binary capture file for each PDM microphone. The JSON file specifies how much was captured for each trigger and some other meta-data. 
 2. Run the `post-process-pdm.py` script on the generated data to generate a set of filtered data that is ready for visualization
