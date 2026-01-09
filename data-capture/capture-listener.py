@@ -31,8 +31,13 @@ def auto_detect_serial_port() -> Optional[str]:
     return ports[0].device if ports else None
 
 
-def read_exact(ser: serial.Serial, n: int, idle_timeout: float = 2.0) -> bytes:
-    """Read exactly n bytes from serial, tolerating brief pauses."""
+def read_exact(
+    ser: serial.Serial, n: int, idle_timeout: Optional[float] = 2.0
+) -> bytes:
+    """Read exactly n bytes from serial, tolerating brief pauses.
+
+    Set idle_timeout to None to wait indefinitely (useful between captures).
+    """
     buf = bytearray()
     last_progress = time.monotonic()
 
@@ -44,6 +49,9 @@ def read_exact(ser: serial.Serial, n: int, idle_timeout: float = 2.0) -> bytes:
             continue
 
         # No data this read: check if we've been idle for too long
+        if idle_timeout is None:
+            continue
+
         if (time.monotonic() - last_progress) >= idle_timeout:
             raise RuntimeError("Serial read timeout or device disconnected")
 
@@ -85,7 +93,7 @@ def main():
 
         try:
             # 1) Read header
-            hdr_bytes = read_exact(ser, HDR_SIZE)
+            hdr_bytes = read_exact(ser, HDR_SIZE, idle_timeout=None)
             magic, index, bit_count, channel_count = struct.unpack(HDR_FMT, hdr_bytes)
         except RuntimeError as exc:
             print(f"{exc}; flushing and waiting for next frame...")

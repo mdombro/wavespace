@@ -302,6 +302,8 @@ def process_capture(
     map_pm1: bool,
     combine_method: str,
     highpass_taps: Optional[np.ndarray] = None,
+    fs_out: Optional[float] = None,
+    speaker_delay_us: float = 0.0,
 ) -> np.ndarray:
     filtered: List[np.ndarray] = []
     for ch in sorted(spec.channels, key=lambda c: c.channel_index):
@@ -310,6 +312,14 @@ def process_capture(
     combined = combine_channels(filtered, method=combine_method)
     if highpass_taps is not None and combined.size:
         combined = StreamingFilter(highpass_taps, decimation=1).process(combined)
+
+    # Drop initial samples to account for speaker-to-microphone delay
+    if speaker_delay_us > 0 and fs_out is not None and combined.size:
+        samples_to_drop = int((speaker_delay_us / 1_000_000.0) * fs_out)
+        if samples_to_drop >= combined.size:
+            return np.empty(0, dtype=np.float64)
+        combined = combined[samples_to_drop:]
+
     return combined
 
 
@@ -367,6 +377,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Optional comma-separated list of capture indices to process (others are skipped).",
     )
+    parser.add_argument(
+        "--speaker-delay-us",
+        type=float,
+        default=0.0,
+        help="Microseconds of samples to drop from the start after filtering (accounts for speaker-to-mic delay).",
+    )
     return parser.parse_args()
 
 
@@ -422,6 +438,7 @@ def main() -> int:
         decimation=np.int32(decimation),
         taps_lowpass=taps.astype(np.float64),
         taps_highpass=(highpass_taps.astype(np.float64) if highpass_taps is not None else np.array([], dtype=np.float64)),
+        speaker_delay_us=np.float64(args.speaker_delay_us),
     )
     if args.plot_filter or args.plot_filter_file:
         try:
@@ -454,6 +471,8 @@ def main() -> int:
             map_pm1=args.map_pm1,
             combine_method=args.combine,
             highpass_taps=highpass_taps,
+            fs_out=fs_out,
+            speaker_delay_us=args.speaker_delay_us,
         )
         if combined.size == 0:
             print(f"Skipping capture {spec.index}: empty filtered output.")
@@ -474,6 +493,7 @@ def main() -> int:
             taps=taps.astype(np.float64),
             highpass_cutoff=np.float64(highpass_cutoff or 0.0),
             highpass_taps=(highpass_taps.astype(np.float64) if highpass_taps is not None else np.array([], dtype=np.float64)),
+            speaker_delay_us=np.float64(args.speaker_delay_us),
         )
         if wav_output_dir is not None:
             wav_path = wav_output_dir / f"{out_path.stem}.wav"

@@ -52,7 +52,7 @@ python gantry-scripting/measurement_grid.py /dev/ttyUSB0 --x-size 10 --y-size 10
 ```bash
 python data-processing/post-process-pdm.py --captures pdm_captures/ --xyz events.csv --out filtered-data --decimation 1 --write-wav --plot-filter --sample-rate 3250000
 
-python data-processing/post-process-pdm.py --captures pdm_captures/ --xyz events.csv --out filtered-data --decimation 1 --write-wav --plot-filter --sample-rate 3250000 --highpass-cutoff 20000 --cutoff 30000
+python data-processing/post-process-pdm.py --captures pdm_captures/ --xyz events.csv --out filtered-data2 --decimation 1 --write-wav --plot-filter --sample-rate 3250000 --highpass-cutoff 20000 --cutoff 30000 --speaker-delay-us 2000
 ```
 
 ## Generating Visualization Sample Data (`pyvista-viz.py`)
