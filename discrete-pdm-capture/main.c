@@ -22,7 +22,7 @@
 #define SPEAKER_TRIGGER_PIN PDM_TRIGGER_PIN
 #define SPEAKER_TONE_HZ     90000u    // Speaker tone frequency
 #define SPEAKER_DURATION_MS 1u     // Speaker tone duration per trigger
-#define SPEAKER_DELAY_US    0u     // Delay before tone starts (microseconds)
+#define SPEAKER_DELAY_US    2000u     // Delay before tone starts (microseconds)
 
 #define CAPTURE_DEBUG_PIN   7   // shared debug probe pin
 
@@ -213,7 +213,8 @@ static void pdm_capture_pio_init(PIO pio,
 
 static void speaker_pio_init(void)
 {
-    float clkdiv = (float)clock_get_hz(clk_sys) / (float)(SPEAKER_TONE_HZ * 2u);
+    // trigger_wave PIO uses three instructions per tone period
+    float clkdiv = (float)clock_get_hz(clk_sys) / (float)(SPEAKER_TONE_HZ * 3u);
     if (clkdiv < 1.0f) {
         clkdiv = 1.0f;
     }
@@ -228,7 +229,7 @@ static void speaker_pio_init(void)
     }
 
     uint64_t delay_ticks =
-        (uint64_t)SPEAKER_TONE_HZ * 2u * (uint64_t)SPEAKER_DELAY_US / 1000000u;
+        (uint64_t)SPEAKER_TONE_HZ * 3u * (uint64_t)SPEAKER_DELAY_US / 1000000u;
     if (delay_ticks > 0xFFFFFFFFu) {
         delay_ticks = 0xFFFFFFFFu;
     }

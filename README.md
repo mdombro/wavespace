@@ -50,7 +50,9 @@ python gantry-scripting/measurement_grid.py /dev/ttyUSB0 --x-size 10 --y-size 10
 3. You will also need to have an `events.csv` file that specifies for each trigger index the corresponding XYZ location in the gantry space. This is a work in progress from the `gantry_scripting` set of scripts.
 ### Example
 ```bash
-python post-process-pdm.py --captures pdm_captures --xyz events.csv --out filtered-captures --decimation 1 
+python data-processing/post-process-pdm.py --captures pdm_captures/ --xyz events.csv --out filtered-data --decimation 1 --write-wav --plot-filter --sample-rate 3250000
+
+python data-processing/post-process-pdm.py --captures pdm_captures/ --xyz events.csv --out filtered-data --decimation 1 --write-wav --plot-filter --sample-rate 3250000 --highpass-cutoff 20000 --cutoff 30000
 ```
 
 ## Generating Visualization Sample Data (`pyvista-viz.py`)
