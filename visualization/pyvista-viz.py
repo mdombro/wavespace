@@ -44,6 +44,15 @@ from pyvistaqt import QtInteractor
 # ---------------- Data providers ----------------
 
 
+def _normalize_val(val: np.ndarray) -> np.ndarray:
+    """Normalize values to [0, 1] range using min-max scaling."""
+    val = np.asarray(val, dtype=np.float32)
+    vmin, vmax = val.min(), val.max()
+    if vmax - vmin < 1e-12:
+        return np.zeros_like(val)
+    return (val - vmin) / (vmax - vmin)
+
+
 class ProviderBase:
     def __len__(self):
         raise NotImplementedError
@@ -83,7 +92,8 @@ class NPZFramesProvider(ProviderBase):
             raise FileNotFoundError(fn)
         data = np.load(fn, allow_pickle=False)
         xyz = data["xyz"].astype(np.float32)
-        val = np.clip(data["val"].astype(np.float32), 0.0, 1.0)
+        val = data["val"].astype(np.float32)
+        val = _normalize_val(val)
         return xyz, val
 
     def get(self, t):
@@ -99,7 +109,7 @@ class NPZFramesProvider(ProviderBase):
 class NPZSeriesProvider(ProviderBase):
     def __init__(self, series_path):
         data = np.load(series_path, allow_pickle=False)
-        self._val = np.clip(data["val"].astype(np.float32), 0.0, 1.0)
+        self._val = _normalize_val(data["val"].astype(np.float32))
         self.T, self.N = self._val.shape
         self._N = self.N
         self._xyz = data["xyz"]
@@ -163,7 +173,7 @@ class PointFilesProvider(ProviderBase):
             xyz = np.asarray(data["xyz"], dtype=np.float32).reshape(-1)
             if xyz.size != 3:
                 raise ValueError(f"'xyz' in {fn} must have 3 elements, got {xyz.shape}")
-            series = np.clip(np.asarray(data["val"], dtype=np.float32), 0.0, 1.0).reshape(-1)
+            series = _normalize_val(np.asarray(data["val"], dtype=np.float32).reshape(-1))
             frame_count = series.shape[0]
             if min_frames is None or frame_count < min_frames:
                 min_frames = frame_count
