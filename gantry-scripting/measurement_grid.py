@@ -24,6 +24,10 @@ class MeasurementGrid:
         self.m42_count = 0
         self.m42_events = []
         self.planned_m42_events = []
+        self._csv_stream_file = None
+        self._csv_stream_writer = None
+        self._csv_stream_target = None
+        self._csv_stream_error = False
     
     def connect(self):
         """Establish serial connection."""
@@ -119,6 +123,7 @@ class MeasurementGrid:
         }
         self.m42_count += 1
         self.m42_events.append(event)
+        self._stream_csv_event(event)
 
         pos = event['position']
         print(
@@ -126,6 +131,64 @@ class MeasurementGrid:
             f"X{pos['X']:.3f} Y{pos['Y']:.3f} Z{pos['Z']:.3f}"
         )
         return event
+
+    def _open_csv_stream(self, csv_path: str | None) -> bool:
+        """Open a CSV file for streaming measurement rows as they occur."""
+        # Ensure previous stream is closed before opening a new one
+        self._close_csv_stream()
+        self._csv_stream_target = None
+        self._csv_stream_error = False
+
+        if not csv_path:
+            return False
+
+        try:
+            self._csv_stream_file = open(csv_path, 'w', newline='', encoding='utf-8')
+            fieldnames = ['index', 'command', 'X', 'Y', 'Z']
+            self._csv_stream_writer = csv.DictWriter(self._csv_stream_file, fieldnames=fieldnames)
+            self._csv_stream_writer.writeheader()
+            self._csv_stream_file.flush()
+            self._csv_stream_target = csv_path
+            print(f"Streaming measurement rows to CSV: {csv_path}")
+            return True
+        except OSError as exc:
+            print(f"Failed to open CSV stream {csv_path}: {exc}")
+            self._csv_stream_file = None
+            self._csv_stream_writer = None
+            self._csv_stream_target = None
+            self._csv_stream_error = True
+            return False
+
+    def _close_csv_stream(self):
+        """Flush and close any active CSV stream."""
+        if self._csv_stream_file:
+            try:
+                self._csv_stream_file.flush()
+                self._csv_stream_file.close()
+            except OSError as exc:
+                print(f"Failed to close CSV stream: {exc}")
+        self._csv_stream_file = None
+        self._csv_stream_writer = None
+
+    def _stream_csv_event(self, event: dict):
+        """Write a single event row to the CSV stream if it is enabled."""
+        if not self._csv_stream_writer:
+            return
+
+        pos = event['position']
+        try:
+            self._csv_stream_writer.writerow({
+                'index': event['index'],
+                'command': event['command'],
+                'X': pos.get('X', pos.get('x', 0.0)),
+                'Y': pos.get('Y', pos.get('y', 0.0)),
+                'Z': pos.get('Z', pos.get('z', 0.0)),
+            })
+            self._csv_stream_file.flush()
+        except OSError as exc:
+            print(f"Failed to stream CSV row: {exc}")
+            self._csv_stream_error = True
+            self._close_csv_stream()
 
     def _extract_m42_strength(self, command: str) -> int | None:
         """Parse the S value from an M42 command."""
@@ -344,7 +407,8 @@ class MeasurementGrid:
         )
         print(f"Planned M42 commands (including initial reset): {len(self.planned_m42_events)}")
         self._preview_m42_plan()
-        
+        self._open_csv_stream(m42_csv_path)
+
         if not self.connect():
             return
         
@@ -410,11 +474,15 @@ class MeasurementGrid:
             traceback.print_exc()
         
         finally:
+            streaming_completed = bool(self._csv_stream_target) and not self._csv_stream_error
+            self._close_csv_stream()
             # Persist log even if there was an error or interrupt
             self.save_m42_events(
                 json_path=m42_json_path,
-                csv_path=m42_csv_path
+                csv_path=None if streaming_completed else m42_csv_path
             )
+            self._csv_stream_target = None
+            self._csv_stream_error = False
             self.disconnect()
 
 

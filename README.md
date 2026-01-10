@@ -42,6 +42,8 @@ Execute some form of the following command to run the gantry and also export the
 Note that pin 16 is what is being used on the stepper controller board.
 ```bash
 python gantry-scripting/measurement_grid.py /dev/ttyUSB0 --x-size 10 --y-size 10 --z-size 10 --spacing 5 --lead-in 2 --reading-time 1 --pin 16 --feedrate 500 --m42-csv-log events.csv
+
+python gantry-scripting/measurement_grid.py /dev/ttyUSB0 --x-size 20 --y-size 20 --z-size 20 --spacing 1 --lead-in 1 --reading-time 0.3 --pin 16 --feedrate 300 --m42-csv-log events.csv
 ```
 
 ## Parsing the Bit Stream (`post-process-pdm.py`)
