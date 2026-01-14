@@ -44,15 +44,6 @@ from pyvistaqt import QtInteractor
 # ---------------- Data providers ----------------
 
 
-def _normalize_val(val: np.ndarray) -> np.ndarray:
-    """Normalize values to [0, 1] range using min-max scaling."""
-    val = np.asarray(val, dtype=np.float32)
-    vmin, vmax = val.min(), val.max()
-    if vmax - vmin < 1e-12:
-        return np.zeros_like(val)
-    return (val - vmin) / (vmax - vmin)
-
-
 class ProviderBase:
     def __len__(self):
         raise NotImplementedError
@@ -67,6 +58,9 @@ class ProviderBase:
     def max_points(self) -> int:
         return getattr(self, "_N", None)
 
+    def amplitude_range(self):
+        return (-1.0, 1.0)
+
 
 class NPZFramesProvider(ProviderBase):
     def __init__(self, path, pattern, frames):
@@ -75,10 +69,19 @@ class NPZFramesProvider(ProviderBase):
         self.T = int(frames)
         if self.T <= 0:
             raise ValueError("Frame count must be positive.")
-        xyz0, _ = self._load(0)
-        self._N = xyz0.shape[0]
-        self._first_xyz = xyz0.copy()
+        self._amp_min = float("inf")
+        self._amp_max = float("-inf")
+        self._prefetch = {}
+        self._first_xyz = None
         self._static = True
+        self._scan_amplitude_range()
+        if 0 in self._prefetch:
+            xyz0, _ = self._prefetch[0]
+        else:
+            xyz0, _ = self._load_frame(0)
+        self._N = xyz0.shape[0]
+        if self._first_xyz is None:
+            self._first_xyz = xyz0.copy()
 
     def __len__(self):
         return self.T
@@ -86,18 +89,39 @@ class NPZFramesProvider(ProviderBase):
     def _filename(self, t):
         return os.path.join(self.path, self.pattern.format(t))
 
-    def _load(self, t):
+    def _load_frame(self, t, use_prefetch=True):
+        if use_prefetch and t in self._prefetch:
+            xyz, val = self._prefetch.pop(t)
+            return xyz.copy(), val.copy()
         fn = self._filename(t)
         if not os.path.exists(fn):
             raise FileNotFoundError(fn)
         data = np.load(fn, allow_pickle=False)
-        xyz = data["xyz"].astype(np.float32)
-        val = data["val"].astype(np.float32)
-        val = _normalize_val(val)
+        xyz = np.asarray(data["xyz"], dtype=np.float32)
+        val = np.asarray(data["val"], dtype=np.float32).reshape(-1)
+        if val.size:
+            vmin = float(np.min(val))
+            vmax = float(np.max(val))
+            if vmin < self._amp_min:
+                self._amp_min = vmin
+            if vmax > self._amp_max:
+                self._amp_max = vmax
         return xyz, val
 
+    def _scan_amplitude_range(self):
+        for t in range(self.T):
+            xyz, val = self._load_frame(t, use_prefetch=False)
+            if t == 0:
+                self._prefetch[0] = (xyz.copy(), val.copy())
+                self._first_xyz = xyz.copy()
+                self._N = xyz.shape[0]
+        if not np.isfinite(self._amp_min):
+            self._amp_min = 0.0
+        if not np.isfinite(self._amp_max):
+            self._amp_max = 0.0
+
     def get(self, t):
-        xyz, val = self._load(int(t))
+        xyz, val = self._load_frame(int(t))
         if self._static and not np.array_equal(self._first_xyz, xyz):
             self._static = False
         return xyz, val
@@ -105,14 +129,19 @@ class NPZFramesProvider(ProviderBase):
     def static_xyz(self) -> bool:
         return bool(self._static)
 
+    def amplitude_range(self):
+        return (self._amp_min, self._amp_max)
+
 
 class NPZSeriesProvider(ProviderBase):
     def __init__(self, series_path):
         data = np.load(series_path, allow_pickle=False)
-        self._val = _normalize_val(data["val"].astype(np.float32))
+        self._val = np.asarray(data["val"], dtype=np.float32)
         self.T, self.N = self._val.shape
         self._N = self.N
         self._xyz = data["xyz"]
+        self._amp_min = float(np.min(self._val)) if self._val.size else 0.0
+        self._amp_max = float(np.max(self._val)) if self._val.size else 0.0
         if self._xyz.ndim == 2 and self._xyz.shape == (self.N, 3):
             self._mode = "static"
         elif self._xyz.ndim == 3 and self._xyz.shape == (self.T, self.N, 3):
@@ -133,6 +162,9 @@ class NPZSeriesProvider(ProviderBase):
 
     def static_xyz(self):
         return self._mode == "static"
+
+    def amplitude_range(self):
+        return (self._amp_min, self._amp_max)
 
 
 class PointFilesProvider(ProviderBase):
@@ -173,7 +205,7 @@ class PointFilesProvider(ProviderBase):
             xyz = np.asarray(data["xyz"], dtype=np.float32).reshape(-1)
             if xyz.size != 3:
                 raise ValueError(f"'xyz' in {fn} must have 3 elements, got {xyz.shape}")
-            series = _normalize_val(np.asarray(data["val"], dtype=np.float32).reshape(-1))
+            series = np.asarray(data["val"], dtype=np.float32).reshape(-1)
             frame_count = series.shape[0]
             if min_frames is None or frame_count < min_frames:
                 min_frames = frame_count
@@ -210,6 +242,10 @@ class PointFilesProvider(ProviderBase):
         self._ragged_series = [np.asarray(series, dtype=np.float32) for series in trimmed]
         self._val_series = None
         self._T = max(series.shape[0] for series in self._ragged_series)
+        mins = [float(np.min(series)) for series in self._ragged_series if series.size]
+        maxs = [float(np.max(series)) for series in self._ragged_series if series.size]
+        self._amp_min = min(mins) if mins else 0.0
+        self._amp_max = max(maxs) if maxs else 0.0
 
     def get(self, t):
         if self._val_series is None:
@@ -234,6 +270,12 @@ class PointFilesProvider(ProviderBase):
                 series = series[:max_len]
             padded.append(series)
         self._val_series = np.stack(padded, axis=1)
+        if self._val_series.size:
+            self._amp_min = float(np.min(self._val_series))
+            self._amp_max = float(np.max(self._val_series))
+
+    def amplitude_range(self):
+        return (self._amp_min, self._amp_max)
 
 
 def make_demo_provider(T=160, N=1000, radius=1.0):
@@ -247,48 +289,71 @@ def make_demo_provider(T=160, N=1000, radius=1.0):
         [r * s * np.cos(phi), r * s * np.sin(phi), r * cost], axis=-1
     ).astype(np.float32)
 
+    val_series = np.empty((T, N), dtype=np.float32)
+    rr = np.linalg.norm(xyz, axis=1)
+    sigma = 0.16 * radius
+    denom = 2 * sigma * sigma
+    for t in range(T):
+        tau = t / max(1, T - 1)
+        r0 = 0.8 * radius * tau
+        val = np.exp(-((rr - r0) ** 2) / denom)
+        m = val.max()
+        if m > 0:
+            val = val / m
+        val_series[t] = val.astype(np.float32)
+
     class Demo(ProviderBase):
+        def __init__(self, xyz_data, val_data):
+            self._xyz = xyz_data
+            self._val = val_data
+            if self._val.size:
+                self._amp_min = float(self._val.min())
+                self._amp_max = float(self._val.max())
+            else:
+                self._amp_min = 0.0
+                self._amp_max = 0.0
+
         def __len__(self):
-            return T
+            return self._val.shape[0]
 
         def get(self, t):
-            tt = int(t)
-            tau = tt / max(1, T - 1)
-            c = 0.8 * radius
-            r0 = c * tau
-            rr = np.linalg.norm(xyz, axis=1)
-            sigma = 0.16 * radius
-            val = np.exp(-((rr - r0) ** 2) / (2 * sigma * sigma)).astype(np.float32)
-            m = val.max()
-            if m > 0:
-                val /= m
-            return xyz, val
+            return self._xyz, self._val[int(t)]
 
         def static_xyz(self):
             return True
 
         def max_points(self):
-            return xyz.shape[0]
+            return self._xyz.shape[0]
 
-    return Demo()
+        def amplitude_range(self):
+            return (self._amp_min, self._amp_max)
+
+    return Demo(xyz, val_series)
 
 
 # ---------------- Visualization helpers ----------------
 
 
-COLORSCALES = ["Viridis", "Plasma", "Cividis", "Magma", "Turbo", "Inferno", "Ice", "Aggrnyl"]
+COLORSCALES = ["RdBu", "PuOr", "BrBG", "PiYG", "Spectral", "coolwarm", "seismic", "RdYlGn"]
 
 
 @dataclass
 class VizParams:
-    cmap: str = "Viridis"
+    cmap: str = "RdBu"
     size_scale: float = 1.0
     downsample: int = 0  # 0 = no downsample
+    amp_threshold: float = 0.0
 
 
 def _normalize_cmap_name(name: str) -> str:
-    """Translate UI colormap labels into the lowercase keys expected by Matplotlib."""
-    return (name or "").strip().lower()
+    """Return a Matplotlib-friendly colormap identifier."""
+    if not name:
+        return COLORSCALES[0]
+    cleaned = (name or "").strip()
+    if cleaned in COLORSCALES:
+        return cleaned
+    lower = cleaned.lower()
+    return lower if lower else COLORSCALES[0]
 
 
 def _downsample(xyz, val, step):
@@ -307,8 +372,12 @@ def _safe_diag_extent(xyz):
     return diag if diag > 0 else 1.0
 
 
-def _compute_sizes(val, size_scale, scale_factor):
-    base = 2.0 + 8.0 * val  # baseline range roughly matching previous defaults
+def _compute_sizes(val, size_scale, scale_factor, amp_abs_max):
+    if val.size == 0:
+        return np.empty((0,), dtype=np.float32)
+    denom = amp_abs_max if amp_abs_max > 1e-12 else 1.0
+    mag = np.clip(np.abs(val) / denom, 0.0, 1.0)
+    base = 2.0 + 8.0 * mag  # baseline range roughly matching previous defaults
     return scale_factor * size_scale * base
 
 
@@ -330,9 +399,20 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.size_scale = min(4.0, max(0.1, self.size_scale))
         self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else COLORSCALES[0]
         self.static_xyz = provider.static_xyz()
+        amp_min, amp_max = provider.amplitude_range()
+        self.amp_min = float(amp_min)
+        self.amp_max = float(amp_max)
+        base_amp = max(abs(self.amp_min), abs(self.amp_max))
+        self._amp_slider_enabled = base_amp > 0
+        self.amp_abs_max = base_amp if base_amp > 0 else 1.0
+        self.amp_threshold = min(max(0.0, self.params.amp_threshold), self.amp_abs_max)
+        self._current_scale_abs = self.amp_abs_max
+        self._clim = (-self.amp_abs_max, self.amp_abs_max)
+        self._amp_slider_resolution = 1000
 
         xyz0, val0 = provider.get(0)
         xyz0, val0 = _downsample(xyz0, val0, self.params.downsample)
+        xyz0, val0 = self._apply_amp_threshold(xyz0, val0)
         self._base_extent = _safe_diag_extent(xyz0)
         self._size_scale = self._base_extent / 150.0
         self._glyph_geom = pv.Sphere(radius=1.0, theta_resolution=12, phi_resolution=12)
@@ -342,9 +422,11 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self._actor = None
         self.label_frame = None
         self.label_downsample = None
+        self.label_amp_threshold = None
 
         self._build_ui(fps)
         self._initialize_scene(xyz0, val0)
+        self._update_status_labels()
 
     # ----- UI construction -----
 
@@ -365,6 +447,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.label_frame = QtWidgets.QLabel()
         self.label_downsample = QtWidgets.QLabel()
         self.label_size_scale = None
+        self.slider_amp = None
 
         top_row.addWidget(self.btn_play)
         top_row.addWidget(self.btn_pause)
@@ -404,6 +487,21 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         down_layout.addWidget(self.slider_downsample)
         settings_row.addLayout(down_layout)
 
+        # Amplitude threshold slider
+        amp_layout = QtWidgets.QVBoxLayout()
+        amp_layout.addWidget(QtWidgets.QLabel("Amplitude threshold (|value|)"))
+        self.slider_amp = self._make_slider(
+            0,
+            self._amp_slider_resolution,
+            self._amp_value_to_slider(self.amp_threshold),
+        )
+        if not self._amp_slider_enabled:
+            self.slider_amp.setEnabled(False)
+        amp_layout.addWidget(self.slider_amp)
+        self.label_amp_threshold = QtWidgets.QLabel(self._format_amp_label(self.amp_threshold))
+        amp_layout.addWidget(self.label_amp_threshold)
+        settings_row.addLayout(amp_layout)
+
         main_layout.addLayout(settings_row)
 
         # PyVista view
@@ -424,10 +522,54 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
         self.slider_size_scale.valueChanged.connect(self._on_size_scale_changed)
         self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
+        self.slider_amp.valueChanged.connect(self._on_amp_threshold_changed)
+
+    def _frame_abs_value(self, val) -> float:
+        arr = np.asarray(val, dtype=np.float32)
+        if arr.size == 0:
+            return 0.0
+        return float(np.max(np.abs(arr)))
+
+    def _select_scale_abs(self, frame_abs: float) -> float:
+        if frame_abs and frame_abs > 0:
+            return frame_abs
+        if self.amp_abs_max > 0:
+            return self.amp_abs_max
+        return 1.0
+
+    def _update_scale_and_clim(self, frame_abs: float, update_mapper: bool = False) -> float:
+        scale_abs = self._select_scale_abs(frame_abs)
+        if scale_abs <= 0:
+            scale_abs = 1.0
+        self._current_scale_abs = scale_abs
+        self._clim = (-scale_abs, scale_abs)
+        if update_mapper:
+            self._apply_color_limits_to_mapper()
+        return scale_abs
+
+    def _apply_color_limits_to_mapper(self):
+        vtk_mapper = self._get_actor_mapper()
+        if vtk_mapper is None:
+            return
+        self._ensure_mapper_scalar_settings(vtk_mapper)
+        if hasattr(vtk_mapper, "SetScalarRange"):
+            vtk_mapper.SetScalarRange(*self._clim)
+        lut = None
+        if hasattr(vtk_mapper, "GetLookupTable"):
+            lut = vtk_mapper.GetLookupTable()
+        if lut is not None:
+            if hasattr(lut, "SetRange"):
+                lut.SetRange(*self._clim)
+            elif hasattr(lut, "scalar_range"):
+                try:
+                    lut.scalar_range = self._clim
+                except Exception:
+                    pass
+        if hasattr(vtk_mapper, "Modified"):
+            vtk_mapper.Modified()
 
     def _format_size_scale_label(self, value):
         return f"{value:.2f}×"
-        self._update_status_labels()
 
     def _make_slider(self, minimum, maximum, value):
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -436,6 +578,24 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         slider.setPageStep(1)
         slider.setValue(int(round(value)))
         return slider
+
+    def _amp_value_to_slider(self, value):
+        if self.amp_abs_max <= 0:
+            return 0
+        frac = float(np.clip(value / self.amp_abs_max, 0.0, 1.0))
+        return int(round(frac * self._amp_slider_resolution))
+
+    def _slider_to_amp_value(self, slider_value):
+        if self.amp_abs_max <= 0:
+            return 0.0
+        return (float(slider_value) / float(self._amp_slider_resolution)) * self.amp_abs_max
+
+    def _format_amp_label(self, value):
+        return f"|val| ≥ {value:.4g}" if value > 0 else "No amplitude cutoff"
+
+    def _update_amp_label(self):
+        if self.label_amp_threshold is not None:
+            self.label_amp_threshold.setText(self._format_amp_label(self.amp_threshold))
 
     def _wrap_slider(self, label, slider):
         layout = QtWidgets.QVBoxLayout()
@@ -446,8 +606,13 @@ class PointCloudViewer(QtWidgets.QMainWindow):
     # ----- Plot initialization -----
 
     def _initialize_scene(self, xyz, val):
-        mesh = self._build_polydata(xyz, val)
-        glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
+        frame_abs = self._frame_abs_value(val)
+        scale_abs = self._update_scale_and_clim(frame_abs, update_mapper=False)
+        mesh = self._build_polydata(xyz, val, scale_abs)
+        if mesh.n_points:
+            glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
+        else:
+            glyph = pv.PolyData()
         self._apply_scalars_to_glyph(glyph, mesh)
         self._mesh = mesh
         self._glyph = glyph
@@ -455,7 +620,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             glyph,
             scalars="val",
             cmap=_normalize_cmap_name(self.cmap),
-            clim=[0.0, 1.0],
+            clim=self._clim,
             lighting=False,
             show_scalar_bar=False,
             opacity=0.5,
@@ -475,19 +640,33 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         if vtk_mapper is not None:
             self._ensure_mapper_scalar_settings(vtk_mapper)
             if hasattr(vtk_mapper, "SetScalarRange"):
-                vtk_mapper.SetScalarRange(0.0, 1.0)
+                vtk_mapper.SetScalarRange(*self._clim)
         self.plotter.show_axes()
         self.plotter.render()
 
-    def _build_polydata(self, xyz, val):
+    def _build_polydata(self, xyz, val, scale_abs: float):
         xyz = np.asarray(xyz, dtype=np.float32)
-        val = np.clip(np.asarray(val, dtype=np.float32), 0.0, 1.0)
+        val = np.asarray(val, dtype=np.float32).reshape(-1)
         mesh = pv.PolyData(xyz)
         mesh.point_data["val"] = val
         mesh.point_data.active_scalars_name = "val"
-        scale = _compute_sizes(val, self.size_scale, self._size_scale)
+        scale = _compute_sizes(val, self.size_scale, self._size_scale, scale_abs)
         mesh.point_data["scale"] = scale
         return mesh
+
+    def _apply_amp_threshold(self, xyz, val):
+        thr = float(self.amp_threshold)
+        xyz_arr = np.asarray(xyz, dtype=np.float32)
+        val_arr = np.asarray(val, dtype=np.float32).reshape(-1)
+        if thr <= 0 or val_arr.size == 0:
+            return xyz_arr, val_arr
+        mask = np.abs(val_arr) >= thr
+        if not np.any(mask):
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+        return xyz_arr[mask], val_arr[mask]
 
     # ----- UI callbacks -----
 
@@ -520,6 +699,14 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self._update_status_labels()
         self._refresh_current_mesh(rebuild_geometry=True)
 
+    def _on_amp_threshold_changed(self, value):
+        new_thr = self._slider_to_amp_value(value)
+        if abs(new_thr - self.amp_threshold) < 1e-6:
+            return
+        self.amp_threshold = new_thr
+        self._update_amp_label()
+        self._refresh_current_mesh(rebuild_geometry=True)
+
     # ----- Scene updates -----
 
     def set_frame(self, frame_index, rebuild_geometry=False):
@@ -529,14 +716,25 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         self.current_frame = frame_index
         xyz, val = self.provider.get(frame_index)
         xyz, val = _downsample(xyz, val, self.downsample_step)
+        xyz, val = self._apply_amp_threshold(xyz, val)
+        frame_abs = self._frame_abs_value(val)
+        scale_abs = self._update_scale_and_clim(frame_abs, update_mapper=True)
 
-        if self.static_xyz and not rebuild_geometry and self._mesh is not None:
-            self._mesh.point_data["val"] = np.clip(val, 0.0, 1.0)
-            scale = _compute_sizes(val, self.size_scale, self._size_scale)
+        reuse_points = (
+            self.static_xyz
+            and not rebuild_geometry
+            and self._mesh is not None
+            and self.amp_threshold <= 0
+        )
+
+        if reuse_points:
+            vals = np.asarray(val, dtype=np.float32)
+            self._mesh.point_data["val"] = vals
+            scale = _compute_sizes(vals, self.size_scale, self._size_scale, scale_abs)
             self._mesh.point_data["scale"] = scale
             self._update_glyph(self._mesh, reuse_points=True)
         else:
-            self._mesh = self._build_polydata(xyz, val)
+            self._mesh = self._build_polydata(xyz, val, scale_abs)
             self._update_glyph(self._mesh, reuse_points=False)
 
         if self.slider_frame.value() != frame_index:
@@ -558,7 +756,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         if not self._actor:
             return
         lut = pv.LookupTable(cmap=_normalize_cmap_name(self.cmap))
-        lut.scalar_range = (0.0, 1.0)
+        lut.scalar_range = self._clim
         vtk_mapper = self._get_actor_mapper()
         if vtk_mapper is None:
             raise RuntimeError("Could not access mapper on actor for colormap update.")
@@ -566,7 +764,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         if hasattr(vtk_mapper, "SetLookupTable"):
             vtk_mapper.SetLookupTable(lut)
         if hasattr(vtk_mapper, "SetScalarRange"):
-            vtk_mapper.SetScalarRange(0.0, 1.0)
+            vtk_mapper.SetScalarRange(*self._clim)
         if hasattr(vtk_mapper, "Modified"):
             vtk_mapper.Modified()
         self.plotter.render()
@@ -608,6 +806,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             self.label_frame.setText(self._frame_label_text())
         if self.label_downsample is not None:
             self.label_downsample.setText(self._downsample_label_text())
+        self._update_amp_label()
 
     def _apply_scalars_to_glyph(self, glyph, mesh):
         if glyph is None or mesh is None:
@@ -628,11 +827,10 @@ class PointCloudViewer(QtWidgets.QMainWindow):
 
     def _update_glyph(self, mesh, reuse_points):
         camera_pos = self.plotter.camera_position
-        if reuse_points and self._glyph is not None:
-            # Regenerate glyph with updated scalars/scale but same points
+        if mesh.n_points:
             glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
         else:
-            glyph = mesh.glyph(scale="scale", geom=self._glyph_geom, orient=False)
+            glyph = pv.PolyData()
 
         self._apply_scalars_to_glyph(glyph, mesh)
         self._glyph = glyph
@@ -646,7 +844,7 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             vtk_mapper.SetInputDataObject(glyph)
         self._ensure_mapper_scalar_settings(vtk_mapper)
         if hasattr(vtk_mapper, "SetScalarRange"):
-            vtk_mapper.SetScalarRange(0.0, 1.0)
+            vtk_mapper.SetScalarRange(*self._clim)
         if hasattr(vtk_mapper, "Modified"):
             vtk_mapper.Modified()
         self.plotter.camera_position = camera_pos
@@ -740,6 +938,12 @@ def main(argv=None):
         help="Marker size multiplier (1.0 = default radius; increase for larger points).",
     )
     ap.add_argument("--downsample", type=int, default=0, help="Keep every Nth point (0=no downsample)")
+    ap.add_argument(
+        "--amp-threshold",
+        type=float,
+        default=0.0,
+        help="Initial |value| cutoff; points below this magnitude are hidden.",
+    )
     ap.add_argument("--host", type=str, default="127.0.0.1", help="Unused (compatibility placeholder)")
     ap.add_argument("--port", type=int, default=8050, help="Unused (compatibility placeholder)")
     ap.add_argument(
@@ -776,9 +980,10 @@ def main(argv=None):
             provider = NPZFramesProvider(args.path, pattern, frames)
 
     params = VizParams(
-        cmap="Viridis",
+        cmap=COLORSCALES[0],
         size_scale=max(0.1, args.size_scale),
         downsample=max(0, args.downsample),
+        amp_threshold=max(0.0, args.amp_threshold),
     )
 
     if args.offscreen:

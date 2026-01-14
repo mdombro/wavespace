@@ -42,6 +42,8 @@ class ProviderBase:
         raise NotImplementedError
     def static_xyz(self) -> bool: return False
     def max_points(self) -> int: return self._N if hasattr(self, "_N") else None
+    def amplitude_range(self):
+        return (-1.0, 1.0)
 
 class PointFilesProvider(ProviderBase):
     def __init__(self, path, pattern, points=None):
@@ -83,8 +85,7 @@ class PointFilesProvider(ProviderBase):
             if xyz.shape[0] != 3:
                 raise ValueError(f"'xyz' in {fn} must have 3 elements, got shape {xyz.shape}")
 
-            val = np.clip(np.asarray(data["val"], dtype=np.float32), 0.0, 1.0)
-            val = val.reshape(-1)
+            val = np.asarray(data["val"], dtype=np.float32).reshape(-1)
             if self._T is None:
                 self._T = val.shape[0]
             elif val.shape[0] != self._T:
@@ -98,6 +99,8 @@ class PointFilesProvider(ProviderBase):
         if self._T is None:
             raise ValueError("Could not determine time dimension from point files.")
         self._N = self._xyz.shape[0]
+        self._amp_min = float(self._val.min())
+        self._amp_max = float(self._val.max())
 
     def get(self, t):
         tt = int(t)
@@ -107,14 +110,18 @@ class PointFilesProvider(ProviderBase):
 
     def static_xyz(self) -> bool: return True
     def max_points(self) -> int: return self._xyz.shape[0]
+    def amplitude_range(self):
+        return (self._amp_min, self._amp_max)
     
 class NPZSeriesProvider(ProviderBase):
     def __init__(self, series_path):
         data = np.load(series_path, allow_pickle=False)
-        self._val = np.clip(data["val"].astype(np.float32), 0.0, 1.0)
+        self._val = data["val"].astype(np.float32)
         self.T, self.N = self._val.shape
         self._N = self.N
         self._xyz = data["xyz"]
+        self._amp_min = float(self._val.min())
+        self._amp_max = float(self._val.max())
         if self._xyz.ndim == 2 and self._xyz.shape == (self.N, 3):
             self._mode = "static"
         elif self._xyz.ndim == 3 and self._xyz.shape == (self.T, self.N, 3):
@@ -130,6 +137,8 @@ class NPZSeriesProvider(ProviderBase):
             xyz = self._xyz[t].astype(np.float32)
         return xyz, self._val[t]
     def static_xyz(self): return self._mode == "static"
+    def amplitude_range(self):
+        return (self._amp_min, self._amp_max)
 
 def make_demo_provider(T=160, N=10000, radius=1.0):
     rng = np.random.default_rng(7)
@@ -154,39 +163,77 @@ def make_demo_provider(T=160, N=10000, radius=1.0):
         val_series[t] = val.astype(np.float32)
 
     class Demo(ProviderBase):
-        def __len__(self): return T
+        def __init__(self, xyz_data, val_data):
+            self._xyz = xyz_data
+            self._val = val_data
+            self._amp_min = float(val_data.min())
+            self._amp_max = float(val_data.max())
+        def __len__(self): return self._val.shape[0]
         def get(self, t):
-            return xyz, val_series[int(t)]
+            return self._xyz, self._val[int(t)]
         def static_xyz(self): return True
-        def max_points(self): return xyz.shape[0]
+        def max_points(self): return self._xyz.shape[0]
+        def amplitude_range(self):
+            return (self._amp_min, self._amp_max)
 
-    return Demo()
+    return Demo(xyz, val_series)
 
 # ------------- Figure helpers -------------
 
-COLORSCALES = ["Viridis","Plasma","Cividis","Magma","Turbo","Inferno","Ice","Aggrnyl"]
+COLORSCALES = ["RdBu","PuOr","Picnic","Portland","BrBG","Spectral"]
 
 @dataclass
 class VizParams:
-    cmap: str = "Viridis"
+    cmap: str = "RdBu"
     size_min: float = 2.0
     size_max: float = 10.0
     downsample: int = 0  # 0 = no downsample; otherwise keep N//downsample points
+    amp_threshold: float = 0.0
 
-def _figure_for_frame(xyz, val, vp: VizParams):
-    N = xyz.shape[0]
-    if vp.downsample and vp.downsample > 1:
-        step = int(max(1, vp.downsample))
-        xyz = xyz[::step]; val = val[::step]; N = xyz.shape[0]
+def _apply_downsample_and_threshold(xyz, val, downsample, amp_threshold, indices=None):
+    if downsample and downsample > 1:
+        step = int(max(1, downsample))
+        if indices is not None:
+            idx = np.asarray(indices, dtype=np.int64)
+        else:
+            idx = np.arange(0, xyz.shape[0], step, dtype=np.int64)
+        xyz = xyz[idx]
+        val = val[idx]
+    thr = float(amp_threshold or 0.0)
+    if thr > 0:
+        mask = np.abs(val) >= thr
+        if np.any(mask):
+            xyz = xyz[mask]
+            val = val[mask]
+        else:
+            xyz = np.empty((0, 3), dtype=xyz.dtype)
+            val = np.empty((0,), dtype=val.dtype)
+    return xyz, val
 
-    sizes = vp.size_min + (vp.size_max - vp.size_min)*val
+def _compute_sizes(val, vp: VizParams, amp_abs_max: float):
+    if val.size == 0:
+        return np.empty((0,), dtype=np.float32)
+    denom = amp_abs_max if amp_abs_max > 1e-9 else 1.0
+    mag = np.clip(np.abs(val) / denom, 0.0, 1.0)
+    return vp.size_min + (vp.size_max - vp.size_min) * mag
+
+def _figure_for_frame(xyz, val, vp: VizParams, amp_abs_max: float):
+    xyz_sel, val_sel = _apply_downsample_and_threshold(
+        xyz, val, vp.downsample, vp.amp_threshold
+    )
+    sizes = _compute_sizes(val_sel, vp, amp_abs_max)
     fig = go.Figure()
     fig.add_trace(go.Scatter3d(
-        x=xyz[:,0], y=xyz[:,1], z=xyz[:,2],
+        x=xyz_sel[:,0] if xyz_sel.size else [],
+        y=xyz_sel[:,1] if xyz_sel.size else [],
+        z=xyz_sel[:,2] if xyz_sel.size else [],
         mode="markers",
         marker=dict(
-            size=np.clip(sizes, 1, 100),
-            color=val, colorscale=vp.cmap, cmin=0, cmax=1,
+            size=np.clip(sizes, 1, 100).tolist(),
+            color=val_sel.tolist(),
+            colorscale=vp.cmap,
+            cmin=-amp_abs_max,
+            cmax=amp_abs_max,
             opacity=0.95,
         )
     ))
@@ -205,9 +252,16 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
     app = Dash(__name__)
     T = len(provider)
     vp = default_params or VizParams()
+    amp_min, amp_max = provider.amplitude_range()
+    amp_abs_max = max(abs(amp_min), abs(amp_max))
+    if amp_abs_max <= 0:
+        amp_abs_max = 1.0
+    amp_slider_step = amp_abs_max / 200 if amp_abs_max > 0 else 0.01
+    amp_slider_value = min(max(0.0, vp.amp_threshold), amp_abs_max)
+    vp.amp_threshold = amp_slider_value
 
     xyz0, val0 = provider.get(0)
-    initial_fig = _figure_for_frame(xyz0, val0, vp)
+    initial_fig = _figure_for_frame(xyz0, val0, vp, amp_abs_max)
 
     app.layout = html.Div([
         html.Div([
@@ -247,6 +301,13 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
                            tooltip={"placement":"bottom", "always_visible":False}),
                 html.Div(id="lbl-down", className="slider-value")
             ], style={"flex":"1","marginLeft":"16px"}),
+            html.Div([
+                html.Label("Amplitude threshold (|value|)"),
+                dcc.Slider(0, amp_abs_max, step=amp_slider_step, value=amp_slider_value, id="sl-amp",
+                           marks=None, dots=False,
+                           tooltip={"placement":"bottom", "always_visible":False}),
+                html.Div(id="lbl-amp", className="slider-value")
+            ], style={"flex":"1","marginLeft":"16px"}),
         ], style={"display":"flex","gap":"12px","alignItems":"center","margin":"8px 12px"}),
 
         dcc.Graph(
@@ -265,6 +326,7 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
     # Initial figure
     app._provider = provider  # stash
     app._vp = vp
+    app._amp_abs_max = amp_abs_max
 
     @app.callback(
         Output("store-playing","data"),
@@ -318,32 +380,33 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
         Output("lbl-szmin","children"),
         Output("lbl-szmax","children"),
         Output("lbl-down","children"),
+        Output("lbl-amp","children"),
         Input("slider-t","value"),
         Input("dd-cmap","value"),
         Input("sl-szmin","value"),
         Input("sl-szmax","value"),
         Input("sl-down","value"),
+        Input("sl-amp","value"),
         Input("store-indices","data"),
         prevent_initial_call=False
     )
-    def update_fig(t, cmap, szmin, szmax, down, indices_data):
+    def update_fig(t, cmap, szmin, szmax, down, amp_threshold, indices_data):
         # Pull frame and render
         xyz, val = provider.get(int(t))
         ds = int(down or 0)
-        if ds > 1:
-            if indices_data is not None:
-                idx = np.asarray(indices_data, dtype=np.int64)
-            else:
-                idx = np.arange(0, xyz.shape[0], ds, dtype=np.int64)
-            xyz_sel = xyz[idx]
-            val_sel = val[idx]
-        else:
-            xyz_sel = xyz
-            val_sel = val
-        sizes = float(szmin) + (float(szmax) - float(szmin)) * val_sel
+        amp_thr = float(amp_threshold or 0.0)
+        indices = indices_data if ds > 1 else None
+        vp_current = VizParams(
+            cmap=cmap, size_min=float(szmin), size_max=float(szmax),
+            downsample=ds, amp_threshold=amp_thr
+        )
+        xyz_sel, val_sel = _apply_downsample_and_threshold(
+            xyz, val, vp_current.downsample, vp_current.amp_threshold, indices
+        )
+        sizes = _compute_sizes(val_sel, vp_current, amp_abs_max)
         triggered = {entry["prop_id"].split(".")[0] for entry in dash.callback_context.triggered}
         update_positions = not triggered  # initial call
-        if "sl-down" in triggered or "store-indices" in triggered:
+        if "sl-down" in triggered or "store-indices" in triggered or "sl-amp" in triggered:
             update_positions = True
         color_list = val_sel.tolist()
         size_list = np.clip(sizes, 1, 100).tolist()
@@ -351,20 +414,20 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
             "color": color_list,
             "size": size_list,
             "colorscale": cmap,
-            "cmin": 0,
-            "cmax": 1,
+            "cmin": -amp_abs_max,
+            "cmax": amp_abs_max,
         }
         if update_positions:
             p = Patch()
             # Update coordinates only when downsample changes to minimize payload
-            p["data"][0]["x"] = xyz_sel[:, 0].tolist()
-            p["data"][0]["y"] = xyz_sel[:, 1].tolist()
-            p["data"][0]["z"] = xyz_sel[:, 2].tolist()
+            p["data"][0]["x"] = xyz_sel[:, 0].tolist() if xyz_sel.size else []
+            p["data"][0]["y"] = xyz_sel[:, 1].tolist() if xyz_sel.size else []
+            p["data"][0]["z"] = xyz_sel[:, 2].tolist() if xyz_sel.size else []
             p["data"][0]["marker"]["color"] = color_list
             p["data"][0]["marker"]["size"] = size_list
             p["data"][0]["marker"]["colorscale"] = cmap
-            p["data"][0]["marker"]["cmin"] = 0
-            p["data"][0]["marker"]["cmax"] = 1
+            p["data"][0]["marker"]["cmin"] = -amp_abs_max
+            p["data"][0]["marker"]["cmax"] = amp_abs_max
             figure_update = p
         else:
             figure_update = dash.no_update
@@ -374,7 +437,8 @@ def create_app(provider: ProviderBase, fps=24, default_params=None):
             lbl_down = "Current: no downsampling"
         else:
             lbl_down = f"Current: keep every {ds}th point"
-        return figure_update, restyle_payload, lbl_szmin, lbl_szmax, lbl_down
+        lbl_amp = f"Current: hide |val| < {amp_thr:.3f}"
+        return figure_update, restyle_payload, lbl_szmin, lbl_szmax, lbl_down, lbl_amp
 
     app.clientside_callback(
         """
@@ -441,6 +505,7 @@ def main():
     ap.add_argument("--size-min", type=float, default=2.0)
     ap.add_argument("--size-max", type=float, default=10.0)
     ap.add_argument("--downsample", type=int, default=0, help="Keep every Nth point (0=no downsample)")
+    ap.add_argument("--amp-threshold", type=float, default=0.0, help="Initial |value| cutoff (hide smaller magnitudes)")
     ap.add_argument("--host", type=str, default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8050)
     args = ap.parse_args()
@@ -456,7 +521,11 @@ def main():
         provider = PointFilesProvider(args.path, args.pattern, points)
 
     vp = VizParams(
-        cmap="Viridis", size_min=args.size_min, size_max=args.size_max, downsample=max(0,args.downsample)
+        cmap=COLORSCALES[0],
+        size_min=args.size_min,
+        size_max=args.size_max,
+        downsample=max(0, args.downsample),
+        amp_threshold=max(0.0, args.amp_threshold),
     )
     app = create_app(provider, fps=args.fps, default_params=vp)
     # Serve with initial figure to avoid first-render lag
