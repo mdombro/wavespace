@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-PyVista-based animated point-cloud viewer.
+PyVista-based animated point-cloud and marching cubes viewer.
 
 - Visualizes time-varying 3D point clouds where per-point scalar values map to color and size
+- Marching cubes mode: extracts isosurfaces from gridded data with adjustable threshold
 - Playback controls: Play/Pause, time slider scrubbing, FPS-configurable timer
 - Display controls: colormap selector, marker size scaling slider, configurable downsampling
 - Data sources:
@@ -10,8 +11,15 @@ PyVista-based animated point-cloud viewer.
     * Single NPZ series (xyz[T,N,3] or xyz[N,3], val[T,N])
     * Synthetic demo (expanding wavefront)
 
+Rendering modes:
+    * point: Traditional point cloud visualization with spherical glyphs
+    * marching_cubes: Isosurface extraction using marching cubes algorithm
+      - Automatically infers grid structure from XYZ coordinates
+      - Normalizes scattered data to regular grid via interpolation
+      - Adjustable threshold slider for isosurface level
+
 Dependencies:
-    pip install numpy pyvista pyvistaqt PyQt5
+    pip install numpy pyvista pyvistaqt PyQt5 scipy
 """
 
 import argparse
@@ -284,6 +292,7 @@ class VizParams:
     cmap: str = "Viridis"
     size_scale: float = 1.0
     downsample: int = 0  # 0 = no downsample
+    threshold: float = 0.5  # for marching_cubes mode
 
 
 def _normalize_cmap_name(name: str) -> str:
@@ -310,6 +319,85 @@ def _safe_diag_extent(xyz):
 def _compute_sizes(val, size_scale, scale_factor):
     base = 2.0 + 8.0 * val  # baseline range roughly matching previous defaults
     return scale_factor * size_scale * base
+
+
+def _infer_grid(xyz):
+    """
+    Infer regular grid structure from scattered XYZ points.
+    Returns (origin, spacing, dimensions) where:
+      - origin: [x0, y0, z0] coordinates of grid origin
+      - spacing: [dx, dy, dz] spacing between grid points
+      - dimensions: [nx, ny, nz] number of points in each direction
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0] == 0:
+        raise ValueError("Cannot infer grid from empty point set")
+
+    # Find unique coordinates along each axis
+    x_unique = np.unique(np.round(xyz[:, 0], decimals=6))
+    y_unique = np.unique(np.round(xyz[:, 1], decimals=6))
+    z_unique = np.unique(np.round(xyz[:, 2], decimals=6))
+
+    # Calculate spacing as the minimum non-zero difference
+    def calc_spacing(vals):
+        if len(vals) < 2:
+            return 1.0
+        diffs = np.diff(vals)
+        diffs = diffs[diffs > 1e-9]  # filter out numerical noise
+        return float(np.min(diffs)) if len(diffs) > 0 else 1.0
+
+    dx = calc_spacing(x_unique)
+    dy = calc_spacing(y_unique)
+    dz = calc_spacing(z_unique)
+
+    # Grid dimensions
+    nx = len(x_unique)
+    ny = len(y_unique)
+    nz = len(z_unique)
+
+    # Origin is the minimum corner
+    origin = np.array([x_unique[0], y_unique[0], z_unique[0]], dtype=np.float32)
+    spacing = np.array([dx, dy, dz], dtype=np.float32)
+    dimensions = np.array([nx, ny, nz], dtype=np.int32)
+
+    return origin, spacing, dimensions
+
+
+def _normalize_to_grid(xyz, val, origin, spacing, dimensions):
+    """
+    Normalize scattered XYZ points with values to a regular 3D grid using interpolation.
+
+    Args:
+        xyz: [N, 3] array of point coordinates
+        val: [N] array of values at each point
+        origin: [3] grid origin coordinates
+        spacing: [3] grid spacing in each dimension
+        dimensions: [3] grid dimensions (nx, ny, nz)
+
+    Returns:
+        grid_data: [nx, ny, nz] array of interpolated values
+    """
+    from scipy.interpolate import griddata
+
+    xyz = np.asarray(xyz, dtype=np.float64)
+    val = np.asarray(val, dtype=np.float64)
+
+    nx, ny, nz = dimensions
+
+    # Create regular grid
+    x = origin[0] + np.arange(nx) * spacing[0]
+    y = origin[1] + np.arange(ny) * spacing[1]
+    z = origin[2] + np.arange(nz) * spacing[2]
+
+    xg, yg, zg = np.meshgrid(x, y, z, indexing='ij')
+    grid_points = np.stack([xg.ravel(), yg.ravel(), zg.ravel()], axis=-1)
+
+    # Interpolate scattered data to grid using linear interpolation
+    # Fill missing values with 0
+    grid_vals = griddata(xyz, val, grid_points, method='linear', fill_value=0.0)
+    grid_data = grid_vals.reshape(nx, ny, nz).astype(np.float32)
+
+    return grid_data
 
 
 # ---------------- PyVista Qt viewer ----------------
@@ -657,6 +745,225 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+class MarchingCubesViewer(QtWidgets.QMainWindow):
+    """
+    Marching cubes isosurface viewer with adjustable threshold.
+    Infers grid structure from XYZ points, normalizes each frame to the grid,
+    and extracts isosurfaces using marching cubes algorithm.
+    """
+    def __init__(self, provider: ProviderBase, fps=24, default_params=None):
+        super().__init__()
+        self.setWindowTitle("PyVista Marching Cubes Viewer")
+        self.provider = provider
+        self.T = len(provider)
+        self.params = default_params or VizParams()
+
+        self.current_frame = 0
+        self.is_playing = False
+        self.threshold = float(self.params.threshold) if hasattr(self.params, 'threshold') else 0.5
+        self.threshold = max(0.0, min(1.0, self.threshold))  # Clamp to [0, 1]
+        self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else COLORSCALES[0]
+
+        # Infer grid structure from first frame
+        xyz0, val0 = provider.get(0)
+        self.origin, self.spacing, self.dimensions = _infer_grid(xyz0)
+        print(f"[marching-cubes] Inferred grid: origin={self.origin}, spacing={self.spacing}, dimensions={self.dimensions}")
+
+        self._mesh = None
+        self._actor = None
+        self.label_frame = None
+        self.label_threshold = None
+
+        self._build_ui(fps)
+        self._initialize_scene()
+
+    def _build_ui(self, fps):
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+
+        # Playback controls row
+        top_row = QtWidgets.QHBoxLayout()
+        self.btn_play = QtWidgets.QPushButton("⏵ Play")
+        self.btn_pause = QtWidgets.QPushButton("⏸ Pause")
+        self.slider_frame = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_frame.setRange(0, max(0, self.T - 1))
+        self.slider_frame.setSingleStep(1)
+        self.slider_frame.setPageStep(1)
+        self.label_frame = QtWidgets.QLabel()
+
+        top_row.addWidget(self.btn_play)
+        top_row.addWidget(self.btn_pause)
+        top_row.addWidget(self.slider_frame)
+        top_row.addWidget(self.label_frame)
+        main_layout.addLayout(top_row)
+
+        # Settings row
+        settings_row = QtWidgets.QHBoxLayout()
+
+        # Colormap
+        cmap_layout = QtWidgets.QVBoxLayout()
+        cmap_layout.addWidget(QtWidgets.QLabel("Colormap"))
+        self.combo_cmap = QtWidgets.QComboBox()
+        self.combo_cmap.addItems(COLORSCALES)
+        self.combo_cmap.setCurrentText(self.cmap)
+        cmap_layout.addWidget(self.combo_cmap)
+        settings_row.addLayout(cmap_layout)
+
+        # Threshold slider
+        self.slider_threshold = self._make_slider(0, 100, int(self.threshold * 100))
+        threshold_layout = QtWidgets.QVBoxLayout()
+        threshold_layout.addWidget(QtWidgets.QLabel("Isosurface Threshold"))
+        threshold_layout.addWidget(self.slider_threshold)
+        self.label_threshold = QtWidgets.QLabel(self._format_threshold_label(self.threshold))
+        threshold_layout.addWidget(self.label_threshold)
+        settings_row.addLayout(threshold_layout)
+
+        main_layout.addLayout(settings_row)
+
+        # PyVista view
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background("black")
+        main_layout.addWidget(self.plotter)
+
+        # Timer for playback
+        self.timer = QtCore.QTimer(self)
+        interval_ms = int(1000 / max(1, fps))
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self._advance_frame)
+
+        # Signal wiring
+        self.btn_play.clicked.connect(self.start_playback)
+        self.btn_pause.clicked.connect(self.stop_playback)
+        self.slider_frame.valueChanged.connect(self._on_frame_slider)
+        self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
+        self.slider_threshold.valueChanged.connect(self._on_threshold_changed)
+
+    def _make_slider(self, minimum, maximum, value):
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(int(minimum), int(maximum))
+        slider.setSingleStep(1)
+        slider.setPageStep(1)
+        slider.setValue(int(round(value)))
+        return slider
+
+    def _format_threshold_label(self, value):
+        return f"{value:.3f}"
+
+    def _initialize_scene(self):
+        """Initialize the scene with the first frame."""
+        self.set_frame(0)
+        self.plotter.show_axes()
+        self.plotter.reset_camera()
+
+    def _create_grid_mesh(self, frame_index):
+        """Create a PyVista ImageData mesh from the current frame."""
+        xyz, val = self.provider.get(frame_index)
+        grid_data = _normalize_to_grid(xyz, val, self.origin, self.spacing, self.dimensions)
+
+        # Create PyVista ImageData (uniform grid)
+        mesh = pv.ImageData()
+        mesh.dimensions = self.dimensions
+        mesh.origin = self.origin
+        mesh.spacing = self.spacing
+        mesh.point_data["values"] = grid_data.ravel(order='F')  # Fortran order for VTK
+
+        return mesh
+
+    def _update_isosurface(self, mesh):
+        """Extract and display isosurface at current threshold."""
+        # Remove previous mesh
+        if self._actor is not None:
+            self.plotter.remove_actor(self._actor)
+            self._actor = None
+
+        # Extract isosurface using marching cubes
+        try:
+            contour = mesh.contour([self.threshold], scalars="values")
+            if contour.n_points > 0:
+                self._actor = self.plotter.add_mesh(
+                    contour,
+                    scalars="values",
+                    cmap=_normalize_cmap_name(self.cmap),
+                    show_scalar_bar=True,
+                    lighting=True,
+                    opacity=0.8,
+                )
+            else:
+                # No surface at this threshold, show empty scene
+                pass
+        except Exception as e:
+            print(f"[marching-cubes] Warning: Failed to create contour at threshold {self.threshold}: {e}")
+
+        self.plotter.render()
+
+    def set_frame(self, frame_index):
+        """Update the view to show the specified frame."""
+        frame_index = int(frame_index) % max(1, self.T)
+        if frame_index == self.current_frame and self._mesh is not None:
+            # Same frame, just update the isosurface with current threshold
+            self._update_isosurface(self._mesh)
+            return
+
+        self.current_frame = frame_index
+        self._mesh = self._create_grid_mesh(frame_index)
+        self._update_isosurface(self._mesh)
+
+        if self.slider_frame.value() != frame_index:
+            self.slider_frame.blockSignals(True)
+            self.slider_frame.setValue(frame_index)
+            self.slider_frame.blockSignals(False)
+        self._update_status_labels()
+
+    def start_playback(self):
+        if not self.is_playing and self.T > 1:
+            self.timer.start()
+            self.is_playing = True
+
+    def stop_playback(self):
+        if self.is_playing:
+            self.timer.stop()
+            self.is_playing = False
+
+    def _on_frame_slider(self, value):
+        self.set_frame(int(value))
+
+    def _on_cmap_changed(self, cmap):
+        self.cmap = cmap
+        # Recreate the isosurface with new colormap
+        if self._mesh is not None:
+            self._update_isosurface(self._mesh)
+
+    def _on_threshold_changed(self, value):
+        self.threshold = float(value) / 100.0
+        if self.label_threshold:
+            self.label_threshold.setText(self._format_threshold_label(self.threshold))
+        # Update isosurface with new threshold
+        if self._mesh is not None:
+            self._update_isosurface(self._mesh)
+
+    def _advance_frame(self):
+        if self.T <= 1:
+            return
+        next_frame = (self.current_frame + 1) % self.T
+        self.set_frame(next_frame)
+
+    def _frame_label_text(self):
+        total = max(0, int(self.T))
+        if total <= 0:
+            return "Frame: 0/0"
+        return f"Frame: {self.current_frame + 1}/{total}"
+
+    def _update_status_labels(self):
+        if self.label_frame is not None:
+            self.label_frame.setText(self._frame_label_text())
+
+    def closeEvent(self, event):
+        self.stop_playback()
+        super().closeEvent(event)
+
+
 # ---------------- CLI helpers ----------------
 
 
@@ -732,6 +1039,19 @@ def main(argv=None):
         help="Interpretation of files under --path/--pattern (per-frame NPZs or per-point NPZs).",
     )
     ap.add_argument("--series", type=str, help="Single NPZ with xyz/val time series")
+    ap.add_argument(
+        "--render-mode",
+        type=str,
+        choices=["point", "marching_cubes"],
+        default="point",
+        help="Rendering mode: 'point' for point cloud visualization, 'marching_cubes' for isosurface extraction.",
+    )
+    ap.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Initial isosurface threshold for marching_cubes mode (0.0-1.0).",
+    )
     ap.add_argument("--fps", type=int, default=24, help="Playback FPS")
     ap.add_argument(
         "--size-scale",
@@ -779,6 +1099,7 @@ def main(argv=None):
         cmap="Viridis",
         size_scale=max(0.1, args.size_scale),
         downsample=max(0, args.downsample),
+        threshold=max(0.0, min(1.0, args.threshold)),
     )
 
     if args.offscreen:
@@ -795,7 +1116,13 @@ def main(argv=None):
             "If you are running in a headless environment, pass --offscreen "
             "or set QT_QPA_PLATFORM=offscreen."
         )
-    viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
+
+    # Select viewer based on render mode
+    if args.render_mode == "marching_cubes":
+        viewer = MarchingCubesViewer(provider, fps=args.fps, default_params=params)
+    else:  # default to point mode
+        viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
+
     viewer.resize(1200, 800)
     viewer.show()
     sys.exit(qt_app.exec_())
