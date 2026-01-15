@@ -335,6 +335,7 @@ def make_demo_provider(T=160, N=1000, radius=1.0):
 
 
 COLORSCALES = ["RdBu", "PuOr", "BrBG", "PiYG", "Spectral", "coolwarm", "seismic", "RdYlGn"]
+VIZ_MODES = ["dots", "cloud", "splat"]
 
 
 @dataclass
@@ -343,6 +344,9 @@ class VizParams:
     size_scale: float = 1.0
     downsample: int = 0  # 0 = no downsample
     amp_threshold: float = 0.0
+    viz_mode: str = "dots"  # "dots", "cloud", or "splat"
+    grid_resolution: int = 15  # voxel grid resolution for cloud mode
+    splat_radius: float = 1.0  # radius multiplier for Gaussian splats
 
 
 def _normalize_cmap_name(name: str) -> str:
@@ -370,6 +374,82 @@ def _safe_diag_extent(xyz):
     bounds = np.ptp(xyz, axis=0)
     diag = float(np.linalg.norm(bounds))
     return diag if diag > 0 else 1.0
+
+
+def _interpolate_to_volume(xyz, val, resolution=40, padding=0.1):
+    """
+    Interpolate sparse point measurements to a regular 3D volume grid.
+
+    Uses inverse distance weighting for fast interpolation.
+    Returns a pv.ImageData with 'val' scalar field.
+    """
+    xyz = np.asarray(xyz, dtype=np.float32)
+    val = np.asarray(val, dtype=np.float32).reshape(-1)
+
+    if xyz.shape[0] == 0:
+        grid = pv.ImageData()
+        grid.dimensions = (2, 2, 2)
+        grid.origin = (0, 0, 0)
+        grid.spacing = (1, 1, 1)
+        grid.point_data["val"] = np.zeros(8, dtype=np.float32)
+        return grid
+
+    # Compute bounds with padding
+    mins = xyz.min(axis=0)
+    maxs = xyz.max(axis=0)
+    ranges = maxs - mins
+    ranges = np.where(ranges < 1e-6, 1.0, ranges)  # avoid zero range
+    pad = ranges * padding
+    mins = mins - pad
+    maxs = maxs + pad
+
+    # Create grid coordinates
+    gx = np.linspace(mins[0], maxs[0], resolution)
+    gy = np.linspace(mins[1], maxs[1], resolution)
+    gz = np.linspace(mins[2], maxs[2], resolution)
+    GX, GY, GZ = np.meshgrid(gx, gy, gz, indexing='ij')
+    grid_points = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], axis=1)
+
+    # Inverse distance weighting interpolation
+    # For each grid point, compute weighted average of nearby measurement values
+    n_grid = grid_points.shape[0]
+    n_pts = xyz.shape[0]
+
+    # Compute distances from each grid point to each measurement point
+    # Use chunking to avoid memory issues with large grids
+    chunk_size = 5000
+    grid_vals = np.zeros(n_grid, dtype=np.float32)
+
+    power = 2.0  # IDW power parameter
+
+    for i in range(0, n_grid, chunk_size):
+        end = min(i + chunk_size, n_grid)
+        chunk_pts = grid_points[i:end]
+
+        # Distance matrix: (chunk_size, n_pts)
+        diff = chunk_pts[:, np.newaxis, :] - xyz[np.newaxis, :, :]
+        dist = np.sqrt(np.sum(diff ** 2, axis=2))
+
+        # Avoid division by zero
+        dist = np.maximum(dist, 1e-10)
+
+        # Inverse distance weights
+        weights = 1.0 / (dist ** power)
+        weights_sum = weights.sum(axis=1, keepdims=True)
+        weights_norm = weights / weights_sum
+
+        # Weighted average
+        grid_vals[i:end] = (weights_norm * val[np.newaxis, :]).sum(axis=1)
+
+    # Create PyVista ImageData
+    grid = pv.ImageData()
+    grid.dimensions = (resolution, resolution, resolution)
+    grid.origin = tuple(mins)
+    spacing = (maxs - mins) / (resolution - 1)
+    grid.spacing = tuple(spacing)
+    grid.point_data["val"] = grid_vals.astype(np.float32)
+
+    return grid
 
 
 def _compute_sizes(val, size_scale, scale_factor, amp_abs_max):
@@ -855,6 +935,619 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+# ---------------- Cloud (Volume) Viewer ----------------
+
+
+class CloudViewer(QtWidgets.QMainWindow):
+    """Volumetric cloud visualization of acoustic pressure fields."""
+
+    def __init__(self, provider: ProviderBase, fps=24, default_params=None):
+        super().__init__()
+        self.setWindowTitle("PyVista Cloud Viewer - Volumetric Pressure Field")
+        self.provider = provider
+        self.T = len(provider)
+        self.params = default_params or VizParams()
+
+        self.current_frame = 0
+        self.is_playing = False
+        self.grid_resolution = max(10, min(100, self.params.grid_resolution))
+        self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else COLORSCALES[0]
+        self.opacity_level = 0.5  # 0-1 scale for opacity intensity
+        self.show_points = False  # toggle to show measurement points (default off)
+
+        amp_min, amp_max = provider.amplitude_range()
+        self.amp_min = float(amp_min)
+        self.amp_max = float(amp_max)
+        self.amp_abs_max = max(abs(self.amp_min), abs(self.amp_max))
+        if self.amp_abs_max <= 0:
+            self.amp_abs_max = 1.0
+        self._clim = (-self.amp_abs_max, self.amp_abs_max)
+
+        # Volume and point cloud actors
+        self._volume_actor = None
+        self._points_actor = None
+        self._volume_grid = None
+        self._needs_full_rebuild = False
+
+        self._build_ui(fps)
+        xyz0, val0 = provider.get(0)
+        self._initialize_scene(xyz0, val0)
+        self._update_status_labels()
+
+    def _build_ui(self, fps):
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QtWidgets.QVBoxLayout(central)
+
+        # Playback controls row
+        top_row = QtWidgets.QHBoxLayout()
+        self.btn_play = QtWidgets.QPushButton("⏵ Play")
+        self.btn_pause = QtWidgets.QPushButton("⏸ Pause")
+        self.slider_frame = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_frame.setRange(0, max(0, self.T - 1))
+        self.slider_frame.setSingleStep(1)
+        self.label_frame = QtWidgets.QLabel()
+
+        top_row.addWidget(self.btn_play)
+        top_row.addWidget(self.btn_pause)
+        top_row.addWidget(self.slider_frame)
+        top_row.addWidget(self.label_frame)
+        main_layout.addLayout(top_row)
+
+        # Settings row
+        settings_row = QtWidgets.QHBoxLayout()
+
+        # Colormap
+        cmap_layout = QtWidgets.QVBoxLayout()
+        cmap_layout.addWidget(QtWidgets.QLabel("Colormap"))
+        self.combo_cmap = QtWidgets.QComboBox()
+        self.combo_cmap.addItems(COLORSCALES)
+        self.combo_cmap.setCurrentText(self.cmap)
+        cmap_layout.addWidget(self.combo_cmap)
+        settings_row.addLayout(cmap_layout)
+
+        # Grid resolution slider
+        res_layout = QtWidgets.QVBoxLayout()
+        res_layout.addWidget(QtWidgets.QLabel("Grid Resolution"))
+        self.slider_resolution = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_resolution.setRange(15, 80)
+        self.slider_resolution.setValue(self.grid_resolution)
+        self.label_resolution = QtWidgets.QLabel(f"{self.grid_resolution}³")
+        res_layout.addWidget(self.slider_resolution)
+        res_layout.addWidget(self.label_resolution)
+        settings_row.addLayout(res_layout)
+
+        # Opacity slider
+        opacity_layout = QtWidgets.QVBoxLayout()
+        opacity_layout.addWidget(QtWidgets.QLabel("Cloud Opacity"))
+        self.slider_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_opacity.setRange(10, 100)
+        self.slider_opacity.setValue(int(self.opacity_level * 100))
+        self.label_opacity = QtWidgets.QLabel(f"{self.opacity_level:.0%}")
+        opacity_layout.addWidget(self.slider_opacity)
+        opacity_layout.addWidget(self.label_opacity)
+        settings_row.addLayout(opacity_layout)
+
+        # Show points checkbox
+        self.checkbox_points = QtWidgets.QCheckBox("Show measurement points")
+        self.checkbox_points.setChecked(self.show_points)
+        settings_row.addWidget(self.checkbox_points)
+        settings_row.addStretch(1)
+
+        main_layout.addLayout(settings_row)
+
+        # PyVista view
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background([0.05, 0.05, 0.1])
+        main_layout.addWidget(self.plotter)
+
+        # Timer for playback
+        self.timer = QtCore.QTimer(self)
+        interval_ms = int(1000 / max(1, fps))
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self._advance_frame)
+
+        # Signal wiring
+        self.btn_play.clicked.connect(self.start_playback)
+        self.btn_pause.clicked.connect(self.stop_playback)
+        self.slider_frame.valueChanged.connect(self._on_frame_slider)
+        self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
+        self.slider_resolution.valueChanged.connect(self._on_resolution_changed)
+        self.slider_opacity.valueChanged.connect(self._on_opacity_changed)
+        self.checkbox_points.stateChanged.connect(self._on_show_points_changed)
+
+    def _initialize_scene(self, xyz, val):
+        # Create initial volume
+        self._volume_grid = _interpolate_to_volume(xyz, val, self.grid_resolution)
+        self._add_volume_actor()
+
+        # Add measurement points as small spheres
+        self._xyz_points = xyz
+        self._add_points_actor(xyz)
+
+        self.plotter.show_axes()
+        self.plotter.render()
+
+    def _add_volume_actor(self, force_rebuild=False):
+        if self._volume_actor is not None and not force_rebuild:
+            # Try to update scalars in place to avoid flickering
+            try:
+                from vtkmodules.util.numpy_support import numpy_to_vtk
+                mapper = self._volume_actor.GetMapper()
+                if mapper is not None:
+                    input_data = mapper.GetInput()
+                    if input_data is not None:
+                        new_scalars = self._volume_grid.point_data["val"].astype(np.float32)
+                        vtk_arr = numpy_to_vtk(new_scalars, deep=True)
+                        vtk_arr.SetName("val")
+                        input_data.GetPointData().SetScalars(vtk_arr)
+                        input_data.Modified()
+                        mapper.Modified()
+                        return
+            except Exception:
+                pass  # Fall through to full rebuild
+
+        if self._volume_actor is not None:
+            self.plotter.remove_actor(self._volume_actor)
+            self._volume_actor = None
+
+        # Build opacity transfer function - V-shaped with transparent center
+        opacity_tf = self._build_opacity_transfer()
+
+        self._volume_actor = self.plotter.add_volume(
+            self._volume_grid,
+            scalars="val",
+            cmap=_normalize_cmap_name(self.cmap),
+            opacity=opacity_tf,
+            opacity_unit_distance=self._compute_opacity_unit_distance(),
+            shade=False,
+            clim=self._clim,
+            show_scalar_bar=True,
+            blending="composite",
+        )
+
+    def _build_opacity_transfer(self):
+        # Build a V-shaped opacity transfer function:
+        # Near-zero values = fully transparent
+        # High positive/negative values = very opaque
+        # PyVista's opacity list maps linearly across the scalar range
+        # clim goes from -max to +max, so middle should be transparent
+        # Using 7 points for better control: extremes opaque, center transparent
+        base = min(1.0, self.opacity_level * 2.0)  # Boost opacity significantly
+
+        # V-shape: high at edges, zero in middle
+        return [base, base * 0.6, base * 0.15, 0.0, base * 0.15, base * 0.6, base]
+
+    def _compute_opacity_unit_distance(self):
+        # Compute appropriate opacity unit distance based on grid spacing
+        # Smaller values = more opaque/dense appearance
+        if self._volume_grid is None:
+            return 1.0
+        spacing = self._volume_grid.spacing
+        avg_spacing = sum(spacing) / 3.0
+        # Use small unit distance for more saturated colors
+        return avg_spacing * 0.5 / max(0.1, self.opacity_level)
+
+    def _add_points_actor(self, xyz):
+        if self._points_actor is not None:
+            self.plotter.remove_actor(self._points_actor)
+            self._points_actor = None
+
+        if not self.show_points or xyz.shape[0] == 0:
+            return
+
+        point_cloud = pv.PolyData(xyz)
+        self._points_actor = self.plotter.add_mesh(
+            point_cloud,
+            color="yellow",
+            point_size=5,
+            render_points_as_spheres=True,
+            opacity=0.6,
+        )
+
+    def start_playback(self):
+        if not self.is_playing and self.T > 1:
+            self.timer.start()
+            self.is_playing = True
+
+    def stop_playback(self):
+        if self.is_playing:
+            self.timer.stop()
+            self.is_playing = False
+
+    def _on_frame_slider(self, value):
+        self.set_frame(int(value))
+
+    def _on_cmap_changed(self, cmap):
+        self.cmap = cmap
+        self._rebuild_volume(force=True)
+
+    def _on_resolution_changed(self, value):
+        new_res = int(value)
+        if new_res != self.grid_resolution:
+            self.grid_resolution = new_res
+            self.label_resolution.setText(f"{new_res}³")
+            self._rebuild_volume(force=True)
+
+    def _on_opacity_changed(self, value):
+        self.opacity_level = value / 100.0
+        self.label_opacity.setText(f"{self.opacity_level:.0%}")
+        self._rebuild_volume(force=True)
+
+    def _on_show_points_changed(self, state):
+        self.show_points = state == QtCore.Qt.Checked
+        self._add_points_actor(self._xyz_points)
+        self.plotter.render()
+
+    def set_frame(self, frame_index):
+        frame_index = int(frame_index) % max(1, self.T)
+        if frame_index == self.current_frame:
+            return
+        self.current_frame = frame_index
+
+        xyz, val = self.provider.get(frame_index)
+        self._xyz_points = xyz
+        self._volume_grid = _interpolate_to_volume(xyz, val, self.grid_resolution)
+        self._update_volume_data()
+
+        if self.slider_frame.value() != frame_index:
+            self.slider_frame.blockSignals(True)
+            self.slider_frame.setValue(frame_index)
+            self.slider_frame.blockSignals(False)
+        self._update_status_labels()
+
+    def _rebuild_volume(self, force=False):
+        xyz, val = self.provider.get(self.current_frame)
+        self._volume_grid = _interpolate_to_volume(xyz, val, self.grid_resolution)
+        camera_pos = self.plotter.camera_position
+        self._add_volume_actor(force_rebuild=force)
+        self.plotter.camera_position = camera_pos
+        self.plotter.render()
+
+    def _update_volume_data(self):
+        # Update scalars in place when possible to avoid flickering
+        camera_pos = self.plotter.camera_position
+        self._add_volume_actor(force_rebuild=False)
+        if self.show_points:
+            self._add_points_actor(self._xyz_points)
+        self.plotter.camera_position = camera_pos
+        self.plotter.render()
+
+    def _advance_frame(self):
+        if self.T <= 1:
+            return
+        next_frame = (self.current_frame + 1) % self.T
+        self.set_frame(next_frame)
+
+    def _update_status_labels(self):
+        total = max(0, int(self.T))
+        if total <= 0:
+            self.label_frame.setText("Frame: 0/0")
+        else:
+            self.label_frame.setText(f"Frame: {self.current_frame + 1}/{total}")
+
+    def closeEvent(self, event):
+        self.stop_playback()
+        super().closeEvent(event)
+
+
+# ---------------- Gaussian Splat Viewer ----------------
+
+
+class SplatViewer(QtWidgets.QMainWindow):
+    """Gaussian splatting visualization - renders each point as a transparent Gaussian blob."""
+
+    def __init__(self, provider: ProviderBase, fps=24, default_params=None):
+        super().__init__()
+        self.setWindowTitle("PyVista Splat Viewer - Gaussian Splatting")
+        self.provider = provider
+        self.T = len(provider)
+        self.params = default_params or VizParams()
+
+        self.current_frame = 0
+        self.is_playing = False
+        # Default to 'coolwarm' for splat mode as it has darker middle (less white)
+        default_cmap = "coolwarm"
+        self.cmap = self.params.cmap if self.params.cmap in COLORSCALES else default_cmap
+        if self.cmap == "RdBu":  # RdBu has white middle, switch to coolwarm
+            self.cmap = default_cmap
+        self.splat_radius = max(0.1, self.params.splat_radius)
+        self.splat_opacity = 0.6  # base opacity for splats
+        self.downsample_step = max(1, self.params.downsample or 1)
+
+        amp_min, amp_max = provider.amplitude_range()
+        self.amp_min = float(amp_min)
+        self.amp_max = float(amp_max)
+        self.amp_abs_max = max(abs(self.amp_min), abs(self.amp_max))
+        if self.amp_abs_max <= 0:
+            self.amp_abs_max = 1.0
+        self._clim = (-self.amp_abs_max, self.amp_abs_max)
+
+        # Get initial data to compute base radius
+        xyz0, val0 = provider.get(0)
+        self._base_extent = _safe_diag_extent(xyz0)
+        self._auto_radius = self._base_extent / 8.0  # larger splats for more overlap/blending
+
+        # Actors
+        self._splat_actor = None
+        self._mesh = None
+
+        self._build_ui(fps)
+        self._initialize_scene(xyz0, val0)
+        self._update_status_labels()
+
+    def _build_ui(self, fps):
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QtWidgets.QVBoxLayout(central)
+
+        # Playback controls row
+        top_row = QtWidgets.QHBoxLayout()
+        self.btn_play = QtWidgets.QPushButton("⏵ Play")
+        self.btn_pause = QtWidgets.QPushButton("⏸ Pause")
+        self.slider_frame = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_frame.setRange(0, max(0, self.T - 1))
+        self.slider_frame.setSingleStep(1)
+        self.label_frame = QtWidgets.QLabel()
+
+        top_row.addWidget(self.btn_play)
+        top_row.addWidget(self.btn_pause)
+        top_row.addWidget(self.slider_frame)
+        top_row.addWidget(self.label_frame)
+        main_layout.addLayout(top_row)
+
+        # Settings row
+        settings_row = QtWidgets.QHBoxLayout()
+
+        # Colormap
+        cmap_layout = QtWidgets.QVBoxLayout()
+        cmap_layout.addWidget(QtWidgets.QLabel("Colormap"))
+        self.combo_cmap = QtWidgets.QComboBox()
+        self.combo_cmap.addItems(COLORSCALES)
+        self.combo_cmap.setCurrentText(self.cmap)
+        cmap_layout.addWidget(self.combo_cmap)
+        settings_row.addLayout(cmap_layout)
+
+        # Splat radius slider
+        radius_layout = QtWidgets.QVBoxLayout()
+        radius_layout.addWidget(QtWidgets.QLabel("Splat Size"))
+        self.slider_radius = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_radius.setRange(10, 300)  # 0.1x to 3.0x
+        self.slider_radius.setValue(int(self.splat_radius * 100))
+        self.label_radius = QtWidgets.QLabel(f"{self.splat_radius:.1f}x")
+        radius_layout.addWidget(self.slider_radius)
+        radius_layout.addWidget(self.label_radius)
+        settings_row.addLayout(radius_layout)
+
+        # Opacity slider
+        opacity_layout = QtWidgets.QVBoxLayout()
+        opacity_layout.addWidget(QtWidgets.QLabel("Splat Opacity"))
+        self.slider_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_opacity.setRange(10, 100)
+        self.slider_opacity.setValue(int(self.splat_opacity * 100))
+        self.label_opacity = QtWidgets.QLabel(f"{self.splat_opacity:.0%}")
+        opacity_layout.addWidget(self.slider_opacity)
+        opacity_layout.addWidget(self.label_opacity)
+        settings_row.addLayout(opacity_layout)
+
+        # Downsample slider
+        down_layout = QtWidgets.QVBoxLayout()
+        down_layout.addWidget(QtWidgets.QLabel("Downsample"))
+        self.slider_downsample = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_downsample.setRange(1, 20)
+        self.slider_downsample.setValue(self.downsample_step)
+        self.label_downsample = QtWidgets.QLabel(
+            f"every {self.downsample_step}" if self.downsample_step > 1 else "off"
+        )
+        down_layout.addWidget(self.slider_downsample)
+        down_layout.addWidget(self.label_downsample)
+        settings_row.addLayout(down_layout)
+
+        settings_row.addStretch(1)
+        main_layout.addLayout(settings_row)
+
+        # PyVista view
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background("black")
+        main_layout.addWidget(self.plotter)
+
+        # Timer for playback
+        self.timer = QtCore.QTimer(self)
+        interval_ms = int(1000 / max(1, fps))
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self._advance_frame)
+
+        # Signal wiring
+        self.btn_play.clicked.connect(self.start_playback)
+        self.btn_pause.clicked.connect(self.stop_playback)
+        self.slider_frame.valueChanged.connect(self._on_frame_slider)
+        self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
+        self.slider_radius.valueChanged.connect(self._on_radius_changed)
+        self.slider_opacity.valueChanged.connect(self._on_opacity_changed)
+        self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
+
+    def _initialize_scene(self, xyz, val):
+        # Enable depth peeling for better transparency blending
+        self.plotter.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
+        xyz, val = _downsample(xyz, val, self.downsample_step)
+        self._create_splat_mesh(xyz, val)
+        self.plotter.show_axes()
+        self.plotter.render()
+
+    def _create_splat_mesh(self, xyz, val):
+        """Create Gaussian splat visualization using transparent spheres."""
+        if self._splat_actor is not None:
+            self.plotter.remove_actor(self._splat_actor)
+            self._splat_actor = None
+
+        xyz = np.asarray(xyz, dtype=np.float32)
+        val = np.asarray(val, dtype=np.float32).reshape(-1)
+
+        if xyz.shape[0] == 0:
+            return
+
+        # Create point cloud with scalar values
+        points = pv.PolyData(xyz)
+        points.point_data["val"] = val
+        points.point_data.active_scalars_name = "val"
+
+        # Compute sphere radius based on data extent and user setting
+        sphere_radius = self._auto_radius * self.splat_radius
+
+        # Create a smoother sphere for better blending appearance
+        sphere = pv.Sphere(radius=sphere_radius, theta_resolution=20, phi_resolution=20)
+
+        # Glyph at each point
+        glyphs = points.glyph(geom=sphere, orient=False, scale=False)
+
+        # The glyphs need the scalar values propagated
+        n_sphere_pts = sphere.n_points
+        n_data_pts = xyz.shape[0]
+        # Each data point generates n_sphere_pts vertices in the glyph output
+        expanded_vals = np.repeat(val, n_sphere_pts)
+        glyphs.point_data["val"] = expanded_vals
+
+        # Use full amplitude range
+        clim = self._clim
+
+        # Use 'viridis' or a sequential colormap that doesn't have white
+        # Or use the selected cmap - user can switch to coolwarm/seismic which have darker middles
+        cmap_name = _normalize_cmap_name(self.cmap)
+
+        # Add with transparency for blending
+        self._splat_actor = self.plotter.add_mesh(
+            glyphs,
+            scalars="val",
+            cmap=cmap_name,
+            clim=clim,
+            opacity=self.splat_opacity * 0.5,
+            smooth_shading=True,
+            show_scalar_bar=True,
+            lighting=False,
+        )
+
+        self._mesh = points
+        self._n_sphere_pts = n_sphere_pts
+
+    def _update_splat_scalars(self, val):
+        """Try to update scalars in place for smooth animation."""
+        if self._splat_actor is None or self._mesh is None:
+            return False
+
+        try:
+            val = np.asarray(val, dtype=np.float32).reshape(-1)
+            n_sphere_pts = getattr(self, '_n_sphere_pts', None)
+            if n_sphere_pts is None:
+                return False
+
+            mapper = self._splat_actor.GetMapper()
+            if mapper is None:
+                return False
+
+            input_data = mapper.GetInput()
+            if input_data is None:
+                return False
+
+            n_pts = input_data.GetNumberOfPoints()
+            expected_pts = len(val) * n_sphere_pts
+            if n_pts != expected_pts:
+                return False
+
+            expanded_vals = np.repeat(val, n_sphere_pts).astype(np.float32)
+
+            from vtkmodules.util.numpy_support import numpy_to_vtk
+            vtk_arr = numpy_to_vtk(expanded_vals, deep=True)
+            vtk_arr.SetName("val")
+            input_data.GetPointData().SetScalars(vtk_arr)
+            input_data.Modified()
+            mapper.Modified()
+            return True
+
+        except Exception:
+            return False
+
+    def start_playback(self):
+        if not self.is_playing and self.T > 1:
+            self.timer.start()
+            self.is_playing = True
+
+    def stop_playback(self):
+        if self.is_playing:
+            self.timer.stop()
+            self.is_playing = False
+
+    def _on_frame_slider(self, value):
+        self.set_frame(int(value))
+
+    def _on_cmap_changed(self, cmap):
+        self.cmap = cmap
+        self._rebuild_splats()
+
+    def _on_radius_changed(self, value):
+        self.splat_radius = value / 100.0
+        self.label_radius.setText(f"{self.splat_radius:.1f}x")
+        self._rebuild_splats()
+
+    def _on_opacity_changed(self, value):
+        self.splat_opacity = value / 100.0
+        self.label_opacity.setText(f"{self.splat_opacity:.0%}")
+        self._rebuild_splats()
+
+    def _on_downsample_changed(self, value):
+        self.downsample_step = max(1, int(value))
+        self.label_downsample.setText(
+            f"every {self.downsample_step}" if self.downsample_step > 1 else "off"
+        )
+        self._rebuild_splats()
+
+    def set_frame(self, frame_index):
+        frame_index = int(frame_index) % max(1, self.T)
+        if frame_index == self.current_frame:
+            return
+        self.current_frame = frame_index
+
+        xyz, val = self.provider.get(frame_index)
+        xyz, val = _downsample(xyz, val, self.downsample_step)
+
+        # Try in-place scalar update first for smooth animation
+        camera_pos = self.plotter.camera_position
+        if not self._update_splat_scalars(val):
+            self._create_splat_mesh(xyz, val)
+        self.plotter.camera_position = camera_pos
+        self.plotter.render()
+
+        if self.slider_frame.value() != frame_index:
+            self.slider_frame.blockSignals(True)
+            self.slider_frame.setValue(frame_index)
+            self.slider_frame.blockSignals(False)
+        self._update_status_labels()
+
+    def _rebuild_splats(self):
+        xyz, val = self.provider.get(self.current_frame)
+        xyz, val = _downsample(xyz, val, self.downsample_step)
+        camera_pos = self.plotter.camera_position
+        self._create_splat_mesh(xyz, val)
+        self.plotter.camera_position = camera_pos
+        self.plotter.render()
+
+    def _advance_frame(self):
+        if self.T <= 1:
+            return
+        next_frame = (self.current_frame + 1) % self.T
+        self.set_frame(next_frame)
+
+    def _update_status_labels(self):
+        total = max(0, int(self.T))
+        if total <= 0:
+            self.label_frame.setText("Frame: 0/0")
+        else:
+            self.label_frame.setText(f"Frame: {self.current_frame + 1}/{total}")
+
+    def closeEvent(self, event):
+        self.stop_playback()
+        super().closeEvent(event)
+
+
 # ---------------- CLI helpers ----------------
 
 
@@ -951,6 +1644,25 @@ def main(argv=None):
         action="store_true",
         help="Attempt to run with Qt offscreen platform (no interactive window).",
     )
+    ap.add_argument(
+        "--viz-mode",
+        type=str,
+        choices=VIZ_MODES,
+        default="dots",
+        help="Visualization mode: 'dots' for discrete point markers, 'cloud' for volumetric field, 'splat' for Gaussian splatting.",
+    )
+    ap.add_argument(
+        "--grid-resolution",
+        type=int,
+        default=15,
+        help="Voxel grid resolution for cloud mode (default 15, range 15-80).",
+    )
+    ap.add_argument(
+        "--splat-radius",
+        type=float,
+        default=1.0,
+        help="Splat size multiplier for splat mode (default 1.0).",
+    )
     args = ap.parse_args(argv)
 
     if args.offscreen and not OFFSCREEN_REQUESTED:
@@ -984,6 +1696,9 @@ def main(argv=None):
         size_scale=max(0.1, args.size_scale),
         downsample=max(0, args.downsample),
         amp_threshold=max(0.0, args.amp_threshold),
+        viz_mode=args.viz_mode,
+        grid_resolution=max(15, min(80, args.grid_resolution)),
+        splat_radius=max(0.1, args.splat_radius),
     )
 
     if args.offscreen:
@@ -1000,7 +1715,13 @@ def main(argv=None):
             "If you are running in a headless environment, pass --offscreen "
             "or set QT_QPA_PLATFORM=offscreen."
         )
-    viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
+
+    if args.viz_mode == "cloud":
+        viewer = CloudViewer(provider, fps=args.fps, default_params=params)
+    elif args.viz_mode == "splat":
+        viewer = SplatViewer(provider, fps=args.fps, default_params=params)
+    else:
+        viewer = PointCloudViewer(provider, fps=args.fps, default_params=params)
     viewer.resize(1200, 800)
     viewer.show()
     sys.exit(qt_app.exec_())
