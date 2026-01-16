@@ -461,6 +461,19 @@ def _compute_sizes(val, size_scale, scale_factor, amp_abs_max):
     return scale_factor * size_scale * base
 
 
+def _build_opacity_transfer(n_colors, cutoff=0.15, power=0.45):
+    n_colors = max(2, int(n_colors))
+    cutoff = min(max(0.0, float(cutoff)), 0.9)
+    strength = max(0.05, float(power))
+    t = np.linspace(-1.0, 1.0, n_colors, dtype=np.float32)
+    mag = np.abs(t)
+    if cutoff > 0:
+        mag = np.clip((mag - cutoff) / max(1e-6, 1.0 - cutoff), 0.0, 1.0)
+    alpha = np.power(mag, strength)
+    alpha = np.clip(alpha, 0.0, 1.0)
+    return (alpha * 255.0).astype(np.uint8)
+
+
 # ---------------- PyVista Qt viewer ----------------
 
 
@@ -494,8 +507,18 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         xyz0, val0 = _downsample(xyz0, val0, self.params.downsample)
         xyz0, val0 = self._apply_amp_threshold(xyz0, val0)
         self._base_extent = _safe_diag_extent(xyz0)
-        self._size_scale = self._base_extent / 150.0
-        self._glyph_geom = pv.Sphere(radius=1.0, theta_resolution=12, phi_resolution=12)
+        self._splat_scale = 0.1
+        self._size_scale = (self._base_extent / 150.0) * self._splat_scale
+        self._glyph_geom = pv.Sphere(radius=1.0, theta_resolution=16, phi_resolution=16)
+        self._opacity_lut_size = 128
+        self._opacity_cutoff = 0.8
+        self._opacity_power = 1.0
+        self._color_gamma = 0.95
+        self._opacity_tf = _build_opacity_transfer(
+            self._opacity_lut_size,
+            cutoff=self._opacity_cutoff,
+            power=self._opacity_power,
+        )
 
         self._mesh = None
         self._glyph = None
@@ -703,19 +726,9 @@ class PointCloudViewer(QtWidgets.QMainWindow):
             clim=self._clim,
             lighting=False,
             show_scalar_bar=False,
-            opacity=0.5,
+            n_colors=self._opacity_lut_size,
         )
-        if hasattr(self._actor, "prop"):
-            prop = self._actor.prop
-            if hasattr(prop, "opacity"):
-                try:
-                    prop.opacity = 0.5
-                except Exception:
-                    pass
-            if hasattr(prop, "SetOpacity"):
-                prop.SetOpacity(0.5)
-        elif hasattr(self._actor, "GetProperty"):
-            self._actor.GetProperty().SetOpacity(0.5)
+        self._apply_opacity_transfer()
         vtk_mapper = self._get_actor_mapper()
         if vtk_mapper is not None:
             self._ensure_mapper_scalar_settings(vtk_mapper)
@@ -836,6 +849,8 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         if not self._actor:
             return
         lut = pv.LookupTable(cmap=_normalize_cmap_name(self.cmap))
+        lut.n_values = self._opacity_lut_size
+        self._apply_opacity_transfer(lut=lut)
         lut.scalar_range = self._clim
         vtk_mapper = self._get_actor_mapper()
         if vtk_mapper is None:
@@ -858,6 +873,31 @@ class PointCloudViewer(QtWidgets.QMainWindow):
         if mapper is None:
             return None
         return getattr(mapper, "_vtk_obj", mapper)
+
+    def _apply_opacity_transfer(self, lut=None):
+        if lut is None:
+            if not self._actor or not hasattr(self._actor, "mapper"):
+                return
+            mapper = self._actor.mapper
+            lut = getattr(mapper, "lookup_table", None)
+        if lut is None or not hasattr(lut, "apply_opacity"):
+            return
+        if hasattr(lut, "n_values") and lut.n_values != len(self._opacity_tf):
+            lut.n_values = len(self._opacity_tf)
+        lut.apply_opacity(self._opacity_tf)
+        self._apply_color_brightness(lut)
+
+    def _apply_color_brightness(self, lut):
+        if lut is None or not hasattr(lut, "values"):
+            return
+        values = lut.values
+        if values.size == 0:
+            return
+        gamma = max(0.1, float(self._color_gamma))
+        rgb = values[:, :3].astype(np.float32) / 255.0
+        rgb = np.power(rgb, gamma)
+        rgb = np.clip(rgb, 0.0, 1.0)
+        values[:, :3] = (rgb * 255.0).astype(np.uint8)
 
     def _ensure_mapper_scalar_settings(self, vtk_mapper):
         if hasattr(vtk_mapper, "SetScalarModeToUsePointFieldData"):
@@ -1252,8 +1292,9 @@ class SplatViewer(QtWidgets.QMainWindow):
         if self.cmap == "RdBu":  # RdBu has white middle, switch to coolwarm
             self.cmap = default_cmap
         self.splat_radius = max(0.1, self.params.splat_radius)
-        self.splat_opacity = 0.6  # base opacity for splats
+        self.splat_opacity = 0.25  # base opacity for splats
         self.downsample_step = max(1, self.params.downsample or 1)
+        self._static_xyz = provider.static_xyz()
 
         amp_min, amp_max = provider.amplitude_range()
         self.amp_min = float(amp_min)
@@ -1266,7 +1307,15 @@ class SplatViewer(QtWidgets.QMainWindow):
         # Get initial data to compute base radius
         xyz0, val0 = provider.get(0)
         self._base_extent = _safe_diag_extent(xyz0)
-        self._auto_radius = self._base_extent / 8.0  # larger splats for more overlap/blending
+        self._auto_radius = self._base_extent / 8.0  # legacy world-scale (unused for pixels)
+        self._splat_pixel_base = 12.0
+        self._splat_pixel_min = 2.0
+        self._splat_pixel_max = 60.0
+        self._opacity_lut_size = 64
+        self._opacity_curve = 35
+        self._opacity_cutoff = 0.3
+        self._opacity_power = 1.0
+        self._update_opacity_curve(self._opacity_curve)
 
         # Actors
         self._splat_actor = None
@@ -1330,6 +1379,17 @@ class SplatViewer(QtWidgets.QMainWindow):
         opacity_layout.addWidget(self.label_opacity)
         settings_row.addLayout(opacity_layout)
 
+        # Opacity curve slider
+        curve_layout = QtWidgets.QVBoxLayout()
+        curve_layout.addWidget(QtWidgets.QLabel("Opacity Curve"))
+        self.slider_curve = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_curve.setRange(0, 100)
+        self.slider_curve.setValue(self._opacity_curve)
+        self.label_curve = QtWidgets.QLabel(self._format_curve_label())
+        curve_layout.addWidget(self.slider_curve)
+        curve_layout.addWidget(self.label_curve)
+        settings_row.addLayout(curve_layout)
+
         # Downsample slider
         down_layout = QtWidgets.QVBoxLayout()
         down_layout.addWidget(QtWidgets.QLabel("Downsample"))
@@ -1364,18 +1424,17 @@ class SplatViewer(QtWidgets.QMainWindow):
         self.combo_cmap.currentTextChanged.connect(self._on_cmap_changed)
         self.slider_radius.valueChanged.connect(self._on_radius_changed)
         self.slider_opacity.valueChanged.connect(self._on_opacity_changed)
+        self.slider_curve.valueChanged.connect(self._on_curve_changed)
         self.slider_downsample.valueChanged.connect(self._on_downsample_changed)
 
     def _initialize_scene(self, xyz, val):
-        # Enable depth peeling for better transparency blending
-        self.plotter.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
         xyz, val = _downsample(xyz, val, self.downsample_step)
         self._create_splat_mesh(xyz, val)
         self.plotter.show_axes()
         self.plotter.render()
 
     def _create_splat_mesh(self, xyz, val):
-        """Create Gaussian splat visualization using transparent spheres."""
+        """Create Gaussian splat visualization using VTK's point Gaussian mapper."""
         if self._splat_actor is not None:
             self.plotter.remove_actor(self._splat_actor)
             self._splat_actor = None
@@ -1384,87 +1443,117 @@ class SplatViewer(QtWidgets.QMainWindow):
         val = np.asarray(val, dtype=np.float32).reshape(-1)
 
         if xyz.shape[0] == 0:
+            self._mesh = None
             return
 
         # Create point cloud with scalar values
         points = pv.PolyData(xyz)
         points.point_data["val"] = val
-        points.point_data.active_scalars_name = "val"
 
-        # Compute sphere radius based on data extent and user setting
-        sphere_radius = self._auto_radius * self.splat_radius
+        # Compute splat size in pixels to avoid massive overdraw on large scenes
+        splat_size = self._splat_pixel_base * self.splat_radius
+        splat_size = float(np.clip(splat_size, self._splat_pixel_min, self._splat_pixel_max))
 
-        # Create a smoother sphere for better blending appearance
-        sphere = pv.Sphere(radius=sphere_radius, theta_resolution=20, phi_resolution=20)
-
-        # Glyph at each point
-        glyphs = points.glyph(geom=sphere, orient=False, scale=False)
-
-        # The glyphs need the scalar values propagated
-        n_sphere_pts = sphere.n_points
-        n_data_pts = xyz.shape[0]
-        # Each data point generates n_sphere_pts vertices in the glyph output
-        expanded_vals = np.repeat(val, n_sphere_pts)
-        glyphs.point_data["val"] = expanded_vals
-
-        # Use full amplitude range
-        clim = self._clim
-
-        # Use 'viridis' or a sequential colormap that doesn't have white
-        # Or use the selected cmap - user can switch to coolwarm/seismic which have darker middles
         cmap_name = _normalize_cmap_name(self.cmap)
 
-        # Add with transparency for blending
+        # Use point_gaussian style rendering for soft, blended splats
+        # This renders each point as a 2D Gaussian that blends naturally
         self._splat_actor = self.plotter.add_mesh(
-            glyphs,
+            points,
             scalars="val",
             cmap=cmap_name,
-            clim=clim,
-            opacity=self.splat_opacity * 0.5,
-            smooth_shading=True,
+            clim=self._clim,
+            style='points',
+            render_points_as_spheres=True,
+            point_size=splat_size,
             show_scalar_bar=True,
-            lighting=False,
+            n_colors=self._opacity_lut_size,
         )
+        self._apply_splat_opacity()
 
-        self._mesh = points
-        self._n_sphere_pts = n_sphere_pts
+        mapper = getattr(self._splat_actor, "mapper", None)
+        if mapper is None and hasattr(self._splat_actor, "GetMapper"):
+            mapper = self._splat_actor.GetMapper()
+        self._mesh = getattr(mapper, "dataset", None) or points
+        if mapper is not None:
+            self._ensure_splat_mapper_settings(mapper)
 
-    def _update_splat_scalars(self, val):
-        """Try to update scalars in place for smooth animation."""
+    def _update_splat_data(self, xyz, val):
+        """Update point positions/scalars in place to avoid flicker."""
         if self._splat_actor is None or self._mesh is None:
             return False
-
-        try:
-            val = np.asarray(val, dtype=np.float32).reshape(-1)
-            n_sphere_pts = getattr(self, '_n_sphere_pts', None)
-            if n_sphere_pts is None:
-                return False
-
-            mapper = self._splat_actor.GetMapper()
-            if mapper is None:
-                return False
-
-            input_data = mapper.GetInput()
-            if input_data is None:
-                return False
-
-            n_pts = input_data.GetNumberOfPoints()
-            expected_pts = len(val) * n_sphere_pts
-            if n_pts != expected_pts:
-                return False
-
-            expanded_vals = np.repeat(val, n_sphere_pts).astype(np.float32)
-
-            from vtkmodules.util.numpy_support import numpy_to_vtk
-            vtk_arr = numpy_to_vtk(expanded_vals, deep=True)
-            vtk_arr.SetName("val")
-            input_data.GetPointData().SetScalars(vtk_arr)
-            input_data.Modified()
-            mapper.Modified()
-            return True
-
-        except Exception:
+        xyz = np.asarray(xyz, dtype=np.float32)
+        val = np.asarray(val, dtype=np.float32).reshape(-1)
+        if xyz.shape[0] != self._mesh.n_points:
             return False
+        if not self._static_xyz:
+            return False
+        self._mesh.point_data["val"] = val
+        if hasattr(self._mesh.point_data, "active_scalars_name"):
+            self._mesh.point_data.active_scalars_name = "val"
+        if hasattr(self._mesh, "set_active_scalars"):
+            try:
+                self._mesh.set_active_scalars("val")
+            except Exception:
+                pass
+        if hasattr(self._mesh, "Modified"):
+            self._mesh.Modified()
+        if hasattr(self._mesh, "GetPointData"):
+            try:
+                self._mesh.GetPointData().Modified()
+            except Exception:
+                pass
+        mapper = getattr(self._splat_actor, "mapper", None)
+        if mapper is None and hasattr(self._splat_actor, "GetMapper"):
+            mapper = self._splat_actor.GetMapper()
+        if mapper is not None and hasattr(mapper, "Modified"):
+            mapper.Modified()
+        return True
+
+    def _apply_splat_opacity(self):
+        if self._splat_actor is None:
+            return
+        mapper = getattr(self._splat_actor, "mapper", None)
+        if mapper is None and hasattr(self._splat_actor, "GetMapper"):
+            mapper = self._splat_actor.GetMapper()
+        lut = getattr(mapper, "lookup_table", None) if mapper is not None else None
+        if lut is None and mapper is not None and hasattr(mapper, "GetLookupTable"):
+            lut = mapper.GetLookupTable()
+        if lut is None or not hasattr(lut, "apply_opacity"):
+            return
+        opacity_tf = (self._opacity_tf.astype(np.float32) * float(self.splat_opacity)).clip(
+            0.0, 255.0
+        )
+        if hasattr(lut, "n_values") and lut.n_values != len(opacity_tf):
+            lut.n_values = len(opacity_tf)
+        lut.apply_opacity(opacity_tf.astype(np.uint8))
+
+    def _update_opacity_curve(self, value):
+        curve = int(np.clip(value, 0, 100))
+        self._opacity_curve = curve
+        frac = curve / 100.0
+        self._opacity_cutoff = 0.05 + 0.45 * frac
+        self._opacity_power = 0.5 + 3.0 * frac
+        self._opacity_tf = _build_opacity_transfer(
+            self._opacity_lut_size,
+            cutoff=self._opacity_cutoff,
+            power=self._opacity_power,
+        )
+
+    def _format_curve_label(self):
+        return f"cutoff {self._opacity_cutoff:.2f}, p {self._opacity_power:.2f}"
+
+    def _ensure_splat_mapper_settings(self, mapper):
+        if hasattr(mapper, "SetScalarModeToUsePointFieldData"):
+            mapper.SetScalarModeToUsePointFieldData()
+        if hasattr(mapper, "SelectColorArray"):
+            mapper.SelectColorArray("val")
+        if hasattr(mapper, "ScalarVisibilityOn"):
+            mapper.ScalarVisibilityOn()
+        if hasattr(mapper, "SetColorModeToMapScalars"):
+            mapper.SetColorModeToMapScalars()
+        if hasattr(mapper, "SetScalarRange"):
+            mapper.SetScalarRange(*self._clim)
 
     def start_playback(self):
         if not self.is_playing and self.T > 1:
@@ -1491,7 +1580,14 @@ class SplatViewer(QtWidgets.QMainWindow):
     def _on_opacity_changed(self, value):
         self.splat_opacity = value / 100.0
         self.label_opacity.setText(f"{self.splat_opacity:.0%}")
-        self._rebuild_splats()
+        self._apply_splat_opacity()
+        self.plotter.render()
+
+    def _on_curve_changed(self, value):
+        self._update_opacity_curve(value)
+        self.label_curve.setText(self._format_curve_label())
+        self._apply_splat_opacity()
+        self.plotter.render()
 
     def _on_downsample_changed(self, value):
         self.downsample_step = max(1, int(value))
@@ -1511,7 +1607,7 @@ class SplatViewer(QtWidgets.QMainWindow):
 
         # Try in-place scalar update first for smooth animation
         camera_pos = self.plotter.camera_position
-        if not self._update_splat_scalars(val):
+        if not self._update_splat_data(xyz, val):
             self._create_splat_mesh(xyz, val)
         self.plotter.camera_position = camera_pos
         self.plotter.render()
