@@ -6,6 +6,52 @@ Wide-area Acoustic Vector-field Estimation for Spatial Probing & Array Calibrati
 
 # Developer Environment Setup
 
+## Cloud viz (Vite) setup
+1. Install Node.js (22+ recommended) and npm (npm ships with Node).
+   - macOS/Linux (via nvm):
+     ```bash
+     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+     # restart your shell or load nvm:
+     export NVM_DIR="$HOME/.nvm"
+     [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh"
+     nvm install 22
+     nvm use 22
+     ```
+   - macOS (Homebrew):
+     ```bash
+     brew install node
+     ```
+   - Ubuntu/Debian:
+     ```bash
+     sudo apt update
+     sudo apt install -y nodejs npm
+     ```
+   - Fedora:
+     ```bash
+     sudo dnf install -y nodejs npm
+     ```
+   - Arch:
+     ```bash
+     sudo pacman -S nodejs npm
+     ```
+   - Windows:
+     - Install the LTS from https://nodejs.org
+     - Reopen your terminal so `node`/`npm` are on PATH
+2. Verify versions:
+   ```bash
+   node --version
+   npm --version
+   ```
+3. Install project dependencies for the cloud viz app:
+   ```bash
+   cd pressure-volume/pressure-volume
+   npm install
+   ```
+4. Run the Vite dev server:
+   ```bash
+   npm run dev
+   ```
+
 ## Python workspace
 1. Install Python 3.10+ plus `pip`.
 2. Create a virtual environment:
