@@ -3,7 +3,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 const DEFAULT_DATA_ROOT = "/@fs/home/matt/projects/wavespace/filtered-data-bounce";
 const DATA_ROOT = (import.meta.env.VITE_DATA_ROOT || DEFAULT_DATA_ROOT).replace(/\/$/, "");
-const MAX_POINTS = 2000;
+const MAX_POINTS = 80000;
 const LOAD_CONCURRENCY = 8;
 const FRAME_STRIDE = 1;
 const MAX_FRAMES = 50000;
@@ -106,7 +106,7 @@ const dataButton = document.createElement("button");
 dataButton.textContent = "Pick data folder";
 dataButton.style.cssText = buttonStyle;
 const dataLabel = document.createElement("div");
-const defaultDataLabel = DATA_ROOT ? DATA_ROOT.replace(/^\/@fs/, "") : "not selected";
+const defaultDataLabel = "not selected";
 dataLabel.textContent = `Data: ${defaultDataLabel}`;
 dataLabel.style.cssText = "opacity:0.75;max-width:220px;overflow:hidden;text-overflow:ellipsis;";
 dataPickerRow.appendChild(dataButton);
@@ -140,6 +140,13 @@ folderInput.webkitdirectory = true;
 folderInput.setAttribute("webkitdirectory", "");
 folderInput.setAttribute("directory", "");
 document.body.appendChild(folderInput);
+
+const fileInput = document.createElement("input");
+fileInput.type = "file";
+fileInput.style.display = "none";
+fileInput.multiple = true;
+fileInput.accept = ".npz";
+document.body.appendChild(fileInput);
 
 const pointStatusEl = document.createElement("div");
 pointStatusEl.style.cssText = [
@@ -232,6 +239,7 @@ let dataFileList = null;
 let isLoadingDataset = false;
 let loadToken = 0;
 let animationStarted = false;
+let dataPromptOpen = false;
 
 speedControl.input.addEventListener("input", () => {
   playbackSpeed = parseFloat(speedControl.input.value);
@@ -324,26 +332,160 @@ async function setDataFiles(files) {
   await reloadDataset();
 }
 
-dataButton.addEventListener("click", async () => {
-  try {
-    if ("showDirectoryPicker" in window) {
-      const handle = await window.showDirectoryPicker();
-      await setDataDirectory(handle);
-    } else {
-      folderInput.click();
-    }
-  } catch (err) {
-    if (err && err.name !== "AbortError") {
-      console.error(err);
-    }
-  }
-});
+async function setDataServerRoot() {
+  dataDirectoryHandle = null;
+  dataFileList = null;
+  dataLabel.textContent = `Data: ${DATA_ROOT ? DATA_ROOT.replace(/^\/@fs/, "") : "not selected"}`;
+  await reloadDataset();
+}
 
-folderInput.addEventListener("change", () => {
-  if (folderInput.files && folderInput.files.length) {
-    void setDataFiles(folderInput.files);
-    folderInput.value = "";
+function waitForFileSelection(input) {
+  return new Promise((resolve) => {
+    const onChange = () => {
+      const files = input.files && input.files.length ? input.files : null;
+      input.value = "";
+      input.removeEventListener("change", onChange);
+      resolve(files);
+    };
+    input.addEventListener("change", onChange);
+    input.click();
+  });
+}
+
+async function promptForDataSource() {
+  if (dataPromptOpen) {
+    return;
   }
+  dataPromptOpen = true;
+  setLoading("Choose a data source to begin.");
+
+  const overlay = document.createElement("div");
+  overlay.style.cssText = [
+    "position:fixed",
+    "inset:0",
+    "background:rgba(3,5,8,0.75)",
+    "display:flex",
+    "align-items:center",
+    "justify-content:center",
+    "z-index:20",
+  ].join(";");
+
+  const panel = document.createElement("div");
+  panel.style.cssText = [
+    "background:rgba(8,10,14,0.95)",
+    "border:1px solid rgba(255,255,255,0.15)",
+    "border-radius:12px",
+    "padding:18px 20px",
+    "min-width:280px",
+    "max-width:360px",
+    "color:#e7ecf2",
+    "font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+    "font-size:13px",
+    "letter-spacing:0.02em",
+    "display:flex",
+    "flex-direction:column",
+    "gap:12px",
+    "box-shadow:0 10px 40px rgba(0,0,0,0.35)",
+  ].join(";");
+
+  const title = document.createElement("div");
+  title.textContent = "Select data to load";
+  title.style.cssText = "font-size:14px;font-weight:600;";
+
+  const helper = document.createElement("div");
+  helper.textContent = "Choose a folder or specific .npz files (expects point_*.npz).";
+  helper.style.cssText = "opacity:0.75;line-height:1.4;";
+
+  const buttons = document.createElement("div");
+  buttons.style.cssText = "display:flex;flex-direction:column;gap:8px;";
+
+  const makeButton = (label) => {
+    const btn = document.createElement("button");
+    btn.textContent = label;
+    btn.style.cssText = [
+      "appearance:none",
+      "border:1px solid rgba(255,255,255,0.18)",
+      "background:rgba(15,18,24,0.9)",
+      "color:#e7ecf2",
+      "border-radius:6px",
+      "padding:8px 10px",
+      "cursor:pointer",
+      "font:inherit",
+      "text-align:left",
+    ].join(";");
+    return btn;
+  };
+
+  const folderBtn = makeButton("Pick a folder");
+  const filesBtn = makeButton("Pick files");
+  const serverBtn = makeButton(
+    DATA_ROOT ? `Use configured path (${DATA_ROOT.replace(/^\/@fs/, "")})` : "Use configured path (unset)"
+  );
+  serverBtn.disabled = !DATA_ROOT;
+  serverBtn.style.opacity = DATA_ROOT ? "1" : "0.5";
+
+  buttons.appendChild(folderBtn);
+  buttons.appendChild(filesBtn);
+  buttons.appendChild(serverBtn);
+
+  panel.appendChild(title);
+  panel.appendChild(helper);
+  panel.appendChild(buttons);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const cleanup = () => {
+    if (overlay.parentNode) {
+      overlay.parentNode.removeChild(overlay);
+    }
+    dataPromptOpen = false;
+  };
+
+  folderBtn.addEventListener("click", async () => {
+    try {
+      if ("showDirectoryPicker" in window) {
+        const handle = await window.showDirectoryPicker();
+        cleanup();
+        await setDataDirectory(handle);
+      } else {
+        const files = await waitForFileSelection(folderInput);
+        if (files) {
+          cleanup();
+          await setDataFiles(files);
+        }
+      }
+    } catch (err) {
+      if (err && err.name !== "AbortError") {
+        console.error(err);
+      }
+    }
+  });
+
+  filesBtn.addEventListener("click", async () => {
+    try {
+      const files = await waitForFileSelection(fileInput);
+      if (files) {
+        cleanup();
+        await setDataFiles(files);
+      }
+    } catch (err) {
+      if (err && err.name !== "AbortError") {
+        console.error(err);
+      }
+    }
+  });
+
+  serverBtn.addEventListener("click", async () => {
+    if (!DATA_ROOT) {
+      return;
+    }
+    cleanup();
+    await setDataServerRoot();
+  });
+}
+
+dataButton.addEventListener("click", async () => {
+  await promptForDataSource();
 });
 
 playButton.addEventListener("click", () => {
@@ -813,6 +955,9 @@ async function loadPointFile(index) {
 }
 
 async function loadPointDataset() {
+  if (!dataDirectoryHandle && !dataFileList && !DATA_ROOT) {
+    throw new Error("No data source selected.");
+  }
   const points = [];
   const values = [];
   const xs = new Set();
@@ -1234,7 +1379,7 @@ async function reloadDataset() {
 }
 
 async function init() {
-  await reloadDataset();
+  await promptForDataSource();
 }
 
 init();
