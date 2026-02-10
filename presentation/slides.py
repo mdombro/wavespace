@@ -1,39 +1,122 @@
-from __future__ import annotations
+from manim import *
+from manim_slides import Slide, ThreeDSlide
+from manim.utils.color import ManimColor, interpolate_color
+from slide_template import IntroTextTemplate, TextSlideSpec, SlideImageSpec
 
 import numpy as np
 from pathlib import Path
-from manim import (
-    BLUE,
-    DOWN,
-    IN,
-    LEFT,
-    OUT,
-    RIGHT,
-    UP,
-    Arrow,
-    Axes,
-    Cone,
-    Create,
-    Cube,
-    DEGREES,
-    FadeIn,
-    FadeOut,
-    ImageMobject,
-    LaggedStart,
-    Line,
-    Scene,
-    Surface,
-    Square,
-    Text,
-    ThreeDScene,
-    ValueTracker,
-    VGroup,
+
+YOUTUBE_CLIP_PATH = (
+    Path(__file__).parent / "clips" / "o4TdHrMi6do_01m12s_01m24s.mp4"
 )
-from manim.utils.color import ManimColor, interpolate_color
+
+class IntroPipeline(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        markdown=(
+            "# WAVESPACE\n"
+            "## Wide-area Acoustic Vector-field Estimation for Spatial Probing & Array Calibration Environment\n"
+            "<br>\n"
+            "(This is mostly a silly, ChatGPT assisted, made up name...)\n"
+            "<br>\n"
+            "### Wavespace is a project that can directly measure and then visualize the form and dynamics of a sound\n"
+            "wave traveling through air. A fun experiment tinkering with the Pi Pico and viewing the structures\n"
+            "of waves in full three dimensions as opposed to the typical two."
+            # "A reusable intro slide now renders from markdown and supports inline **bold** and *italics*.\n\n"
+            # "- Collect synchronized mic data\n"
+            # "- Process and transform signals\n"
+            # "  - Band-pass + normalization\n"
+            # "  - Feature extraction\n"
+            # "- Render 2D and 3D visual summaries"
+        ),
+        images=[
+            [
+                SlideImageSpec(Path("wavespace.png"), animation="fade"),
+                SlideImageSpec(
+                    Path("465766bf-dfa6-4b8e-93d9-3e45d605a487.jpg"),
+                    animation="fade",
+                    rotation_degrees=180,
+                ),
+                SlideImageSpec(
+                    Path("Screenshot_20260209_210554.png"),
+                    animation="fade",
+                ),
+            ],  
+        ],
+        image_group_layouts=["right"],
+        image_group_directions=["horizontal"],
+        image_group_spacings=[0.18],
+        image_group_offsets=[(0.0, 0.0)],
+        image_group_positions=["bottom"],  # anchor group to slide edge/corner
+        image_group_position_buffs=[0.45],
+        animation="stagger",     # "none" | "fade" | "stagger"
+        uniform_image_size=[True],
+        image_size_ratio=[0.30],       # per-group width proportions
+        image_max_height_ratio=[0.40], # per-group max height proportions
+        image_rotation_degrees=[0.0],   # per-group defaults unless per-image override is set
+        horizontal_placement="left",  # "left" | "center" | "right"
+        vertical_placement="top",     # "top" | "center"
+        text_alignment="left",        # "left" | "center" | "right"
+    )
 
 
-class GridToPlots(Scene):
+class PersonalIntro(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        markdown=(
+            "# Where have I appeared from?"
+            "Shout out to Will Morrison of Marble run fame for suggesting I come here tonight!"
+            "We are both part of the local Cambridge Hackspace orginziation - come check us out!"
+            "Will is very humble, but he did all of the work on the physical gantry system for this project"
+            "Shout out to Will for saving me a ton of time mucking about with stepper motors and drive systems!"
+            "<br><br>"
+            "5 second background - BS in Electrical and Computer Engineering and have worked adjacent to RF and radio"
+            " communications, so have a good number of years working close with the magic of waves and their behaviors."
+        )
+    )
+
+class IdeaOrigination(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        markdown=(
+            "# The original idea was inspired by the Alpha Phoenix video about the 2 billion frames per second camera to "
+            "capture light traveling across the room."
+            "https://www.youtube.com/watch?v=o4TdHrMi6do"
+            "Go watch this video!"
+            "<br><br>"
+            "However, this required some specialized equipment and extrememly tight timing requirements. Plus, he already did it!"
+            "SOUND, though is MUCH easier to sample and work with!"
+            "So we went with that -- plus with sound, we can capture a THREE dimensional structure of sound."
+            "This has always fascinated me because real waves are 3 dimensional and really, really complex because of that"
+            "It is something you never quite get a good appreciation of through a textbook"
+        )
+    )
+
+
+class TwoDvsThreeD(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        markdown="",
+        images=[] # need to have  image of 2d Wave and arrows pointing where is the rest of it, or meme
+    )
+
+
+class Methodology(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        markdown=""
+    )
+
+
+class YouTubeClip(Slide):
+    # External clip slides do not need reverse generation for this deck flow.
+    skip_reversing = True
+
     def construct(self):
+        if not YOUTUBE_CLIP_PATH.exists():
+            raise FileNotFoundError(
+                "Missing YouTube clip slide source at "
+                f"{YOUTUBE_CLIP_PATH}. Put a local MP4 clipped to 1:12-1:24 there."
+            )
+        self.next_slide(src=YOUTUBE_CLIP_PATH)
+
+class TwoDAnimations(Slide):
+    def construct(self): 
         screenshot_path = Path(__file__).with_name("Screenshot_20260202_221921-2.png")
         if screenshot_path.exists():
             overlay = ImageMobject(str(screenshot_path))
@@ -117,107 +200,12 @@ class GridToPlots(Scene):
         self.wait(1.0)
 
 
-class GridToPlots3D(ThreeDScene):
-    def construct(self):
-        self.set_camera_orientation(phi=65 * DEGREES, theta=-45 * DEGREES, zoom=0.95)
-
-        grid_size = 4
-        cube_size = 0.35
-        gap = 0.25
-        step = cube_size + gap
-        start = -0.5 * (grid_size - 1) * step
-        cube_color = "#3B0A64"
-        cube_edge_color = "#C9B2FF"
-
-        cubes = VGroup()
-        for z in range(grid_size):
-            for y in range(grid_size):
-                for x in range(grid_size):
-                    cube = Cube(side_length=cube_size)
-                    cube.set_fill(cube_color, opacity=1.0)
-                    cube.set_stroke(width=1.6, color=cube_edge_color)
-                    cube.move_to([start + x * step, start + y * step, start + z * step])
-                    cubes.add(cube)
-
-        self.play(
-            LaggedStart(
-                *[Create(cube) for cube in cubes],
-                lag_ratio=0.02,
-                run_time=1.0,
-            )
-        )
-        self.wait(0.2)
-
-        rot_matrix = self.camera.get_rotation_matrix()
-        frame_center = self.camera.frame_center
-        for cube in cubes:
-            depth = np.dot(cube.get_center() - frame_center, rot_matrix.T)[2]
-            cube.set_z_index(depth, family=True)
-
-        def make_small_plot(phase: float) -> VGroup:
-            axes = Axes(
-                x_range=(0, 5, 1),
-                y_range=(-1.2, 1.2, 0.5),
-                x_length=1.6,
-                y_length=0.7,
-                tips=False,
-                axis_config={"include_ticks": False, "stroke_width": 2},
-            )
-            x_vals = np.linspace(0, 5, 60)
-            y_vals = np.sin(2 * np.pi * x_vals / 5 + phase)
-            line = axes.plot_line_graph(
-                x_vals,
-                y_vals,
-                add_vertex_dots=False,
-                line_color=BLUE,
-                stroke_width=2,
-            )
-            return VGroup(axes, line)
-
-        phases = np.linspace(0, 2 * np.pi, 5, endpoint=False)
-        plots = VGroup(*[make_small_plot(phase) for phase in phases])
-
-        plot_step = 1.0
-        start_y = plot_step * (len(plots) - 1) / 2
-        plot_x = -self.camera.frame_width / 2 + 1.4
-        for idx, plot in enumerate(plots):
-            plot.move_to([plot_x, start_y - idx * plot_step, 0.0])
-        self.camera.add_fixed_in_frame_mobjects(*plots)
-
-        rng = np.random.default_rng(64)
-        start_indices = rng.choice(len(cubes), size=len(plots), replace=False)
-        start_cubes = [cubes[idx] for idx in start_indices]
-        lines = VGroup(
-            *[
-                Arrow(
-                    self.camera.project_point(start_cubes[idx].get_corner(LEFT + DOWN + IN)),
-                    plots[idx].get_right(),
-                    buff=0,
-                    stroke_width=2,
-                )
-                for idx in range(len(plots))
-            ]
-        )
-        self.camera.add_fixed_in_frame_mobjects(*lines)
-
-        animations = []
-        for idx in range(len(plots)):
-            animations.append(Create(lines[idx]))
-            animations.append(FadeIn(plots[idx], shift=LEFT * 0.2))
-
-        self.play(
-            LaggedStart(
-                *animations,
-                lag_ratio=0.1,
-                run_time=2.6,
-            )
-        )
-        self.wait(1.0)
+        self.next_slide()
 
 
 
-class GridToPlots3DEffector(ThreeDScene):
-    def construct(self):
+class ThreeDAnimations(ThreeDSlide): 
+    def construct(self): 
         self.set_camera_orientation(phi=65 * DEGREES, theta=-45 * DEGREES, zoom=0.95)
 
         grid_size = 4
@@ -246,157 +234,10 @@ class GridToPlots3DEffector(ThreeDScene):
                 run_time=1.0,
             )
         )
-        self.wait(0.2)
 
-        rot_matrix = self.camera.get_rotation_matrix()
-        frame_center = self.camera.frame_center
-        for cube in cubes:
-            depth = np.dot(cube.get_center() - frame_center, rot_matrix.T)[2]
-            cube.set_z_index(depth, family=True)
-
-        def make_small_plot(phase: float) -> VGroup:
-            axes = Axes(
-                x_range=(0, 5, 1),
-                y_range=(-1.2, 1.2, 0.5),
-                x_length=1.6,
-                y_length=0.7,
-                tips=False,
-                axis_config={"include_ticks": False, "stroke_width": 2},
-            )
-            x_vals = np.linspace(0, 5, 60)
-            y_vals = np.sin(2 * np.pi * x_vals / 5 + phase)
-            line = axes.plot_line_graph(
-                x_vals,
-                y_vals,
-                add_vertex_dots=False,
-                line_color=BLUE,
-                stroke_width=2,
-            )
-            return VGroup(axes, line)
-
-        phases = np.linspace(0, 2 * np.pi, 5, endpoint=False)
-        plots = VGroup(*[make_small_plot(phase) for phase in phases])
-
-        plot_step = 1.0
-        start_y = plot_step * (len(plots) - 1) / 2
-        plot_x = -self.camera.frame_width / 2 + 1.4
-        for idx, plot in enumerate(plots):
-            plot.move_to([plot_x, start_y - idx * plot_step, 0.0])
-
-        def fix_in_frame(mobjects: VGroup) -> None:
-            self.camera.add_fixed_in_frame_mobjects(*mobjects)
-
-        # rng = np.random.default_rng(64)
-        # start_indices = rng.choice(len(cubes), size=len(plots), replace=False)
-        start_indices = [0,1,2,3]
-        start_cubes = [cubes[idx] for idx in start_indices]
-
-        min_z = start
-        max_z = start + (grid_size - 1) * step
-        effector_top_z = max_z + 0.9
-
-        def add_plot_with_line(idx: int) -> Arrow:
-            line = Arrow(
-                self.camera.project_point(start_cubes[idx].get_corner(LEFT + DOWN + IN)),
-                plots[idx].get_right(),
-                buff=0,
-                stroke_width=2,
-            )
-            fix_in_frame(VGroup(line, plots[idx]))
-            return line
-
-        selected_cubes = start_cubes
-        segment_start = [selected_cubes[0].get_center()]
-        segment_end = [segment_start[0]]
-        move_tracker = ValueTracker(0.0)
-
-        def update_effector(mob: Line) -> None:
-            alpha = move_tracker.get_value()
-            current = segment_start[0] + alpha * (segment_end[0] - segment_start[0])
-            start_point = np.array([current[0], current[1], effector_top_z])
-            end_point = np.array([current[0], current[1], current[2]])
-            start_2d = self.camera.project_point(start_point)
-            end_2d = self.camera.project_point(end_point)
-            start_2d[2] = 0.0
-            end_2d[2] = 0.0
-            mob.put_start_and_end_on(start_2d, end_2d)
-
-        start_point = np.array(
-            [segment_start[0][0], segment_start[0][1], effector_top_z]
-        )
-        end_point = np.array(
-            [segment_start[0][0], segment_start[0][1], segment_start[0][2]]
-        )
-        start_2d = self.camera.project_point(start_point)
-        end_2d = self.camera.project_point(end_point)
-        start_2d[2] = 0.0
-        end_2d[2] = 0.0
-        effector = Line(start_2d, end_2d, stroke_width=6, color=highlight_fill_color)
-        effector.add_updater(update_effector)
-        fix_in_frame(VGroup(effector))
-
-        first_line = add_plot_with_line(0)
-        self.play(
-            Create(effector),
-            Create(first_line),
-            FadeIn(plots[0], shift=LEFT * 0.2),
-            selected_cubes[0].animate.set_fill(highlight_fill_color),
-            run_time=0.8,
-        )
-
-        for idx, (prev_cube, next_cube) in enumerate(
-            zip(selected_cubes, selected_cubes[1:]),
-            start=1,
-        ):
-            segment_start[0] = prev_cube.get_center()
-            segment_end[0] = next_cube.get_center()
-            move_tracker.set_value(0.0)
-            next_line = add_plot_with_line(idx)
-            self.play(
-                move_tracker.animate.set_value(1.0),
-                Create(next_line),
-                FadeIn(plots[idx], shift=LEFT * 0.2),
-                prev_cube.animate.set_fill(cube_color),
-                next_cube.animate.set_fill(highlight_fill_color),
-                run_time=1.4,
-            )
-            self.wait(0.2)
-
-        self.wait(1.0)
+        self.next_slide()
 
 
-
-class GridToPlots3DEffectorWithWave(ThreeDScene):
-    def construct(self):
-        self.set_camera_orientation(phi=65 * DEGREES, theta=-45 * DEGREES, zoom=0.95)
-
-        grid_size = 4
-        cube_size = 0.35
-        gap = 0.25
-        step = cube_size + gap
-        start = -0.5 * (grid_size - 1) * step
-        cube_color = "#3B0A64"
-        cube_edge_color = "#000000"
-        highlight_fill_color = "#F4B183"
-
-        cubes = VGroup()
-        for z in range(grid_size):
-            for y in range(grid_size):
-                for x in range(grid_size):
-                    cube = Cube(side_length=cube_size)
-                    cube.set_fill(cube_color, opacity=1.0)
-                    cube.set_stroke(width=1.6, color=cube_edge_color)
-                    cube.move_to([start + x * step, start + y * step, start + z * step])
-                    cubes.add(cube)
-
-        self.play(
-            LaggedStart(
-                *[Create(cube) for cube in cubes],
-                lag_ratio=0.02,
-                run_time=1.0,
-            )
-        )
-        self.wait(0.2)
 
         rot_matrix = self.camera.get_rotation_matrix()
         frame_center = self.camera.frame_center
@@ -416,6 +257,14 @@ class GridToPlots3DEffectorWithWave(ThreeDScene):
         speaker_cone.set_stroke(width=1.0, color="#666666")
         speaker_cone.move_to(speaker_pos)
         self.play(FadeIn(speaker_cone, shift=speaker_dir * 0.2), run_time=0.6)
+
+
+
+
+        self.next_slide(loop=True)
+
+
+
 
         wave_color = "#8ED6FF"
         cube_wave_color = "#8ED6FF"
@@ -487,6 +336,16 @@ class GridToPlots3DEffectorWithWave(ThreeDScene):
             wave.remove_updater(update_wave)
             self.remove(wave)
 
+
+
+        
+
+        self.next_slide()
+
+
+
+
+
         def make_small_plot(phase: float) -> VGroup:
             axes = Axes(
                 x_range=(0, 5, 1),
@@ -594,5 +453,3 @@ class GridToPlots3DEffectorWithWave(ThreeDScene):
                 run_time=1.4,
             )
             self.wait(0.2)
-
-        self.wait(1.0)
