@@ -22,10 +22,29 @@ class SlideImageSpec:
 
 
 @dataclass
-class TextSlideSpec:
-    """Markdown-first slide spec with grouped image controls."""
+class TextBlockSpec:
+    """One independently positioned and styled markdown text block."""
     markdown: str
+    horizontal_placement: Literal["left", "center", "right"] = "left"
+    vertical_placement: Literal["top", "center"] = "top"
+    text_alignment: Literal["left", "center", "right"] = "left"
+    h1_font_size: int = 58
+    h2_font_size: int = 40
+    h3_font_size: int = 34
+    body_font_size: int = 30
+    bullet_font_size: int = 30
+    sub_bullet_opacity: float = 0.9
+    bullet_indent: float = 0.45
+    line_spacing: float = 0.22
+    block_spacing: float = 0.35
     animation: Literal["none", "fade", "stagger"] = "fade"
+    fade_run_time: float = 1.0
+
+
+@dataclass
+class TextSlideSpec:
+    """Slide spec with one or more text blocks plus grouped image controls."""
+    text_blocks: list[TextBlockSpec] = field(default_factory=list)
     # Image groups. Each inner list is one independently controlled group.
     images: list[list[SlideImageSpec]] = field(default_factory=list)
     # Per-group layout. Defaults to first image layout in each group when omitted.
@@ -63,19 +82,6 @@ class TextSlideSpec:
     image_max_height_ratio: float | list[float] = 0.75
     # Group-level default rotation (degrees), overridden by per-image rotation.
     image_rotation_degrees: float | list[float] = 0.0
-    horizontal_placement: Literal["left", "center", "right"] = "left"
-    vertical_placement: Literal["top", "center"] = "top"
-    text_alignment: Literal["left", "center", "right"] = "left"
-    h1_font_size: int = 58
-    h2_font_size: int = 40
-    h3_font_size: int = 34
-    body_font_size: int = 30
-    bullet_font_size: int = 30
-    sub_bullet_opacity: float = 0.9
-    bullet_indent: float = 0.45
-    line_spacing: float = 0.22
-    block_spacing: float = 0.35
-    fade_run_time: float = 1.0
     image_run_time: float = 0.5
 
 
@@ -106,18 +112,29 @@ class _RenderedImageGroup:
     images: list[tuple[Mobject, SlideImageSpec]]
 
 
+@dataclass
+class _RenderedTextBlock:
+    spec: TextBlockSpec
+    group: VGroup
+    lines: list[Mobject]
+
+
 class IntroTextTemplate(Slide):
     SPEC = TextSlideSpec(
-        markdown=(
-            "# Project Overview\n"
-            "Template slide for introducing a section or talk.\n\n"
-            "- Summarize the context in one sentence.\n"
-            "- State the objective and expected outcome.\n"
-            "  - Define success criteria.\n"
-            "  - Highlight constraints and risks.\n"
-            "- Outline the key points for this section."
-        ),
-        animation="fade",
+        text_blocks=[
+            TextBlockSpec(
+                markdown=(
+                    "# Project Overview\n"
+                    "Template slide for introducing a section or talk.\n\n"
+                    "- Summarize the context in one sentence.\n"
+                    "- State the objective and expected outcome.\n"
+                    "  - Define success criteria.\n"
+                    "  - Highlight constraints and risks.\n"
+                    "- Outline the key points for this section."
+                ),
+                animation="fade",
+            )
+        ],
     )
 
     _BR_TOKEN = "%%BR%%"
@@ -145,19 +162,11 @@ class IntroTextTemplate(Slide):
                 blocks.append(_MarkdownBlock("paragraph", " ".join(paragraph_lines)))
                 paragraph_lines.clear()
 
-        for raw_line in markdown.splitlines():
-            line = raw_line.rstrip()
+        def process_logical_line(line: str) -> None:
             stripped = line.strip()
             if not stripped:
                 flush_paragraph()
-                continue
-
-            # Standalone <br> lines must become explicit spacers because
-            # MarkupText("\n") has zero height in Manim.
-            if self._BR_TOKEN in stripped and stripped.replace(self._BR_TOKEN, "").strip() == "":
-                flush_paragraph()
-                blocks.append(_MarkdownBlock("spacer", "", depth=max(stripped.count(self._BR_TOKEN), 1)))
-                continue
+                return
 
             heading_match = re.match(r"^(#{1,3})\s+(.*)$", stripped)
             if heading_match:
@@ -166,7 +175,7 @@ class IntroTextTemplate(Slide):
                 text = heading_match.group(2).strip()
                 kind: Literal["h1", "h2", "h3"] = "h1" if level == 1 else "h2" if level == 2 else "h3"
                 blocks.append(_MarkdownBlock(kind, text))
-                continue
+                return
 
             bullet_match = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
             if bullet_match:
@@ -175,9 +184,18 @@ class IntroTextTemplate(Slide):
                 depth = indent // 2
                 text = bullet_match.group(2).strip()
                 blocks.append(_MarkdownBlock("bullet", text, depth=depth))
-                continue
+                return
 
             paragraph_lines.append(stripped)
+
+        for raw_line in markdown.splitlines():
+            line = raw_line.rstrip()
+            segments = line.split(self._BR_TOKEN)
+            for idx, segment in enumerate(segments):
+                process_logical_line(segment)
+                if idx < len(segments) - 1:
+                    flush_paragraph()
+                    blocks.append(_MarkdownBlock("spacer", "", depth=1))
 
         flush_paragraph()
         return blocks
@@ -195,7 +213,7 @@ class IntroTextTemplate(Slide):
             return RIGHT
         return ORIGIN
 
-    def _position_content(self, content: Mobject, spec: TextSlideSpec) -> None:
+    def _position_content(self, content: Mobject, spec: TextBlockSpec) -> None:
         if spec.horizontal_placement == "left":
             target_x = -self.camera.frame_width / 2 + content.width / 2 + 0.8
         elif spec.horizontal_placement == "right":
@@ -249,7 +267,7 @@ class IntroTextTemplate(Slide):
             group.to_corner(DR, buff=buff)
 
     def _build_text_group(
-        self, spec: TextSlideSpec
+        self, spec: TextBlockSpec
     ) -> tuple[VGroup, list[Mobject]]:
         blocks = self._parse_markdown(spec.markdown)
         lines: list[Mobject] = []
@@ -411,7 +429,19 @@ class IntroTextTemplate(Slide):
 
     def construct(self):
         spec = self.SPEC
-        text_group, text_lines = self._build_text_group(spec)
+        rendered_text_blocks: list[_RenderedTextBlock] = []
+        for text_block_spec in spec.text_blocks:
+            text_group, text_lines = self._build_text_group(text_block_spec)
+            rendered_text_blocks.append(
+                _RenderedTextBlock(
+                    spec=text_block_spec,
+                    group=text_group,
+                    lines=text_lines,
+                )
+            )
+
+        primary_text_block = rendered_text_blocks[0] if rendered_text_blocks else None
+        secondary_text_blocks = rendered_text_blocks[1:] if len(rendered_text_blocks) > 1 else []
         image_groups = self._build_image_groups(spec)
 
         anchored_groups = [group for group in image_groups if group.position != "none"]
@@ -425,43 +455,65 @@ class IntroTextTemplate(Slide):
         left_group = Group(*[group.mob for group in left_groups]) if left_groups else None
         right_group = Group(*[group.mob for group in right_groups]) if right_groups else None
         center_group = Group(*[group.mob for group in center_groups]) if center_groups else None
+        flow_spacing = (
+            primary_text_block.spec.block_spacing if primary_text_block is not None else 0.35
+        )
+        flow_alignment = (
+            primary_text_block.spec.text_alignment if primary_text_block is not None else "left"
+        )
 
         if left_group is not None and len(left_groups) > 1:
-            left_group.arrange(DOWN, buff=spec.block_spacing)
+            left_group.arrange(DOWN, buff=flow_spacing)
         if right_group is not None and len(right_groups) > 1:
-            right_group.arrange(DOWN, buff=spec.block_spacing)
+            right_group.arrange(DOWN, buff=flow_spacing)
         if center_group is not None and len(center_groups) > 1:
-            center_group.arrange(DOWN, buff=spec.block_spacing)
+            center_group.arrange(DOWN, buff=flow_spacing)
 
-        row_items = []
+        row_items: list[Mobject] = []
         if left_group is not None:
             row_items.append(left_group)
-        row_items.append(text_group)
+        if primary_text_block is not None:
+            row_items.append(primary_text_block.group)
         if right_group is not None:
             row_items.append(right_group)
 
-        main_row = (
-            Group(*row_items).arrange(RIGHT, aligned_edge=UP, buff=0.8)
-            if len(row_items) > 1
-            else text_group
-        )
+        if not row_items:
+            main_row = None
+        elif len(row_items) > 1:
+            main_row = Group(*row_items).arrange(RIGHT, aligned_edge=UP, buff=0.8)
+        else:
+            main_row = row_items[0]
 
         content = main_row
         if center_group is not None:
-            content = Group(main_row, center_group).arrange(
-                DOWN,
-                aligned_edge=self._aligned_edge(spec.text_alignment),
-                buff=spec.block_spacing,
-            )
+            if content is None:
+                content = center_group
+            else:
+                content = Group(content, center_group).arrange(
+                    DOWN,
+                    aligned_edge=self._aligned_edge(flow_alignment),
+                    buff=flow_spacing,
+                )
 
         max_width = self.camera.frame_width - 1.2
         max_height = self.camera.frame_height - 1.2
-        if content.width > max_width:
-            content.scale_to_fit_width(max_width)
-        if content.height > max_height:
-            content.scale_to_fit_height(max_height)
+        if content is not None:
+            if content.width > max_width:
+                content.scale_to_fit_width(max_width)
+            if content.height > max_height:
+                content.scale_to_fit_height(max_height)
 
-        self._position_content(content, spec)
+            if primary_text_block is not None:
+                self._position_content(content, primary_text_block.spec)
+            else:
+                content.move_to(ORIGIN)
+
+        for rendered in secondary_text_blocks:
+            if rendered.group.width > max_width:
+                rendered.group.scale_to_fit_width(max_width)
+            if rendered.group.height > max_height:
+                rendered.group.scale_to_fit_height(max_height)
+            self._position_content(rendered.group, rendered.spec)
 
         for anchored_group in anchored_groups:
             self._place_group_on_slide(
@@ -473,7 +525,7 @@ class IntroTextTemplate(Slide):
         for bg_group in bg_groups:
             for bg_mob, bg_spec in bg_group.images:
                 anim = self._image_animation(bg_mob, bg_spec)
-                if anim is None or spec.animation == "none":
+                if anim is None:
                     self.add(bg_mob)
                 else:
                     self.play(anim, run_time=spec.image_run_time)
@@ -484,32 +536,28 @@ class IntroTextTemplate(Slide):
             for image in group.images
         ]
 
-        if spec.animation == "none":
-            self.add(content)
-        elif spec.animation == "stagger":
-            self.play(
-                LaggedStart(
-                    *[FadeIn(line, shift=DOWN * 0.05) for line in text_lines],
-                    lag_ratio=0.12,
-                ),
-                run_time=1.0,
-            )
-            for mob, image_spec in foreground_images:
-                anim = self._image_animation(mob, image_spec)
-                if anim is None:
-                    self.add(mob)
-                else:
-                    self.play(anim, run_time=spec.image_run_time)
-        else:
-            self.play(FadeIn(text_group), run_time=spec.fade_run_time)
-            image_anims = []
-            for mob, image_spec in foreground_images:
-                anim = self._image_animation(mob, image_spec)
-                if anim is None:
-                    self.add(mob)
-                else:
-                    image_anims.append(anim)
-            if image_anims:
-                self.play(LaggedStart(*image_anims, lag_ratio=0.1), run_time=spec.image_run_time)
+        for rendered in rendered_text_blocks:
+            if rendered.spec.animation == "none":
+                self.add(rendered.group)
+            elif rendered.spec.animation == "stagger":
+                self.play(
+                    LaggedStart(
+                        *[FadeIn(line, shift=DOWN * 0.05) for line in rendered.lines],
+                        lag_ratio=0.12,
+                    ),
+                    run_time=rendered.spec.fade_run_time,
+                )
+            else:
+                self.play(FadeIn(rendered.group), run_time=rendered.spec.fade_run_time)
+
+        image_anims = []
+        for mob, image_spec in foreground_images:
+            anim = self._image_animation(mob, image_spec)
+            if anim is None:
+                self.add(mob)
+            else:
+                image_anims.append(anim)
+        if image_anims:
+            self.play(LaggedStart(*image_anims, lag_ratio=0.1), run_time=spec.image_run_time)
 
         self.next_slide()
