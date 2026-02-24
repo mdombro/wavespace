@@ -39,14 +39,14 @@ class IntroPipeline(IntroTextTemplate):
         ],
         images=[
             [
-                SlideImageSpec(Path("wavespace.png"), animation="fade"),
+                SlideImageSpec(Path("images/wavespace.png"), animation="fade"),
                 SlideImageSpec(
-                    Path("465766bf-dfa6-4b8e-93d9-3e45d605a487.jpg"),
+                    Path("images/465766bf-dfa6-4b8e-93d9-3e45d605a487.jpg"),
                     animation="fade",
                     rotation_degrees=180
                 ),
                 SlideImageSpec(
-                    Path("Screenshot_20260209_210554.png"),
+                    Path("images/Screenshot_20260209_210554.png"),
                     animation="fade",
                 ),
             ],  
@@ -107,7 +107,7 @@ class IdeaOrigination(IntroTextTemplate):
             )
         ],
         images=[
-            [SlideImageSpec(Path("g4.png"), animation="fade")]
+            [SlideImageSpec(Path("images/g4.png"), animation="fade")]
         ],
         image_group_positions=["bottom_right"],
         image_group_layouts=["right"],
@@ -116,8 +116,7 @@ class IdeaOrigination(IntroTextTemplate):
     )
 
 
-
-class Methodology(IntroTextTemplate):
+class SystemPhotos(IntroTextTemplate):
     SPEC = TextSlideSpec(
         text_blocks=[TextBlockSpec(markdown="")]
     )
@@ -137,7 +136,7 @@ class YouTubeClip(Slide):
 
 class TwoDAnimations(Slide):
     def construct(self): 
-        screenshot_path = Path(__file__).with_name("Screenshot_20260202_221921-2.png")
+        screenshot_path = Path(__file__).parent / "images" / "Screenshot_20260202_221921-2.png"
         if screenshot_path.exists():
             overlay = ImageMobject(str(screenshot_path))
             overlay.set_opacity(0.25)

@@ -34,7 +34,7 @@ from manim.utils.color import ManimColor, interpolate_color
 
 class GridToPlots(Scene):
     def construct(self):
-        screenshot_path = Path(__file__).with_name("Screenshot_20260202_221921-2.png")
+        screenshot_path = Path(__file__).parent / "images" / "Screenshot_20260202_221921-2.png"
         if screenshot_path.exists():
             overlay = ImageMobject(str(screenshot_path))
             overlay.set_opacity(0.25)
