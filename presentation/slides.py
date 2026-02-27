@@ -19,7 +19,7 @@ class IntroPipeline(IntroTextTemplate):
                     "# WAVESPACE\n"
                     "## Wide-area Acoustic Vector-field Estimation for Spatial Probing & Array Calibration Environment\n"
                     "<br>\n"
-                    "(This is mostly a silly, ChatGPT assisted, made up name...)\n"
+                    "(This is mostly a silly, ChatGPT assisted, made up name... But I was exhausted enough to go for it)\n"
                     "<br>\n"
                     "### Wavespace is a project that can directly measure and then visualize the form and dynamics of a sound\n"
                     "wave traveling through air. A fun experiment tinkering with the Pi Pico and viewing the structures\n"
@@ -64,23 +64,55 @@ class IntroPipeline(IntroTextTemplate):
     )
 
 
-class PersonalIntro(IntroTextTemplate):
+# class PersonalIntro(IntroTextTemplate):
+#     SPEC = TextSlideSpec(
+#         text_blocks=[
+#             TextBlockSpec(
+#                 markdown=(
+#                     "# Where have I appeared from?<br>"
+#                     "Shout out to Will Morrison of Marble run fame for suggesting I come here tonight!"
+#                     "We are both part of the local Cambridge Hackspace orginziation - come check us out!"
+#                     "Will is very humble, but he did all of the work on the physical gantry system for this project"
+#                     "Shout out to Will for saving me a ton of time mucking about with stepper motors and drive systems!"
+#                     "<br><br>"
+#                     "5 second background - BS in Electrical and Computer Engineering and have worked adjacent to RF and radio"
+#                     " communications, so have a good number of years working close with the magic of waves and their behaviors."
+#                 )
+#             )
+#         ]
+#     )
+
+
+class SystemPhotos(IntroTextTemplate):
     SPEC = TextSlideSpec(
         text_blocks=[
             TextBlockSpec(
-                markdown=(
-                    "# Where have I appeared from?<br>"
-                    "Shout out to Will Morrison of Marble run fame for suggesting I come here tonight!"
-                    "We are both part of the local Cambridge Hackspace orginziation - come check us out!"
-                    "Will is very humble, but he did all of the work on the physical gantry system for this project"
-                    "Shout out to Will for saving me a ton of time mucking about with stepper motors and drive systems!"
-                    "<br><br>"
-                    "5 second background - BS in Electrical and Computer Engineering and have worked adjacent to RF and radio"
-                    " communications, so have a good number of years working close with the magic of waves and their behaviors."
-                )
+                markdown="# System Images",
+                horizontal_placement="center",
+                vertical_placement="top",
+                text_alignment="center",
+                h1_font_size=40,
+                block_spacing=0.18,
             )
-        ]
+        ],
+        images=[
+            [
+                SlideImageSpec(Path("images/IMG20260210174845.jpg"), animation="fade"),
+                SlideImageSpec(Path("images/IMG20260210174915.jpg"), animation="fade"),
+            ],
+            [
+                SlideImageSpec(Path("images/IMG20260210174859.jpg"), animation="fade"),
+                SlideImageSpec(Path("images/IMG20260210174906.jpg"), animation="fade"),
+            ],
+        ],
+        image_group_layouts=["center", "center"],
+        image_group_directions=["horizontal", "horizontal"],
+        image_group_spacings=[0.12, 0.12],
+        uniform_image_size=[True, True],
+        image_size_ratio=[0.62, 0.62],
+        image_max_height_ratio=[0.42, 0.42],
     )
+
 
 class IdeaOrigination(IntroTextTemplate):
     SPEC = TextSlideSpec(
@@ -92,8 +124,8 @@ class IdeaOrigination(IntroTextTemplate):
                     <br>The original idea was inspired by the Alpha Phoenix video about the 2 billion frames per second camera to 
                     capture light traveling across the room.
                     <br>
-                    https://www.youtube.com/watch?v=o4TdHrMi6do
-                    <br>
+                    https://www.youtube.com/watch?v=o4TdHrMi6do  
+
                     Go watch the full video when you have time!
                     <br>
                     However, this required some specialized equipment and extrememly tight timing requirements. Plus, he already did it!
@@ -113,12 +145,6 @@ class IdeaOrigination(IntroTextTemplate):
         image_group_layouts=["right"],
         image_size_ratio=[0.20],
         image_max_height_ratio=0.25
-    )
-
-
-class SystemPhotos(IntroTextTemplate):
-    SPEC = TextSlideSpec(
-        text_blocks=[TextBlockSpec(markdown="")]
     )
 
 
@@ -696,3 +722,399 @@ class ThreeDAnimations(ThreeDSlide):
                 run_time=1.4,
             )
             self.wait(0.2)
+
+
+class SystemsOverview(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        text_blocks=[
+            TextBlockSpec(
+                markdown=(
+                    "# Systems Overview\n"
+                    "- In building blocks here is how the system works\n"
+                    "- Lots of computer boards!"
+                ),
+                horizontal_placement="left",
+                vertical_placement="top",
+                text_alignment="left",
+            )
+        ],
+        images=[
+            [SlideImageSpec(Path("images/System-diagram.drawio.png"), animation="fade")]
+        ],
+        image_group_layouts=["right"],
+        image_group_positions=["bottom"],
+        image_group_position_buffs=[0.28],
+        uniform_image_size=[True],
+        image_size_ratio=[0.80],
+        image_max_height_ratio=[0.52],
+    )
+
+
+class PDMOverview(IntroTextTemplate):
+    SPEC = TextSlideSpec(
+        text_blocks=[
+            TextBlockSpec(
+                markdown=(
+                    "# PDM Overview\n"
+                    "- Use PDM for the interface protocol with the microphones\n"
+                    "- More resistant to electrical noise, easier and cheaper to capture for microcontrollers\n"
+                    "- A fun decision because it is somewhat unintuitive how this protocol works!"
+                    "- One con is that it requires a *way* higher sampling rate than a respective ADC device"
+                ),
+                horizontal_placement="left",
+                vertical_placement="top",
+                text_alignment="left",
+            )
+        ],
+        images=[
+            [SlideImageSpec(Path("images/Pasted image 20260112220338.png"), animation="fade")]
+        ],
+        image_group_layouts=["right"],
+        image_group_positions=["bottom"],
+        image_group_position_buffs=[0.28],
+        uniform_image_size=[True],
+        image_size_ratio=[0.84],
+        image_max_height_ratio=[0.62],
+    )
+
+
+class OneChannelFilterAnimation(Slide):
+    # Options: "transfer" (frequency response look) or "rounded" (corner-rounding look).
+    FILTER_ICON_STYLE: Literal["transfer", "rounded"] = "transfer"
+    BIT_STREAM_CH1 = "0101101100101010"
+    BIT_STREAM_CH2 = "0101010011011010"
+    SAMPLES_PER_BIT = 10
+    LOWPASS_TAPS = 14
+    HIGHPASS_BASELINE_TAPS = 28
+
+    def _pulse_wave(self, bits: str, bit_w: float = 0.24, amp: float = 0.32) -> VMobject:
+        points: list[np.ndarray] = []
+        first_level = amp if bits[0] == "1" else -amp
+        points.append(np.array([0.0, first_level, 0.0]))
+        for i, bit in enumerate(bits):
+            level = amp if bit == "1" else -amp
+            x_end = (i + 1) * bit_w
+            points.append(np.array([x_end, level, 0.0]))
+            if i < len(bits) - 1:
+                next_level = amp if bits[i + 1] == "1" else -amp
+                if not np.isclose(level, next_level):
+                    points.append(np.array([x_end, next_level, 0.0]))
+
+        wave = VMobject()
+        wave.set_points_as_corners(points)
+        wave.set_stroke(color=BLUE_B, width=3.2)
+        return wave
+
+    def _wave_from_samples(
+        self,
+        samples: np.ndarray,
+        bit_count: int,
+        bit_w: float = 0.24,
+        amp: float = 0.35,
+        color: ManimColor = TEAL_A,
+    ) -> VMobject:
+        y = amp * samples / (np.max(np.abs(samples)) + 1e-8)
+        x = np.linspace(0.0, bit_count * bit_w, len(y))
+        points = [np.array([xx, yy, 0.0]) for xx, yy in zip(x, y)]
+        wave = VMobject()
+        wave.set_points_smoothly(points)
+        wave.set_stroke(color=color, width=3.2)
+        return wave
+
+    def _compute_filter_chain(self, bits: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        values = np.array([1.0 if b == "1" else -1.0 for b in bits], dtype=float)
+        raw = np.repeat(values, self.SAMPLES_PER_BIT)
+
+        lp_kernel = np.ones(self.LOWPASS_TAPS) / float(self.LOWPASS_TAPS)
+        low = np.convolve(raw, lp_kernel, mode="same")
+
+        # The high-pass stage is applied to the low-pass output (cascaded LP -> HP).
+        hp_baseline_kernel = np.ones(self.HIGHPASS_BASELINE_TAPS) / float(self.HIGHPASS_BASELINE_TAPS)
+        low_baseline = np.convolve(low, hp_baseline_kernel, mode="same")
+        high = low - low_baseline
+        return raw, low, high
+
+    def _filter_icon(self, kind: Literal["low", "high"], label: str) -> VGroup:
+        box = Rectangle(width=1.55, height=1.05, stroke_width=2.0, color=WHITE)
+
+        icon = VMobject()
+        if self.FILTER_ICON_STYLE == "rounded":
+            if kind == "low":
+                icon_points = [
+                    np.array([-0.48, 0.20, 0.0]),
+                    np.array([-0.20, 0.20, 0.0]),
+                    np.array([0.00, 0.12, 0.0]),
+                    np.array([0.22, -0.20, 0.0]),
+                    np.array([0.48, -0.20, 0.0]),
+                ]
+            else:
+                icon_points = [
+                    np.array([-0.48, -0.20, 0.0]),
+                    np.array([-0.22, -0.20, 0.0]),
+                    np.array([0.00, 0.10, 0.0]),
+                    np.array([0.18, 0.20, 0.0]),
+                    np.array([0.48, 0.20, 0.0]),
+                ]
+            icon.set_points_smoothly(icon_points)
+        else:
+            if kind == "low":
+                icon_points = [
+                    np.array([-0.48, 0.20, 0.0]),
+                    np.array([-0.10, 0.20, 0.0]),
+                    np.array([0.24, -0.20, 0.0]),
+                    np.array([0.48, -0.20, 0.0]),
+                ]
+            else:
+                icon_points = [
+                    np.array([-0.48, -0.20, 0.0]),
+                    np.array([-0.24, 0.20, 0.0]),
+                    np.array([0.12, 0.20, 0.0]),
+                    np.array([0.48, 0.20, 0.0]),
+                ]
+            icon.set_points_as_corners(icon_points)
+        icon.set_stroke(color=WHITE, width=2.2)
+
+        caption = Text(label, font_size=24)
+        caption.next_to(box, DOWN, buff=0.18)
+        return VGroup(box, icon, caption)
+
+    def _cube_icon(self, side_length: float = 1.0) -> Mobject:
+        box = RoundedRectangle(
+            width=side_length,
+            height=side_length,
+            corner_radius=0.08,
+            stroke_width=1.8,
+            color=WHITE,
+        )
+        self._set_cube_brightness(box, 0.25)
+        return box
+
+    def _set_cube_brightness(self, cube: Mobject, level: float) -> None:
+        level = float(np.clip(level, 0.0, 1.0))
+        fill_color = interpolate_color(ManimColor("#1B2533"), ManimColor("#F0F7FF"), level)
+        cube.set_fill(fill_color, opacity=0.94)
+
+    def _build_channel_row(self, channel_label: str, bits: str) -> dict[str, object]:
+        bits_label = Text(f"{channel_label} PDM bit stream", font_size=22)
+        input_wave = self._pulse_wave(bits)
+        input_wave.scale_to_fit_width(1.75)
+        input_frame = Rectangle(width=input_wave.width + 0.22, height=0.82, stroke_width=1.8)
+        input_bundle = VGroup(bits_label, input_frame, input_wave)
+        bits_label.next_to(input_frame, UP, buff=0.10)
+        input_wave.move_to(input_frame.get_center())
+
+        _, low_samples, high_samples = self._compute_filter_chain(bits)
+
+        low_filter = self._filter_icon("low", "Low Pass\nFilter (20kHz)")
+        low_wave = self._wave_from_samples(
+            low_samples,
+            bit_count=len(bits),
+            amp=0.30,
+            color=TEAL_A,
+        )
+        low_wave.scale_to_fit_width(1.70)
+        low_wave_box = Rectangle(width=low_wave.width + 0.22, height=0.86, stroke_width=1.8)
+        low_stage = VGroup(low_wave_box, low_wave)
+        low_wave.move_to(low_wave_box.get_center())
+
+        high_filter = self._filter_icon("high", "High Pass\nFilter (30kHz)")
+        high_wave = self._wave_from_samples(
+            high_samples,
+            bit_count=len(bits),
+            amp=0.30,
+            color=YELLOW_C,
+        )
+        high_wave.scale_to_fit_width(1.70)
+        high_wave_box = Rectangle(width=high_wave.width + 0.22, height=0.86, stroke_width=1.8)
+        high_stage = VGroup(high_wave_box, high_wave)
+        high_wave.move_to(high_wave_box.get_center())
+
+        nodes = VGroup(input_bundle, low_filter, low_stage, high_filter, high_stage)
+        nodes.arrange(RIGHT, buff=0.46, aligned_edge=DOWN)
+
+        arrows = VGroup(
+            Arrow(input_bundle.get_right(), low_filter.get_left(), buff=0.10, stroke_width=2.2),
+            Arrow(low_filter.get_right(), low_stage.get_left(), buff=0.10, stroke_width=2.2),
+            Arrow(low_stage.get_right(), high_filter.get_left(), buff=0.10, stroke_width=2.2),
+            Arrow(high_filter.get_right(), high_stage.get_left(), buff=0.10, stroke_width=2.2),
+        )
+        row_group = VGroup(nodes, arrows)
+        return {
+            "group": row_group,
+            "bits_label": bits_label,
+            "input_frame": input_frame,
+            "input_wave": input_wave,
+            "low_filter": low_filter,
+            "low_wave": low_wave,
+            "low_wave_box": low_wave_box,
+            "high_filter": high_filter,
+            "high_wave": high_wave,
+            "high_wave_box": high_wave_box,
+            "arrows": arrows,
+            "high_stage": high_stage,
+            "high_samples": high_samples,
+        }
+
+    def construct(self):
+        title = Text("Dual-Channel Filter Pipeline + Sum", font_size=36)
+        title.to_edge(UP, buff=0.35)
+
+        channel_1 = self._build_channel_row("Channel 1", self.BIT_STREAM_CH1)
+        channel_2 = self._build_channel_row("Channel 2", self.BIT_STREAM_CH2)
+        summed_signal = channel_1["high_samples"] + channel_2["high_samples"]
+
+        rows = VGroup(channel_1["group"], channel_2["group"])
+        rows.arrange(DOWN, buff=0.80, aligned_edge=LEFT)
+
+        adder_circle = Circle(radius=0.30, stroke_width=2.2, color=BLUE_C)
+        adder_h = Line(LEFT * 0.14, RIGHT * 0.14, stroke_width=2.2, color=BLUE_C).move_to(adder_circle)
+        adder_v = Line(DOWN * 0.14, UP * 0.14, stroke_width=2.2, color=BLUE_C).move_to(adder_circle)
+        adder = VGroup(adder_circle, adder_h, adder_v)
+        top_high_stage = channel_1["high_stage"]
+        bottom_high_stage = channel_2["high_stage"]
+        adder_center = np.array(
+            [
+                0.5 * (top_high_stage.get_center()[0] + bottom_high_stage.get_center()[0]),
+                0.5 * (top_high_stage.get_center()[1] + bottom_high_stage.get_center()[1]),
+                0.0,
+            ]
+        )
+        adder.move_to(adder_center)
+
+        top_sum_arrow = Arrow(
+            top_high_stage.get_bottom(),
+            adder.get_top(),
+            buff=0.06,
+            stroke_width=2.2,
+        )
+        bottom_sum_arrow = Arrow(
+            bottom_high_stage.get_top(),
+            adder.get_bottom(),
+            buff=0.06,
+            stroke_width=2.2,
+        )
+
+        final_wave = self._wave_from_samples(
+            summed_signal,
+            bit_count=len(self.BIT_STREAM_CH1),
+            amp=0.40,
+            color=GREEN_A,
+        )
+        final_wave.scale_to_fit_width(4.2)
+        final_wave_box = RoundedRectangle(
+            width=final_wave.width + 0.30,
+            height=1.24,
+            corner_radius=0.08,
+            stroke_width=2.0,
+            color=WHITE,
+        )
+        final_wave.move_to(final_wave_box.get_center())
+        final_wave_label = Text("Final summed signal", font_size=28)
+        final_stage = VGroup(final_wave_label, final_wave_box, final_wave)
+        final_wave_label.next_to(final_wave_box, UP, buff=0.10)
+        final_stage.next_to(rows, DOWN, buff=0.70)
+        final_stage.set_x(0.0)
+
+        adder_to_final_arrow = CurvedArrow(
+            adder.get_right() + RIGHT * 0.04,
+            final_wave_box.get_top() + RIGHT * 0.62,
+            angle=-1.18,
+            tip_length=0.16,
+            stroke_width=2.2,
+            color=BLUE_C,
+        )
+
+        cube = self._cube_icon(side_length=1.15)
+        cube_label = Text("Visualization", font_size=22)
+        cube_label.next_to(cube, DOWN, buff=0.16)
+        cube_group = VGroup(cube, cube_label)
+        cube_group.next_to(final_wave_box, RIGHT, buff=0.92)
+        output_arrow = Arrow(final_wave_box.get_right(), cube.get_left(), buff=0.14, stroke_width=2.2)
+
+        pipeline = VGroup(
+            rows,
+            adder,
+            top_sum_arrow,
+            bottom_sum_arrow,
+            adder_to_final_arrow,
+            final_stage,
+            output_arrow,
+            cube_group,
+        )
+        pipeline.scale_to_fit_width(self.camera.frame_width * 0.95)
+        if pipeline.height > self.camera.frame_height * 0.80:
+            pipeline.scale_to_fit_height(self.camera.frame_height * 0.80)
+        pipeline.next_to(title, DOWN, buff=0.32)
+        pipeline.set_x(0.0)
+
+        self.play(FadeIn(title), run_time=0.8)
+        for channel in (channel_1, channel_2):
+            self.play(
+                FadeIn(channel["bits_label"]),
+                Create(channel["input_frame"]),
+                Create(channel["input_wave"]),
+                run_time=1.2,
+            )
+            self.play(Create(channel["arrows"][0]), FadeIn(channel["low_filter"]), run_time=1.0)
+            self.play(
+                Create(channel["arrows"][1]),
+                TransformFromCopy(channel["input_wave"], channel["low_wave"]),
+                Create(channel["low_wave_box"]),
+                run_time=1.5,
+            )
+            self.play(Create(channel["arrows"][2]), FadeIn(channel["high_filter"]), run_time=1.0)
+            self.play(
+                Create(channel["arrows"][3]),
+                TransformFromCopy(channel["low_wave"], channel["high_wave"]),
+                Create(channel["high_wave_box"]),
+                run_time=1.5,
+            )
+
+        self.play(Create(top_sum_arrow), Create(bottom_sum_arrow), FadeIn(adder), run_time=1.2)
+        self.play(
+            Create(adder_to_final_arrow),
+            FadeIn(final_wave_label),
+            Create(final_wave_box),
+            Create(final_wave),
+            run_time=1.8,
+        )
+        sweep_x_left = final_wave_box.get_left()[0] + 0.08
+        sweep_x_right = final_wave_box.get_right()[0] - 0.08
+        sweep_y_bottom = final_wave_box.get_bottom()[1] + 0.06
+        sweep_y_top = final_wave_box.get_top()[1] - 0.06
+        sweep_line = Line(
+            np.array([sweep_x_left, sweep_y_bottom, 0.0]),
+            np.array([sweep_x_left, sweep_y_top, 0.0]),
+            stroke_width=3.2,
+            color=GREEN_B,
+        )
+        self.play(Create(output_arrow), FadeIn(cube_group), Create(sweep_line), run_time=1.2)
+
+        signal_peak = np.max(np.abs(summed_signal)) + 1e-8
+        signal_time = ValueTracker(0.0)
+
+        def cube_brightness_updater(_mob: Mobject) -> None:
+            t = signal_time.get_value()
+            idx = min(int(t * (len(summed_signal) - 1)), len(summed_signal) - 1)
+            level = 0.5 + 0.5 * (summed_signal[idx] / signal_peak)
+            self._set_cube_brightness(cube, level)
+
+        def sweep_line_updater(_mob: Mobject) -> None:
+            t = signal_time.get_value()
+            x = sweep_x_left + (sweep_x_right - sweep_x_left) * t
+            sweep_line.put_start_and_end_on(
+                np.array([x, sweep_y_bottom, 0.0]),
+                np.array([x, sweep_y_top, 0.0]),
+            )
+
+        # Loop only this activity segment (brightness + sweep).
+        self.next_slide(loop=True)
+
+        cube.add_updater(cube_brightness_updater)
+        sweep_line.add_updater(sweep_line_updater)
+        cube_brightness_updater(cube)
+        sweep_line_updater(sweep_line)
+        self.play(signal_time.animate.set_value(1.0), run_time=12.0, rate_func=linear)
+        cube.remove_updater(cube_brightness_updater)
+        sweep_line.remove_updater(sweep_line_updater)
+        self.next_slide()
